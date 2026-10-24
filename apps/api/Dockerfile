@@ -7,9 +7,13 @@ WORKDIR /app
 FROM base AS build
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/api/package.json apps/api/package.json
+COPY packages/shared/package.json packages/shared/package.json
+COPY mock-store/package.json mock-store/package.json
 RUN pnpm install --frozen-lockfile
 COPY tsconfig.base.json ./
+COPY packages/shared packages/shared
 COPY apps/api apps/api
+RUN pnpm --filter @supportpilot/shared run build
 RUN pnpm --filter @supportpilot/api run build
 RUN pnpm --filter @supportpilot/api deploy --prod /app/deploy/api
 
