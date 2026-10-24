@@ -10,13 +10,8 @@ COPY apps/api/package.json apps/api/package.json
 RUN pnpm install --frozen-lockfile
 COPY tsconfig.base.json ./
 COPY apps/api apps/api
-RUN echo "--- apps/api contents before build ---" && find apps/api -type f -not -path "*/node_modules/*"
-RUN echo "--- apps/api/nest-cli.json ---" && cat apps/api/nest-cli.json
-RUN echo "--- apps/api/tsconfig.build.json ---" && cat apps/api/tsconfig.build.json
 RUN pnpm --filter @supportpilot/api run build
-RUN echo "--- apps/api/dist after build ---" && find apps/api/dist -type f || echo "apps/api/dist MISSING after build"
 RUN pnpm --filter @supportpilot/api deploy --prod /app/deploy/api
-RUN echo "--- /app/deploy/api/dist after deploy ---" && find /app/deploy/api/dist -type f || echo "/app/deploy/api/dist MISSING after deploy"
 
 FROM base AS runtime
 RUN addgroup -S nodejs && adduser -S nestjs -G nodejs
