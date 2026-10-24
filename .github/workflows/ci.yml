@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6.1.0
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "24"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm -r run lint
+
+      - name: Test
+        run: pnpm -r run test
+
+      - name: Build
+        run: pnpm -r run build
+
+      - name: Docker Compose build
+        run: docker compose build
+
+      - name: Docker Compose up
+        run: docker compose up -d
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/health; then
+              echo "API is healthy"
+              exit 0
+            fi
+            echo "Waiting for API to become healthy... (attempt $i)"
+            sleep 2
+          done
+          echo "API did not become healthy in time"
+          exit 1
+
+      - name: Docker Compose logs
+        if: always()
+        run: docker compose logs
+
+      - name: Docker Compose ps
+        if: always()
+        run: docker compose ps -a
+
+      - name: Docker Compose down
+        if: always()
+        run: docker compose down
