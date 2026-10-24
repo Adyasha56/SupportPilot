@@ -24,14 +24,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build
+        run: pnpm -r run build
+
       - name: Lint
         run: pnpm -r run lint
 
       - name: Test
         run: pnpm -r run test
-
-      - name: Build
-        run: pnpm -r run build
 
       - name: Docker Compose build
         run: docker compose build

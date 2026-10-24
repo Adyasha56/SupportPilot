@@ -1,0 +1,21 @@
+{
+  "name": "@supportpilot/mock-store",
+  "version": "0.0.0",
+  "private": true,
+  "main": "src/app.ts",
+  "types": "src/app.ts",
+  "scripts": {
+    "start": "node --experimental-strip-types src/server.ts",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@supportpilot/shared": "workspace:*",
+    "express": "5.3.0"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/supertest": "7.2.1",
+    "supertest": "7.3.1"
+  }
+}

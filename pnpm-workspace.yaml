@@ -1,6 +1,7 @@
 packages:
   - "apps/*"
   - "packages/*"
+  - "mock-store"
 
 allowBuilds:
   '@swc/core': true

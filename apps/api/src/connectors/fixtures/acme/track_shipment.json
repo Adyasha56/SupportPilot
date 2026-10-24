@@ -1,0 +1,20 @@
+{
+  "tenantId": "acme",
+  "tool": "track_shipment",
+  "description": "Fetch shipment status for an order",
+  "inputSchema": { "order_id": "string" },
+  "request": {
+    "method": "GET",
+    "baseUrl": "http://localhost:4100",
+    "path": "/shipments/{order_id}",
+    "auth": { "type": "bearer", "secretRef": "CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN" }
+  },
+  "responseMap": {
+    "status": "$.status",
+    "trackingNumber": "$.trackingNumber",
+    "carrier": "$.carrier",
+    "estimatedDelivery": "$.estimatedDelivery"
+  },
+  "riskLevel": "low",
+  "idPattern": "^ORD-\\d{4,}$"
+}

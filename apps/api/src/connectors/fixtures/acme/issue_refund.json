@@ -1,0 +1,20 @@
+{
+  "tenantId": "acme",
+  "tool": "issue_refund",
+  "description": "Issue a refund for an order",
+  "inputSchema": { "order_id": "string", "amount": "number", "idempotencyKey": "string" },
+  "request": {
+    "method": "POST",
+    "baseUrl": "http://localhost:4100",
+    "path": "/refunds",
+    "auth": { "type": "bearer", "secretRef": "CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN" }
+  },
+  "responseMap": {
+    "refundId": "$.id",
+    "orderId": "$.orderId",
+    "amount": "$.amount",
+    "status": "$.status"
+  },
+  "riskLevel": "high",
+  "idPattern": "^ORD-\\d{4,}$"
+}

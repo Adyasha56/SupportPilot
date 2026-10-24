@@ -1,0 +1,20 @@
+{
+  "tenantId": "acme",
+  "tool": "get_order",
+  "description": "Fetch an order by id",
+  "inputSchema": { "order_id": "string" },
+  "request": {
+    "method": "GET",
+    "baseUrl": "http://localhost:4100",
+    "path": "/orders/{order_id}",
+    "auth": { "type": "bearer", "secretRef": "CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN" }
+  },
+  "responseMap": {
+    "status": "$.status",
+    "total": "$.total",
+    "placedAt": "$.placedAt",
+    "customerRef": "$.customerRef"
+  },
+  "riskLevel": "low",
+  "idPattern": "^ORD-\\d{4,}$"
+}
