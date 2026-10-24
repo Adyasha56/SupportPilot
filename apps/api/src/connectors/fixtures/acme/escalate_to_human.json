@@ -1,0 +1,18 @@
+{
+  "tenantId": "acme",
+  "tool": "escalate_to_human",
+  "description": "Create a handoff ticket for a human to review",
+  "inputSchema": { "summary": "string" },
+  "request": {
+    "method": "POST",
+    "baseUrl": "http://localhost:4100",
+    "path": "/escalations",
+    "auth": { "type": "bearer", "secretRef": "CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN" }
+  },
+  "responseMap": {
+    "escalationId": "$.id",
+    "status": "$.status"
+  },
+  "riskLevel": "low",
+  "idPattern": "^ESC-\\d{4,}$"
+}
