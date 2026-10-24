@@ -52,6 +52,14 @@ jobs:
           echo "API did not become healthy in time"
           exit 1
 
+      - name: Docker Compose logs
+        if: always()
+        run: docker compose logs
+
+      - name: Docker Compose ps
+        if: always()
+        run: docker compose ps -a
+
       - name: Docker Compose down
         if: always()
         run: docker compose down
