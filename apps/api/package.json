@@ -2,6 +2,7 @@
   "name": "@supportpilot/api",
   "version": "0.0.0",
   "private": true,
+  "files": ["dist", "src/connectors/fixtures"],
   "scripts": {
     "build": "nest build",
     "start": "node dist/main.js",
@@ -16,11 +17,13 @@
     "@nestjs/platform-express": "12.2.0",
     "@supportpilot/shared": "workspace:*",
     "reflect-metadata": "0.2.2",
-    "rxjs": "7.8.2"
+    "rxjs": "7.8.2",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@nestjs/cli": "12.0.10",
     "@nestjs/testing": "12.2.0",
+    "@supportpilot/mock-store": "workspace:*",
     "@swc/core": "1.16.20",
     "@types/supertest": "7.2.1",
     "supertest": "7.3.1",
