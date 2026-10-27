@@ -1,6 +1,11 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
-import { ConnectorConfig, ConnectorConfigSchema, TENANT_ID_PATTERN } from '@supportpilot/shared';
+import {
+  ConnectorConfig,
+  ConnectorConfigSchema,
+  TENANT_ID_PATTERN,
+  TOOL_INPUT_SCHEMAS,
+} from '@supportpilot/shared';
 
 /** Generous for a tiny connector config; rejects anything absurdly large. */
 export const MAX_CONFIG_FILE_BYTES = 10 * 1024;
@@ -103,6 +108,8 @@ export class FileConnectorConfigRepository implements ConnectorConfigRepository 
       }
       seenTools.add(config.tool);
 
+      this.validateRequestBody(config, entry);
+
       configs.push(config);
     }
 
@@ -116,6 +123,38 @@ export class FileConnectorConfigRepository implements ConnectorConfigRepository 
       throw new ConnectorConfigNotFoundError(`No connector config for tool "${tool}"`);
     }
     return match;
+  }
+
+  /**
+   * GET requests must have no body. Every value in a POST body mapping
+   * (the input argument name it draws from) must be a real field of that
+   * tool's input schema - the schema itself doesn't know which tool it
+   * belongs to, so this cross-check only happens here.
+   */
+  private validateRequestBody(config: ConnectorConfig, entry: string): void {
+    const { method, body } = config.request;
+
+    if (method === 'GET') {
+      if (body) {
+        throw new InvalidConnectorConfigError(`GET connector config must not have a body: ${entry}`);
+      }
+      return;
+    }
+
+    if (!body) {
+      return;
+    }
+
+    const inputSchema = TOOL_INPUT_SCHEMAS[config.tool];
+    const validArgNames = new Set(Object.keys(inputSchema.shape));
+
+    for (const argName of Object.values(body)) {
+      if (!validArgNames.has(argName)) {
+        throw new InvalidConnectorConfigError(
+          `Connector config's request.body references an unknown input argument "${argName}": ${entry}`,
+        );
+      }
+    }
   }
 
   /**

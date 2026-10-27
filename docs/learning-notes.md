@@ -27,3 +27,37 @@
 **The fix**: a separate `apps/api/tsconfig.build.json` that extends the main `tsconfig.json`, sets `rootDir: "./src"`, and narrows `include` to `src/**/*.ts` only (excluding `test/`, `**/*.spec.ts`, `dist`, `node_modules`). `nest-cli.json` points `compilerOptions.tsConfigPath` at this build config. The original `tsconfig.json` is untouched and still covers `src/` + `test/` together, so the editor, ESLint, and Vitest keep type-checking both.
 
 **Why a separate build tsconfig, not one tsconfig doing both jobs**: type-checking and editor tooling want the widest `include` (so tests get type errors too), but compilation output wants the narrowest `include` (only what ships to `dist/`, with `rootDir` pinned so the output path is predictable). One tsconfig can't satisfy both without compromising one side — this split is the standard Nest CLI pattern (`nest new` scaffolds projects this way by default) for exactly this reason.
+
+## Milestone 1 — node:http with a custom `lookup`, not fetch, for the tool runner
+
+**What**: the tool runner sends every outbound connector request via `node:http`/`node:https`'s `request()`, never the built-in `fetch`, with `agent: false` (a fresh, non-pooled connection per call) and a custom `lookup` option.
+
+**Why**: this closes a real DNS-rebinding gap that a fetch-only pre-check can't. `fetch` resolves DNS internally, with no hook to re-validate the address at the moment it actually connects — so a hostname could pass an earlier SSRF check and then resolve to a private IP by the time `fetch` itself connects, moments later. `http.request`'s `lookup` option runs at that exact connect moment, so validation and connection happen atomically. `agent: false` additionally guarantees a prior validated connection is never silently reused for a different, unvalidated target.
+
+**What I found by testing it, not assuming it**: Node only invokes the custom `lookup` function when the target is a *hostname* — for a literal IP target, Node skips DNS resolution (and `lookup`) entirely, which is correct and safe (there's no resolution step to rebind in the first place). My first test for "lookup runs on every request" used a literal IP as the stub server's URL and silently proved nothing — `resolveDns` was called zero times, not because the feature was broken, but because the test never actually exercised the lookup path. Fixed by pointing the test at a hostname instead. Also confirmed directly: Node calls `lookup` with `{ all: true }` by default, which is why the lookup function has to handle both the single-address and array callback shapes, not just one.
+
+## Milestone 1 — ToolRunnerSettings must boot with an empty host allowlist
+
+**What went wrong**: `ToolRunnerSettingsSchema` originally required `hostAllowlist` to have at least one entry (`.min(1)`). Starting the built app with `NODE_ENV=production` and no tool-runner env vars set at all crashed at Nest's bootstrap, because `CONNECTOR_HOST_ALLOWLIST` defaults to an empty list and the schema rejected it.
+
+**The fix**: removed the `.min(1)` constraint. An empty allowlist is a valid, safe configuration — it just means no connector is currently permitted to make outbound requests, which is the correct conservative default for an unconfigured deployment, not an error condition.
+
+**Why this matters beyond the one bug**: it's a concrete instance of "fail fast on genuinely invalid config, but don't treat the safest possible default as invalid" — a container that won't start because nothing has been configured yet is worse than one that starts and simply permits nothing until an operator sets the allowlist.
+
+## Milestone 1 — a stray idPattern on escalate_to_human
+
+**What went wrong**: the `escalate_to_human` connector fixture originally set `"idPattern": "^ESC-\\d{4,}$"`. That pattern describes the *output* escalation id format (`ESC-####`) — but `escalate_to_human`'s only input argument is `summary` (free text), which has no id-shaped field at all. The pattern was silently meaningless: nothing in the tool runner would ever apply it to anything, since `escalate_to_human` has zero entries in the id-argument list it checks against.
+
+**The fix**: removed it. Caught while wiring `request.body` mappings for the POST tools and re-reading each fixture carefully, not by a failing test — nothing failed, because the pattern simply never got exercised. A good reminder that "doesn't throw" isn't the same as "correct."
+
+## Milestone 1 — a package using zod needs zod as its own dependency
+
+**What went wrong**: `apps/api/src/agent/tool-runner/tool-runner.settings.ts` imports `zod` directly, but `apps/api/package.json` never declared it — only `packages/shared` did. pnpm's strict per-package isolation doesn't let one workspace package borrow another's dependency transitively, so the test suite failed with `Cannot find package 'zod'` the moment this file was added.
+
+**The fix**: added `zod@4.6.7` as a direct `apps/api` dependency. **Why not route it through `packages/shared` instead**: `ToolRunnerSettingsSchema` is purely an `apps/api`-internal concern (env parsing for this app's own tool runner) — `mock-store` has no use for it, so putting it in the shared package would be the wrong home just to avoid a second `zod` entry in a lockfile.
+
+## Milestone 1 — a size-limit test that didn't test the size limit
+
+**What went wrong**: the first version of the "oversized response" test set `Content-Length: 5` and then wrote 2000 bytes, expecting the tool runner's own streaming byte-counter to catch it. It didn't — Node's own HTTP parser rejects a response that delivers more bytes than its declared `Content-Length` as a protocol violation, surfacing as a generic network error *before* our byte-counting logic ever got a chance to run. The test still "passed" in the sense that *some* failure occurred, but not the one it claimed to be testing.
+
+**The fix**: rewrote the test to send a response with *no* `Content-Length` at all (chunked encoding), which Node cannot pre-validate the size of — that's the actual scenario our own streaming counter exists to defend against, and it's the one real "lying" servers can get away with (declaring too little is caught by Node itself; declaring nothing at all is not).

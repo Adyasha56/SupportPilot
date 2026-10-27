@@ -7,7 +7,12 @@
     "method": "POST",
     "baseUrl": "http://localhost:4100",
     "path": "/refunds",
-    "auth": { "type": "bearer", "secretRef": "CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN" }
+    "auth": { "type": "bearer", "secretRef": "CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN" },
+    "body": {
+      "orderId": "order_id",
+      "amount": "amount",
+      "idempotencyKey": "idempotencyKey"
+    }
   },
   "responseMap": {
     "refundId": "$.id",

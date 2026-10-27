@@ -58,3 +58,11 @@ export const EscalateToHumanOutputSchema = z.object({
   status: z.literal('created'),
 });
 export type EscalateToHumanOutput = z.infer<typeof EscalateToHumanOutputSchema>;
+
+/** Used to cross-validate a connector's request.body mapping at config-load time. */
+export const TOOL_INPUT_SCHEMAS = {
+  get_order: GetOrderInputSchema,
+  track_shipment: TrackShipmentInputSchema,
+  issue_refund: IssueRefundInputSchema,
+  escalate_to_human: EscalateToHumanInputSchema,
+} as const;
