@@ -19,6 +19,14 @@ export const ConnectorRequestSchema = z.object({
   baseUrl: z.string().url(),
   path: z.string().min(1),
   auth: ConnectorAuthSchema,
+  /**
+   * Outbound JSON field name -> input argument name. GET requests must omit
+   * this (no body). Only mapped fields are ever sent. Cross-validated at
+   * config-load time (every value must be a real field of that tool's input
+   * schema) by the repository, not here - this schema doesn't know which
+   * tool it belongs to until after parsing.
+   */
+  body: z.record(z.string(), z.string()).optional(),
 });
 
 export const ConnectorToolName = z.enum([
