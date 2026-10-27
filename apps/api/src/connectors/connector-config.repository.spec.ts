@@ -144,4 +144,53 @@ describe('FileConnectorConfigRepository against a scratch fixture tree', () => {
     const repo = new FileConnectorConfigRepository(scratchRoot);
     expect(repo.findAllForTenant('acme')).toHaveLength(1);
   });
+
+  it('rejects a GET connector config that declares a body', () => {
+    writeTenantConfig(
+      'acme',
+      'bad.json',
+      JSON.stringify({
+        ...VALID_CONFIG,
+        request: { ...VALID_CONFIG.request, body: { order_id: 'order_id' } },
+      }),
+    );
+    const repo = new FileConnectorConfigRepository(scratchRoot);
+    expect(() => repo.findAllForTenant('acme')).toThrow(InvalidConnectorConfigError);
+  });
+
+  it('rejects a POST body mapping that references an unknown input argument', () => {
+    const postConfig = {
+      ...VALID_CONFIG,
+      tool: 'issue_refund',
+      inputSchema: { order_id: 'string', amount: 'number' },
+      request: {
+        method: 'POST',
+        baseUrl: 'http://localhost:4100',
+        path: '/refunds',
+        auth: { type: 'bearer', secretRef: 'CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN' },
+        body: { orderId: 'order_id', total: 'not_a_real_arg' },
+      },
+    };
+    writeTenantConfig('acme', 'bad.json', JSON.stringify(postConfig));
+    const repo = new FileConnectorConfigRepository(scratchRoot);
+    expect(() => repo.findAllForTenant('acme')).toThrow(InvalidConnectorConfigError);
+  });
+
+  it('accepts a POST body mapping whose arguments all exist on the input schema', () => {
+    const postConfig = {
+      ...VALID_CONFIG,
+      tool: 'issue_refund',
+      inputSchema: { order_id: 'string', amount: 'number' },
+      request: {
+        method: 'POST',
+        baseUrl: 'http://localhost:4100',
+        path: '/refunds',
+        auth: { type: 'bearer', secretRef: 'CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN' },
+        body: { orderId: 'order_id', amount: 'amount' },
+      },
+    };
+    writeTenantConfig('acme', 'ok.json', JSON.stringify(postConfig));
+    const repo = new FileConnectorConfigRepository(scratchRoot);
+    expect(repo.findAllForTenant('acme')).toHaveLength(1);
+  });
 });

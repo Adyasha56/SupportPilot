@@ -7,12 +7,14 @@
     "method": "POST",
     "baseUrl": "http://localhost:4100",
     "path": "/escalations",
-    "auth": { "type": "bearer", "secretRef": "CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN" }
+    "auth": { "type": "bearer", "secretRef": "CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN" },
+    "body": {
+      "summary": "summary"
+    }
   },
   "responseMap": {
     "escalationId": "$.id",
     "status": "$.status"
   },
-  "riskLevel": "low",
-  "idPattern": "^ESC-\\d{4,}$"
+  "riskLevel": "low"
 }
