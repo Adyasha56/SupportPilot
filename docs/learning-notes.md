@@ -1,5 +1,27 @@
 # Learning notes
 
+## Milestone 2, Stage 3 — LLM provider: Gemini embeddings, verified against the real SDK
+
+**What was built**: `apps/api/src/llm/` — the `LlmProvider` interface (`embed()` only; `generate()` deferred to Milestone 3), `GeminiLlmProvider` (the real implementation), `ThrottledClient` (rate limit + bounded concurrency + backoff), `EmbeddingLruCache` (bounded in-process LRU), a `FakeLlmProvider` test double (feature-hashing bag-of-words), and a manual `embedding-smoke-test` script. `EMBEDDING_MODEL`/`EMBEDDING_DIMENSION` moved to `@supportpilot/shared` so the LLM provider and the Mongoose vector index definition can never silently diverge — enforced by a test.
+
+**Verified directly against the installed `@google/genai@2.31.0` package (not assumed from docs)**: its own `embedContent`'s internal `tContentsForEmbed` transform maps a plain `string[]` passed as `contents` to one separate `Content` per string (confirmed by reading the compiled SDK source), and `EmbedContentResponse.embeddings` is documented as "in the same order as provided in the batch request." This matters because an earlier, different SDK (`@google/generative-ai`) had a batching gotcha where a plain string array could get merged into one multipart content — that risk does **not** apply to this SDK's `embedContent`, so no extra wrapping (`{parts:[{text}]}` per item) is needed. The one-content-at-a-time restriction that does exist in the SDK's source only applies to the Vertex AI path for certain models, never to the Gemini Developer API (AI Studio key) path this project uses.
+
+**Normalization**: `gemini-embedding-001`'s native output is 3072 dimensions, pre-normalized by Google. Truncating to a smaller `outputDimensionality` (768 here, chosen to fit Atlas M0's 512MB cap) is **not** auto-normalized by the API — confirmed via `ai.google.dev`'s own embeddings guide, which explicitly says non-3072-dimension output must be normalized manually. `GeminiLlmProvider` L2-normalizes every vector itself before returning it, regardless of dimension, rather than trusting the API's output to already have unit norm.
+
+**Design choice — result types, not exceptions**: `embed()` returns `{ok:true,...} | {ok:false,error:{code,message}}` rather than throwing, matching the tool runner's Milestone 1 pattern. A missing API key, a rate limit, or bad input are routine, expected outcomes for an embedding call, not exceptional ones — RULES.md's "return typed errors from services" applies the same way here as it did to connector tool calls.
+
+**Free-tier data-usage finding**: on the Gemini API free tier, Google's terms treat it as an "Unpaid Service" and explicitly reserve the right to use submitted content and generated responses to improve Google's products; human reviewers may read/annotate it. The paid tier's terms state the opposite. Documented directly in `.env.example` next to `GEMINI_API_KEY`: do not send real company policy documents or customer data through the free tier.
+
+**Interview Q&A**: *"How did you avoid the classic batching gotcha where a model merges multiple texts into one embedding?"* — By reading the actual installed SDK's compiled source rather than trusting a summary of the docs: `@google/genai`'s `embedContent` maps each array element to its own separate `Content` before sending the request, and its response type is documented as one embedding per input, in order. That's also proven with a unit test against a fake client shaped exactly like the real request/response contract, not just asserted from the docs.
+
+## Milestone 2, Stage 2 follow-ups — bounded limiter, trust proxy, explicit index ownership
+
+**Failed-attempt limiter was unbounded in practice**: `FailedAttemptLimiter`'s `windowMs` expiry only reclaims an entry the next time *that same key* is looked up — a key queried exactly once (e.g. one failed attempt from each of many distinct source IPs) stayed in the Map forever. Fixed with a `maxEntries` cap (default 5000) and oldest-first eviction on overflow, using the Map's own insertion order rather than adding a second data structure.
+
+**Trust proxy**: `req.ip` (what the limiter keys on) resolves to whichever peer connects directly to the Node process — if that peer is a reverse proxy (as Render's free web service is), every client collapses into one shared key. Added `app.set('trust proxy', 1)` in `main.ts`, trusting exactly one hop, matching Render's single-proxy topology; local Docker Compose has no proxy at all, so the setting is harmless there too (there's no X-Forwarded-For to trust, so `req.ip` falls back to the direct socket address regardless).
+
+**Mongoose `autoIndex` made explicit**: was relying on Mongoose's own default (`true`) rather than stating it. Decision: `autoIndex: false` everywhere, with `db:ensure-indexes` extended to also call `Model.syncIndexes()` for every schema's regular (non-Atlas-Search) indexes — e.g. the unique index on `ApiKey.hash`. This keeps exactly one script, run manually, owning *all* index creation (both ordinary MongoDB indexes and the Atlas Vector Search index), rather than two different mental models for the two kinds of index.
+
 ## Milestone 2 — Database decision: MongoDB Atlas (M0) with Atlas Vector Search, via Mongoose
 
 **Decision**: MongoDB Atlas, free M0 cluster, using Atlas Vector Search for policy chunk retrieval, accessed through Mongoose.
