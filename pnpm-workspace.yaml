@@ -8,5 +8,12 @@ allowBuilds:
   # Verified benign before approving (see docs/learning-notes.md): protobufjs's
   # postinstall only prints a semver-mismatch warning; @google/genai's
   # "prepare" script isn't even included in the published package's files.
+  # Required anyway, regardless of how harmless the scripts themselves are:
+  # pnpm's own lockfile supply-chain policy hard-fails `pnpm install` (a
+  # nonzero exit, ERR_PNPM_IGNORED_BUILDS) on ANY package with an
+  # unapproved lifecycle script - confirmed directly by removing these two
+  # and reinstalling: the packages still land on disk and build/test still
+  # pass, but `pnpm install` itself errors out, which would break CI and a
+  # fresh clone's install step.
   '@google/genai': true
   protobufjs: true
