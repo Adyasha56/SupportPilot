@@ -257,4 +257,21 @@ describe('PolicyIngestionService.ingest', () => {
     const [texts] = embed.mock.calls[0];
     expect(texts[0]).toContain('Refund Policy'); // the heading path, prepended to the embedded string
   });
+
+  it('a heading with no body of its own before its first subheading never produces an empty-text chunk (found against a real document)', async () => {
+    // "## Refund Policy" has no body text before "### Standard Refund
+    // Window" - the chunker keeps that as its own empty section (no
+    // same-parent sibling to merge into), which would otherwise fail
+    // PolicyChunk's schema-level `text` required check at commit time.
+    const text =
+      '# Company Policy\n\nIntro paragraph with enough content to stand on its own as a real chunk here.\n\n## Refund Policy\n\n### Standard Window\n\nRefunds are accepted within 30 days of purchase, no exceptions apply at all.';
+    const { service, chunkRepository } = makeService();
+
+    const result = await service.ingest({ tenantId: 'acme', text, title: 'Company Policy' });
+
+    expect(result.ok).toBe(true);
+    const stored = await chunkRepository.vectorSearch({ tenantId: 'acme', queryVector: [1], limit: 100, exact: true });
+    expect(stored.every((c) => c.text.trim().length > 0)).toBe(true);
+  });
+
 });

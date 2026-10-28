@@ -1,4 +1,4 @@
-import { Inject, Injectable, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { EMBEDDING_DIMENSION, EMBEDDING_MODEL, PolicyErrorCode } from '@supportpilot/shared';
 import { LLM_PROVIDER } from '../llm/llm.module';
 import { LLM_SETTINGS } from '../llm/llm-settings.provider';
@@ -33,6 +33,8 @@ export type IngestOutcome =
  */
 @Injectable()
 export class PolicyIngestionService {
+  private readonly logger = new Logger(PolicyIngestionService.name);
+
   constructor(
     @Inject(INGESTION_SETTINGS) private readonly settings: IngestionSettings,
     @Inject(LLM_PROVIDER) private readonly llmProvider: LlmProvider,
@@ -103,7 +105,20 @@ export class PolicyIngestionService {
       }
       return { ok: false, code: 'INVALID_CONTENT', message: chunkResult.error.message };
     }
-    const chunks = chunkResult.chunks;
+    // A heading with no body text of its own before its first subheading
+    // (e.g. "## Refund Policy" immediately followed by "### Standard Refund
+    // Window", nothing in between) legitimately produces an empty-text
+    // chunk from the chunker - it has no same-parent sibling to merge into,
+    // so it's kept as its own section rather than dropped silently inside
+    // the chunker itself (confirmed against a real document, not a
+    // hypothetical). Nothing is lost by skipping it here: its heading
+    // still appears in every one of its subsections' headingPath.
+    const chunks = chunkResult.chunks.filter((chunk) => chunk.text.trim().length > 0);
+    if (chunks.length === 0) {
+      // Every section the chunker found was heading-only, with no body
+      // text anywhere (e.g. a document that's only a table of contents).
+      return { ok: false, code: 'INVALID_CONTENT', message: 'Document has no embeddable content after chunking.' };
+    }
 
     const existingDocumentCount = await documentRepository.countActiveForTenant(params.tenantId);
     if (existingDocumentCount >= this.settings.maxDocumentsPerTenant) {
@@ -162,13 +177,22 @@ export class PolicyIngestionService {
         await chunkRepository.insertMany(newChunks, session);
         await documentRepository.markReady(params.tenantId, document.id, chunks.length, session);
       });
-    } catch {
+    } catch (err) {
       // Real MongoDB transactions already roll back atomically on any
       // error inside the callback (confirmed empirically - see
       // docs/learning-notes.md) - this delete is a safety net that's a
       // harmless no-op in that case, but is what actually guarantees "zero
       // chunks on failure" against the in-memory fakes used in tests, which
       // have no real transactional rollback of their own.
+      //
+      // The error itself is an infrastructure/driver error (a Mongoose
+      // validation message, a transaction abort reason, etc.), never
+      // document content - safe to log. Without this, a commit failure was
+      // previously undiagnosable from server logs alone.
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error(
+        JSON.stringify({ event: 'policy_commit_failed', tenantId: params.tenantId, documentId: document.id, error: message }),
+      );
       await chunkRepository.deleteForDocument(params.tenantId, document.id);
       await documentRepository.markFailed(params.tenantId, document.id, 'COMMIT_FAILED');
       return { ok: false, code: 'COMMIT_FAILED', message: 'Failed to save this document.' };
