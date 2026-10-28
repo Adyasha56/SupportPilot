@@ -1,5 +1,22 @@
 # Learning notes
 
+## Milestone 2 — Database decision: MongoDB Atlas (M0) with Atlas Vector Search, via Mongoose
+
+**Decision**: MongoDB Atlas, free M0 cluster, using Atlas Vector Search for policy chunk retrieval, accessed through Mongoose.
+
+**Why, over Postgres + pgvector**:
+- **One system for both data and vectors.** `PolicyChunk` documents and their embeddings live in the same collection, queried with one `$vectorSearch` aggregation stage rather than a separate vector extension bolted onto a relational table. For a document-shaped domain (tenants, documents, chunks, conversations, agent steps — all naturally nested/variable-shape records), this fits better than forcing a relational schema.
+- **Tenant isolation is structurally simple.** `tenantId` is just another field on every document, pre-filtered inside the same `$vectorSearch` call via the index's `filter`-type fields (see the Milestone 2 plan for the exact mechanism) — no separate row-level-security configuration needed, as Postgres would require for the same guarantee.
+- **Free tier genuinely supports it.** Verified directly against current MongoDB docs (not memory): Atlas free (M0) clusters support up to 3 Search/Vector Search indexes combined, with 512 MB storage. That's enough for this project's one tenant-filtered vector index plus headroom.
+
+**Trade-offs accepted, against Postgres + pgvector**:
+- **512 MB storage cap** is smaller than Neon's free tier — chunk text must stay lean (store extracted text only, not raw uploaded files, per RULES.md section 7).
+- **3-index ceiling** means the vector index design must be deliberate from the start — one shared index with a `tenantId` filter field, not one index per tenant (already the documented design in `PROJECT.md` section 3).
+- **No SQL joins or relational integrity** — trade-offs are handled at the application layer (Mongoose schemas + repository interfaces) rather than database constraints. Acceptable here since the data model (per `PROJECT.md` section 5) has few true relational constraints — mostly parent-child references (chunk → document → tenant), which Mongoose's `ref`/`populate` or manual `tenantId` scoping covers adequately.
+- **Index creation is asynchronous** (not instant on write) — the app must poll `listSearchIndexes()` for `queryable: true` before relying on a newly created index, which Postgres's synchronous `CREATE INDEX` wouldn't require. Handled once in a small startup/bootstrap routine, not a recurring concern.
+
+**Interview Q&A**: *"Why MongoDB over Postgres for a RAG system, when pgvector is also free and well-known?"* — Because the actual data (multi-tenant documents, chunks, conversation traces, agent steps) is naturally document-shaped, not relational, and Atlas Vector Search keeps the embeddings in the same collection as the data they describe instead of a bolted-on extension. The real constraint that shaped the design was the free tier's 3-index cap, which is why the project uses one shared vector index with a `tenantId` filter field rather than per-tenant indexes — same discipline pgvector would need under a hosted free tier's own index-count limits.
+
 ## Milestone 0 — TypeScript pinned to 6.0.3, not 7.x
 
 **What**: the root and `apps/api` `package.json` pin `typescript` to `6.0.3` instead of the registry's `latest` tag (`7.0.2`).

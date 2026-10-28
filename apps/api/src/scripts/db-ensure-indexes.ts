@@ -1,0 +1,223 @@
+/**
+ * Manually run only - never from the app's own boot path (see
+ * database.module.ts). Run once per database (dev, and separately the one
+ * fixed test database, which needs --allow-test-db):
+ *
+ *   pnpm run db:ensure-indexes
+ *   pnpm run db:ensure-indexes -- --allow-test-db   (for the shared test db)
+ *
+ * Runs compiled JS (dist/scripts/...), not the .ts source directly: Node's
+ * native TypeScript type stripping (stable since Node 24.12, confirmed
+ * against the official docs) does not support decorators at all (a parser
+ * error, no flag helps) and requires --experimental-transform-types even
+ * just for constructor parameter properties - both used throughout our
+ * NestJS code. This script itself doesn't use either today, but compiling
+ * it the same way as every other script keeps one consistent, future-proof
+ * execution mechanism rather than two different ones per script.
+ *
+ * createSearchIndex is NOT idempotent (confirmed against current MongoDB
+ * docs), and attempting to create a duplicate-named index has been reported
+ * to make Atlas Local deployments stop processing index management
+ * requests entirely - so this always checks what already exists first and
+ * never blindly (re)creates.
+ */
+import mongoose from 'mongoose';
+import { assertNotTestDatabase, getDatabaseNameFromUri } from '../db/database-name';
+import {
+  POLICY_CHUNK_VECTOR_INDEX_DEFINITION,
+  POLICY_CHUNK_VECTOR_INDEX_NAME,
+  PolicyChunkSchema,
+} from '../db/schemas/policy-chunk.schema';
+
+export const COLLECTION_NAME = 'policyChunks';
+export const POLL_INTERVAL_MS = 10_000;
+export const QUERYABLE_TIMEOUT_MS = 120_000;
+
+export interface ExistingSearchIndex {
+  name?: string;
+  queryable?: boolean;
+  status?: string;
+  latestDefinition?: {
+    fields?: Array<Record<string, unknown>>;
+  };
+}
+
+/**
+ * The minimal surface this script needs - deliberately NOT Mongoose's
+ * Model<T> generic, which has enough internal generic machinery (virtuals,
+ * statics, etc.) that assigning a concrete model to any re-typed parameter
+ * fails to compile. Also lets tests inject a fake with none of that
+ * machinery at all.
+ */
+export interface EnsureIndexDeps {
+  listCollectionNames(): Promise<string[]>;
+  createCollection(): Promise<void>;
+  listSearchIndexes(): Promise<ExistingSearchIndex[]>;
+  createSearchIndex(description: Record<string, unknown>): Promise<string>;
+}
+
+export function definitionsMatch(
+  existing: ExistingSearchIndex['latestDefinition'],
+  expected: typeof POLICY_CHUNK_VECTOR_INDEX_DEFINITION.definition,
+): boolean {
+  const existingFields = existing?.fields ?? [];
+  if (existingFields.length !== expected.fields.length) {
+    return false;
+  }
+  return expected.fields.every((expectedField) =>
+    existingFields.some((existingField) => fieldsMatch(existingField, expectedField)),
+  );
+}
+
+function fieldsMatch(
+  existingField: Record<string, unknown>,
+  expectedField: (typeof POLICY_CHUNK_VECTOR_INDEX_DEFINITION.definition.fields)[number],
+): boolean {
+  if (existingField.path !== expectedField.path || existingField.type !== expectedField.type) {
+    return false;
+  }
+  if (expectedField.type === 'vector') {
+    return (
+      existingField.numDimensions === expectedField.numDimensions &&
+      existingField.similarity === expectedField.similarity
+    );
+  }
+  return true;
+}
+
+/**
+ * Checks listCollections first (cheap, no side effect) rather than
+ * unconditionally calling createCollection every run. If the collection is
+ * missing, creates it - and if createCollection itself still throws an
+ * "already exists" / NamespaceExists error (a concurrent creator raced us
+ * between the check and the create), that specific error is treated as
+ * success rather than a failure. Mongoose's own createCollection() has an
+ * open issue about NOT always catching this itself
+ * (Automattic/mongoose#9447), so this doesn't rely on that.
+ */
+export async function ensureCollectionExists(
+  deps: EnsureIndexDeps,
+  log: (message: string) => void,
+): Promise<void> {
+  const names = await deps.listCollectionNames();
+  if (names.includes(COLLECTION_NAME)) {
+    log(`Collection "${COLLECTION_NAME}" already exists.`);
+    return;
+  }
+
+  log(`Collection "${COLLECTION_NAME}" does not exist yet - creating it.`);
+  try {
+    await deps.createCollection();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/already exists|NamespaceExists/i.test(message)) {
+      log(`Collection "${COLLECTION_NAME}" was created by a concurrent process - treating as success.`);
+      return;
+    }
+    throw err;
+  }
+}
+
+async function waitUntilQueryable(
+  deps: EnsureIndexDeps,
+  name: string,
+  timeoutMs: number,
+  log: (message: string) => void,
+): Promise<void> {
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const indexes = await deps.listSearchIndexes();
+    const match = indexes.find((index) => index.name === name);
+    if (match?.queryable) {
+      log(`Index "${name}" is queryable after ${Math.round((Date.now() - startedAt) / 1000)}s.`);
+      return;
+    }
+    const elapsedS = Math.round((Date.now() - startedAt) / 1000);
+    log(`[${elapsedS}s elapsed] Waiting for index "${name}" - status: ${match?.status ?? 'unknown'}`);
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+
+  throw new Error(
+    `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for index "${name}" to become queryable. ` +
+      'This is safe to re-run: the index already exists on Atlas and this script will simply resume polling.',
+  );
+}
+
+export async function ensureIndexes(deps: EnsureIndexDeps, log: (message: string) => void): Promise<void> {
+  await ensureCollectionExists(deps, log);
+
+  const existingIndexes = await deps.listSearchIndexes();
+  const existing = existingIndexes.find((index) => index.name === POLICY_CHUNK_VECTOR_INDEX_NAME);
+
+  if (existing) {
+    if (!definitionsMatch(existing.latestDefinition, POLICY_CHUNK_VECTOR_INDEX_DEFINITION.definition)) {
+      throw new Error(
+        `Index "${POLICY_CHUNK_VECTOR_INDEX_NAME}" already exists but its definition does not match ` +
+          'the expected one. Not auto-fixing - resolve this manually (drop and recreate, or update the code).',
+      );
+    }
+    if (existing.queryable) {
+      log(`Index "${POLICY_CHUNK_VECTOR_INDEX_NAME}" already exists, matches, and is queryable. Nothing to do.`);
+      return;
+    }
+    log(`Index "${POLICY_CHUNK_VECTOR_INDEX_NAME}" exists and matches, but isn't queryable yet.`);
+    await waitUntilQueryable(deps, POLICY_CHUNK_VECTOR_INDEX_NAME, QUERYABLE_TIMEOUT_MS, log);
+    return;
+  }
+
+  log(`Creating index "${POLICY_CHUNK_VECTOR_INDEX_NAME}"...`);
+  await deps.createSearchIndex(POLICY_CHUNK_VECTOR_INDEX_DEFINITION);
+  await waitUntilQueryable(deps, POLICY_CHUNK_VECTOR_INDEX_NAME, QUERYABLE_TIMEOUT_MS, log);
+}
+
+async function main(): Promise<void> {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    console.error('MONGODB_URI is not set.');
+    process.exitCode = 1;
+    return;
+  }
+
+  const allowTestDb = process.argv.includes('--allow-test-db');
+  try {
+    assertNotTestDatabase(uri, allowTestDb);
+  } catch (err) {
+    console.error((err as Error).message);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(`Target database: "${getDatabaseNameFromUri(uri)}"`);
+  console.log(`Target collection: "${COLLECTION_NAME}"`);
+
+  await mongoose.connect(uri);
+  const model = mongoose.model('PolicyChunk', PolicyChunkSchema);
+
+  const deps: EnsureIndexDeps = {
+    listCollectionNames: async () => {
+      const collections = await mongoose.connection.db!.listCollections({ name: COLLECTION_NAME }).toArray();
+      return collections.map((c) => c.name);
+    },
+    createCollection: async () => {
+      await model.createCollection();
+    },
+    listSearchIndexes: async () => (await model.listSearchIndexes()) as unknown as ExistingSearchIndex[],
+    createSearchIndex: async (description) =>
+      model.createSearchIndex(description as unknown as Parameters<typeof model.createSearchIndex>[0]),
+  };
+
+  try {
+    await ensureIndexes(deps, (message) => console.log(message));
+  } finally {
+    await mongoose.disconnect();
+  }
+}
+
+if (require.main === module) {
+  main().catch((err: unknown) => {
+    console.error('db:ensure-indexes failed:', err instanceof Error ? err.message : err);
+    process.exitCode = 1;
+  });
+}
