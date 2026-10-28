@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import mongoose from 'mongoose';
+import { EMBEDDING_DIMENSION, EMBEDDING_MODEL } from '@supportpilot/shared';
 import {
   POLICY_CHUNK_EMBEDDING_DIMENSION,
   POLICY_CHUNK_VECTOR_INDEX_DEFINITION,
@@ -89,5 +90,24 @@ describe('POLICY_CHUNK_VECTOR_INDEX_DEFINITION', () => {
       (f) => f.type === 'vector',
     );
     expect(vectorFields).toHaveLength(1);
+  });
+});
+
+describe('embedding dimension stays in sync with @supportpilot/shared', () => {
+  // Guards against the vector index and the LLM provider silently
+  // diverging if either side is ever edited to use a literal number
+  // instead of the shared constant - a mismatch would make retrieval
+  // either fail outright or silently return nothing.
+  it('the index definition uses the shared EMBEDDING_DIMENSION constant', () => {
+    expect(POLICY_CHUNK_EMBEDDING_DIMENSION).toBe(EMBEDDING_DIMENSION);
+    const vectorField = POLICY_CHUNK_VECTOR_INDEX_DEFINITION.definition.fields.find((f) => f.type === 'vector');
+    expect(vectorField?.numDimensions).toBe(EMBEDDING_DIMENSION);
+  });
+
+  it('EMBEDDING_MODEL and EMBEDDING_DIMENSION are the pinned, intentional values', () => {
+    // Pins the current decision explicitly, so changing either is a visible,
+    // deliberate diff here rather than an accidental one-line edit elsewhere.
+    expect(EMBEDDING_MODEL).toBe('gemini-embedding-001');
+    expect(EMBEDDING_DIMENSION).toBe(768);
   });
 });
