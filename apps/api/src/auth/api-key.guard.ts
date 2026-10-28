@@ -1,4 +1,4 @@
-import { CanActivate, ExecutionContext, Inject, Injectable, UnauthorizedException } from '@nestjs/common';
+import { CanActivate, ExecutionContext, Inject, Injectable, Optional, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import type { Request } from 'express';
 import { API_KEY_REPOSITORY, ApiKeyRepository } from '../db/api-key.repository';
@@ -26,11 +26,23 @@ export class ApiKeyGuard implements CanActivate {
   private readonly limiter = new FailedAttemptLimiter();
 
   constructor(
-    @Inject(API_KEY_REPOSITORY) private readonly repository: ApiKeyRepository,
+    @Optional() @Inject(API_KEY_REPOSITORY) private readonly repository: ApiKeyRepository | undefined,
     private readonly reflector: Reflector,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
+    if (!this.repository) {
+      // No database configured at all - every key lookup is impossible,
+      // not just this one's. 503 (not the generic 401) because this is a
+      // server configuration problem, never a bad credential - it must
+      // never be confused with "the app is fine, your key is wrong."
+      throw new ServiceUnavailableException({
+        statusCode: 503,
+        code: 'NOT_CONFIGURED',
+        message: 'The database is not configured.',
+      });
+    }
+
     const request = context.switchToHttp().getRequest<Request>();
     const clientKey = request.ip ?? request.socket.remoteAddress ?? 'unknown';
 
@@ -51,10 +63,15 @@ export class ApiKeyGuard implements CanActivate {
       this.fail(clientKey);
     }
 
-    const requiredScope = this.reflector.get<ApiKeyScope | undefined>(
-      REQUIRE_SCOPE_KEY,
+    // getAllAndOverride checks the handler (method) first, falling back to
+    // the class - @RequireScope() works whether applied to one route or to
+    // an entire controller (e.g. PoliciesController applies it once, at the
+    // class level). A plain reflector.get(key, context.getHandler()) would
+    // silently miss class-level metadata entirely.
+    const requiredScope = this.reflector.getAllAndOverride<ApiKeyScope | undefined>(REQUIRE_SCOPE_KEY, [
       context.getHandler(),
-    );
+      context.getClass(),
+    ]);
     if (requiredScope && !record!.scopes.includes(requiredScope)) {
       this.fail(clientKey);
     }
