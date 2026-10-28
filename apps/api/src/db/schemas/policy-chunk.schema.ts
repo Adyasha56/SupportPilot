@@ -1,7 +1,9 @@
 import { Schema, Types } from 'mongoose';
+import { EMBEDDING_DIMENSION } from '@supportpilot/shared';
 
 export const POLICY_CHUNK_VECTOR_INDEX_NAME = 'policy_chunk_vector_index';
-export const POLICY_CHUNK_EMBEDDING_DIMENSION = 768;
+/** Re-exported for existing call sites; the single source of truth is `@supportpilot/shared`'s EMBEDDING_DIMENSION. */
+export const POLICY_CHUNK_EMBEDDING_DIMENSION = EMBEDDING_DIMENSION;
 
 export interface PolicyChunkDocument {
   _id: Types.ObjectId;

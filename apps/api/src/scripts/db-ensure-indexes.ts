@@ -28,10 +28,36 @@ import {
   POLICY_CHUNK_VECTOR_INDEX_NAME,
   PolicyChunkSchema,
 } from '../db/schemas/policy-chunk.schema';
+import { ApiKeySchema } from '../db/schemas/api-key.schema';
+import { TenantSchema } from '../db/schemas/tenant.schema';
+import { PolicyDocumentSchema } from '../db/schemas/policy-document.schema';
 
 export const COLLECTION_NAME = 'policyChunks';
 export const POLL_INTERVAL_MS = 10_000;
 export const QUERYABLE_TIMEOUT_MS = 120_000;
+
+export interface RegularIndexModel {
+  name: string;
+  syncIndexes(): Promise<string[]>;
+}
+
+/**
+ * Regular (non-Atlas-Search) index management for every schema - e.g. the
+ * unique index on ApiKey.hash. Mongoose's autoIndex is set to false (see
+ * database.module.ts) so these are never built implicitly at app boot;
+ * syncIndexes() is the documented replacement, run manually, here, next to
+ * the Atlas Vector Search index management below - one script owns all
+ * index creation for the whole database.
+ */
+export async function ensureRegularIndexes(models: RegularIndexModel[], log: (message: string) => void): Promise<void> {
+  for (const model of models) {
+    const dropped = await model.syncIndexes();
+    if (dropped.length > 0) {
+      log(`${model.name}: dropped stale index(es) not in the schema: ${dropped.join(', ')}`);
+    }
+    log(`${model.name}: regular indexes are in sync with the schema.`);
+  }
+}
 
 export interface ExistingSearchIndex {
   name?: string;
@@ -194,6 +220,16 @@ async function main(): Promise<void> {
 
   await mongoose.connect(uri);
   const model = mongoose.model('PolicyChunk', PolicyChunkSchema);
+  const tenantModel = mongoose.model('Tenant', TenantSchema);
+  const apiKeyModel = mongoose.model('ApiKey', ApiKeySchema);
+  const policyDocumentModel = mongoose.model('PolicyDocument', PolicyDocumentSchema);
+
+  const regularIndexModels: RegularIndexModel[] = [
+    { name: 'Tenant', syncIndexes: () => tenantModel.syncIndexes() },
+    { name: 'ApiKey', syncIndexes: () => apiKeyModel.syncIndexes() },
+    { name: 'PolicyDocument', syncIndexes: () => policyDocumentModel.syncIndexes() },
+    { name: 'PolicyChunk', syncIndexes: () => model.syncIndexes() },
+  ];
 
   const deps: EnsureIndexDeps = {
     listCollectionNames: async () => {
@@ -209,6 +245,7 @@ async function main(): Promise<void> {
   };
 
   try {
+    await ensureRegularIndexes(regularIndexModels, (message) => console.log(message));
     await ensureIndexes(deps, (message) => console.log(message));
   } finally {
     await mongoose.disconnect();

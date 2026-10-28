@@ -30,7 +30,18 @@ const repositoryProviders: Provider[] = [
     // MONGODB_URI hangs the whole app at boot with ZERO log output (not
     // even Nest's own startup line) - confirmed directly. 5s fails loudly
     // instead of hanging silently.
-    MongooseModule.forRoot(process.env.MONGODB_URI as string, { serverSelectionTimeoutMS: 5000 }),
+    //
+    // autoIndex: false - explicit, not relying on Mongoose's own default
+    // (true). Index creation (both this unique index on ApiKey.hash and the
+    // Atlas Vector Search index on PolicyChunk) is exclusively the
+    // `db:ensure-indexes` script's job, run manually, never from the app's
+    // own boot path - same rule already applied to the Vector index,
+    // extended here to ordinary indexes too, so there's one script and one
+    // mental model for all index management instead of two.
+    MongooseModule.forRoot(process.env.MONGODB_URI as string, {
+      serverSelectionTimeoutMS: 5000,
+      autoIndex: false,
+    }),
     MongooseModule.forFeature([
       { name: 'Tenant', schema: TenantSchema },
       { name: 'PolicyDocument', schema: PolicyDocumentSchema },

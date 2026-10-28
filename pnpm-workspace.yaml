@@ -5,3 +5,8 @@ packages:
 
 allowBuilds:
   '@swc/core': true
+  # Verified benign before approving (see docs/learning-notes.md): protobufjs's
+  # postinstall only prints a semver-mismatch warning; @google/genai's
+  # "prepare" script isn't even included in the published package's files.
+  '@google/genai': true
+  protobufjs: true
