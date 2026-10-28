@@ -1,6 +1,6 @@
 import { CanActivate, ExecutionContext, Inject, Injectable, UnauthorizedException } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { Request } from 'express';
+import type { Request } from 'express';
 import { API_KEY_REPOSITORY, ApiKeyRepository } from '../db/api-key.repository';
 import { ApiKeyScope } from '../db/schemas/api-key.schema';
 import { hashApiKey, verifyApiKeyHash } from './api-key.service';

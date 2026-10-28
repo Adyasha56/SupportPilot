@@ -5,6 +5,11 @@
  *
  *   pnpm run db:ensure-indexes
  *   pnpm run db:ensure-indexes -- --allow-test-db   (for the shared test db)
+ *   pnpm run db:ensure-indexes -- --dry-run         (prints the plan, changes nothing)
+ *
+ * --dry-run still connects and reads real state (so the plan it prints is
+ * accurate), and the test_ database guard still applies to it - a dry-run
+ * is not an exemption from that guard, only from making changes.
  *
  * Runs compiled JS (dist/scripts/...), not the .ts source directly: Node's
  * native TypeScript type stripping (stable since Node 24.12, confirmed
@@ -38,6 +43,7 @@ export const QUERYABLE_TIMEOUT_MS = 120_000;
 
 export interface RegularIndexModel {
   name: string;
+  diffIndexes(): Promise<{ toDrop: string[]; toCreate: string[] }>;
   syncIndexes(): Promise<string[]>;
 }
 
@@ -48,14 +54,31 @@ export interface RegularIndexModel {
  * syncIndexes() is the documented replacement, run manually, here, next to
  * the Atlas Vector Search index management below - one script owns all
  * index creation for the whole database.
+ *
+ * diffIndexes() is called first (even outside --dry-run) so every created
+ * or dropped index name is logged explicitly - syncIndexes()'s own return
+ * value only reports what it dropped, not what it created.
  */
-export async function ensureRegularIndexes(models: RegularIndexModel[], log: (message: string) => void): Promise<void> {
+export async function ensureRegularIndexes(
+  models: RegularIndexModel[],
+  log: (message: string) => void,
+  options: { dryRun: boolean } = { dryRun: false },
+): Promise<void> {
   for (const model of models) {
-    const dropped = await model.syncIndexes();
-    if (dropped.length > 0) {
-      log(`${model.name}: dropped stale index(es) not in the schema: ${dropped.join(', ')}`);
+    const { toDrop, toCreate } = await model.diffIndexes();
+    if (toDrop.length === 0 && toCreate.length === 0) {
+      log(`${model.name}: regular indexes already in sync with the schema.`);
+      continue;
     }
-    log(`${model.name}: regular indexes are in sync with the schema.`);
+    if (toCreate.length > 0) {
+      log(`${model.name}: ${options.dryRun ? '[dry-run] would create' : 'creating'} index(es): ${toCreate.join(', ')}`);
+    }
+    if (toDrop.length > 0) {
+      log(`${model.name}: ${options.dryRun ? '[dry-run] would drop' : 'dropping'} index(es): ${toDrop.join(', ')}`);
+    }
+    if (!options.dryRun) {
+      await model.syncIndexes();
+    }
   }
 }
 
@@ -124,10 +147,16 @@ function fieldsMatch(
 export async function ensureCollectionExists(
   deps: EnsureIndexDeps,
   log: (message: string) => void,
+  dryRun = false,
 ): Promise<void> {
   const names = await deps.listCollectionNames();
   if (names.includes(COLLECTION_NAME)) {
     log(`Collection "${COLLECTION_NAME}" already exists.`);
+    return;
+  }
+
+  if (dryRun) {
+    log(`[dry-run] Collection "${COLLECTION_NAME}" does not exist yet - would create it.`);
     return;
   }
 
@@ -171,13 +200,16 @@ async function waitUntilQueryable(
   );
 }
 
-export async function ensureIndexes(deps: EnsureIndexDeps, log: (message: string) => void): Promise<void> {
-  await ensureCollectionExists(deps, log);
+export async function ensureIndexes(deps: EnsureIndexDeps, log: (message: string) => void, dryRun = false): Promise<void> {
+  await ensureCollectionExists(deps, log, dryRun);
 
   const existingIndexes = await deps.listSearchIndexes();
   const existing = existingIndexes.find((index) => index.name === POLICY_CHUNK_VECTOR_INDEX_NAME);
 
   if (existing) {
+    // A definition mismatch is always reported as an error, dry-run or not -
+    // it's a validation finding, not a mutation, so there's nothing for
+    // --dry-run to defer.
     if (!definitionsMatch(existing.latestDefinition, POLICY_CHUNK_VECTOR_INDEX_DEFINITION.definition)) {
       throw new Error(
         `Index "${POLICY_CHUNK_VECTOR_INDEX_NAME}" already exists but its definition does not match ` +
@@ -189,7 +221,16 @@ export async function ensureIndexes(deps: EnsureIndexDeps, log: (message: string
       return;
     }
     log(`Index "${POLICY_CHUNK_VECTOR_INDEX_NAME}" exists and matches, but isn't queryable yet.`);
+    if (dryRun) {
+      log(`[dry-run] Would wait for it to become queryable - no action needed, it already exists.`);
+      return;
+    }
     await waitUntilQueryable(deps, POLICY_CHUNK_VECTOR_INDEX_NAME, QUERYABLE_TIMEOUT_MS, log);
+    return;
+  }
+
+  if (dryRun) {
+    log(`[dry-run] Index "${POLICY_CHUNK_VECTOR_INDEX_NAME}" does not exist - would create it.`);
     return;
   }
 
@@ -207,6 +248,7 @@ async function main(): Promise<void> {
   }
 
   const allowTestDb = process.argv.includes('--allow-test-db');
+  const dryRun = process.argv.includes('--dry-run');
   try {
     assertNotTestDatabase(uri, allowTestDb);
   } catch (err) {
@@ -217,6 +259,9 @@ async function main(): Promise<void> {
 
   console.log(`Target database: "${getDatabaseNameFromUri(uri)}"`);
   console.log(`Target collection: "${COLLECTION_NAME}"`);
+  if (dryRun) {
+    console.log('Mode: --dry-run (no changes will be made)');
+  }
 
   await mongoose.connect(uri);
   const model = mongoose.model('PolicyChunk', PolicyChunkSchema);
@@ -225,10 +270,14 @@ async function main(): Promise<void> {
   const policyDocumentModel = mongoose.model('PolicyDocument', PolicyDocumentSchema);
 
   const regularIndexModels: RegularIndexModel[] = [
-    { name: 'Tenant', syncIndexes: () => tenantModel.syncIndexes() },
-    { name: 'ApiKey', syncIndexes: () => apiKeyModel.syncIndexes() },
-    { name: 'PolicyDocument', syncIndexes: () => policyDocumentModel.syncIndexes() },
-    { name: 'PolicyChunk', syncIndexes: () => model.syncIndexes() },
+    { name: 'Tenant', diffIndexes: () => tenantModel.diffIndexes(), syncIndexes: () => tenantModel.syncIndexes() },
+    { name: 'ApiKey', diffIndexes: () => apiKeyModel.diffIndexes(), syncIndexes: () => apiKeyModel.syncIndexes() },
+    {
+      name: 'PolicyDocument',
+      diffIndexes: () => policyDocumentModel.diffIndexes(),
+      syncIndexes: () => policyDocumentModel.syncIndexes(),
+    },
+    { name: 'PolicyChunk', diffIndexes: () => model.diffIndexes(), syncIndexes: () => model.syncIndexes() },
   ];
 
   const deps: EnsureIndexDeps = {
@@ -245,8 +294,8 @@ async function main(): Promise<void> {
   };
 
   try {
-    await ensureRegularIndexes(regularIndexModels, (message) => console.log(message));
-    await ensureIndexes(deps, (message) => console.log(message));
+    await ensureRegularIndexes(regularIndexModels, (message) => console.log(message), { dryRun });
+    await ensureIndexes(deps, (message) => console.log(message), dryRun);
   } finally {
     await mongoose.disconnect();
   }
