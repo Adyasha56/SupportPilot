@@ -1,12 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, PipelineStage, Types } from 'mongoose';
+import { ClientSession, Model, PipelineStage, Types } from 'mongoose';
 import { POLICY_CHUNK_VECTOR_INDEX_NAME, PolicyChunkDocument } from './schemas/policy-chunk.schema';
 
 export interface NewPolicyChunk {
   tenantId: string;
   documentId: string;
   title: string;
+  headingPath: string;
   position: number;
   text: string;
   embedding: number[];
@@ -39,11 +40,21 @@ export interface VectorSearchResultItem {
 }
 
 export interface PolicyChunkRepository {
-  insertMany(chunks: NewPolicyChunk[]): Promise<void>;
-  activateForDocument(tenantId: string, documentId: string): Promise<void>;
+  /**
+   * Chunks are inserted already `active: true`, inside the same
+   * transaction (session) that also marks the parent document `ready` -
+   * confirmed empirically that multi-document transactions work on this
+   * project's Atlas M0 cluster (see docs/learning-notes.md), so there is
+   * no separate "insert inactive, then activate" phase to begin with.
+   */
+  insertMany(chunks: NewPolicyChunk[], session?: ClientSession): Promise<void>;
+  /** First step of delete (see policies.controller.ts): stop new reads from seeing these chunks before they're physically removed. */
+  deactivateForDocument(tenantId: string, documentId: string): Promise<void>;
   deleteForDocument(tenantId: string, documentId: string): Promise<void>;
   /** Test cleanup only - deletes by tenantId, never dropDatabase. */
   deleteForTenant(tenantId: string): Promise<void>;
+  /** Used for the tenant chunk quota - counts all chunks regardless of active state (inactive ones are rare and transient, only existing mid-delete). */
+  countForTenant(tenantId: string): Promise<number>;
   /**
    * tenantId and active are BOTH applied as $vectorSearch pre-filters (the
    * index declares them as "filter"-type fields) - never a post-filter on
@@ -61,17 +72,18 @@ export const POLICY_CHUNK_REPOSITORY = Symbol('POLICY_CHUNK_REPOSITORY');
 export class MongoosePolicyChunkRepository implements PolicyChunkRepository {
   constructor(@InjectModel('PolicyChunk') private readonly model: Model<PolicyChunkDocument>) {}
 
-  async insertMany(chunks: NewPolicyChunk[]): Promise<void> {
+  async insertMany(chunks: NewPolicyChunk[], session?: ClientSession): Promise<void> {
     if (chunks.length === 0) {
       return;
     }
     await this.model.insertMany(
-      chunks.map((chunk) => ({ ...chunk, documentId: new Types.ObjectId(chunk.documentId), active: false })),
+      chunks.map((chunk) => ({ ...chunk, documentId: new Types.ObjectId(chunk.documentId), active: true })),
+      { session },
     );
   }
 
-  async activateForDocument(tenantId: string, documentId: string): Promise<void> {
-    await this.model.updateMany({ tenantId, documentId: new Types.ObjectId(documentId) }, { $set: { active: true } });
+  async deactivateForDocument(tenantId: string, documentId: string): Promise<void> {
+    await this.model.updateMany({ tenantId, documentId: new Types.ObjectId(documentId) }, { $set: { active: false } });
   }
 
   async deleteForDocument(tenantId: string, documentId: string): Promise<void> {
@@ -80,6 +92,10 @@ export class MongoosePolicyChunkRepository implements PolicyChunkRepository {
 
   async deleteForTenant(tenantId: string): Promise<void> {
     await this.model.deleteMany({ tenantId });
+  }
+
+  async countForTenant(tenantId: string): Promise<number> {
+    return this.model.countDocuments({ tenantId });
   }
 
   async vectorSearch(params: VectorSearchParams): Promise<VectorSearchResultItem[]> {
