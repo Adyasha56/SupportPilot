@@ -4,7 +4,9 @@ import {
   EnsureIndexDeps,
   ensureCollectionExists,
   ensureIndexes,
+  ensureRegularIndexes,
   ExistingSearchIndex,
+  RegularIndexModel,
 } from './db-ensure-indexes';
 import { POLICY_CHUNK_VECTOR_INDEX_DEFINITION, POLICY_CHUNK_VECTOR_INDEX_NAME } from '../db/schemas/policy-chunk.schema';
 
@@ -62,6 +64,31 @@ describe('definitionsMatch', () => {
   it('rejects a definition missing a field', () => {
     const incomplete = { fields: POLICY_CHUNK_VECTOR_INDEX_DEFINITION.definition.fields.slice(0, 1) };
     expect(definitionsMatch(incomplete, POLICY_CHUNK_VECTOR_INDEX_DEFINITION.definition)).toBe(false);
+  });
+});
+
+describe('ensureRegularIndexes', () => {
+  it('syncs every model and logs nothing extra when nothing was dropped', async () => {
+    const models: RegularIndexModel[] = [
+      { name: 'Tenant', syncIndexes: vi.fn(async () => []) },
+      { name: 'ApiKey', syncIndexes: vi.fn(async () => []) },
+    ];
+    const logs: string[] = [];
+    await ensureRegularIndexes(models, (m) => logs.push(m));
+
+    for (const model of models) {
+      expect(model.syncIndexes).toHaveBeenCalledTimes(1);
+    }
+    expect(logs.some((l) => l.includes('dropped'))).toBe(false);
+    expect(logs.filter((l) => l.includes('in sync'))).toHaveLength(2);
+  });
+
+  it('logs the dropped index names when syncIndexes removes a stale one', async () => {
+    const models: RegularIndexModel[] = [{ name: 'ApiKey', syncIndexes: vi.fn(async () => ['old_index_1']) }];
+    const logs: string[] = [];
+    await ensureRegularIndexes(models, (m) => logs.push(m));
+
+    expect(logs.some((l) => l.includes('old_index_1'))).toBe(true);
   });
 });
 

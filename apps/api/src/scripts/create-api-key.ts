@@ -62,10 +62,23 @@ async function runCreate(args: Record<string, string | boolean>): Promise<void> 
 
 async function runRevoke(id: string): Promise<void> {
   const ApiKeyModel = mongoose.model('ApiKey', ApiKeySchema);
-  const result = await ApiKeyModel.updateOne({ _id: id, revokedAt: null }, { $set: { revokedAt: new Date() } });
-  if (result.modifiedCount === 0) {
-    throw new Error(`No active key found with id "${id}" (already revoked, or id does not exist).`);
+
+  // Loaded (and its tenant/prefix printed) before revoking, so an operator
+  // confirms they're about to revoke the right key - hash is never fetched
+  // or printed, since the schema's select:false still applies to find().
+  const existing = await ApiKeyModel.findById(id);
+  if (!existing) {
+    throw new Error(`No key found with id "${id}".`);
   }
+  if (existing.revokedAt) {
+    throw new Error(
+      `Key ${id} (tenant: ${existing.tenantId}, prefix: ${existing.keyPrefix}) is already revoked - nothing to do.`,
+    );
+  }
+
+  console.log(`Revoking key ${id} - tenant: ${existing.tenantId}, prefix: ${existing.keyPrefix}`);
+  existing.revokedAt = new Date();
+  await existing.save();
   console.log(`Key ${id} revoked.`);
 }
 
