@@ -9,14 +9,23 @@ export interface PolicyChunkDocument {
   _id: Types.ObjectId;
   tenantId: string;
   documentId: Types.ObjectId;
+  /** The PARENT DOCUMENT's title, denormalized onto every chunk so a citation can be rendered without an extra lookup (see PROJECT.md section 6's citation shape). */
   title: string;
+  /** e.g. "Refund Policy > Late Delivery", or '' - from Stage 4's chunker, kept so retrieval/the reasoning panel can show which section a chunk came from. */
+  headingPath: string;
   position: number;
   text: string;
   /** select:false - never returned by find()/findOne() unless explicitly requested. */
   embedding: number[];
   embeddingModel: string;
   embeddingDimension: number;
-  /** SHA-256 of `text`, keyed with model+dimension+taskType by the embedding cache. */
+  /**
+   * SHA-256 of `embeddingText` (headingPath + text, the string actually
+   * sent to the embedding model) - NOT of the display-only `text` field.
+   * This matches what the embedding cache itself keys on
+   * (EmbeddingLruCache.key(model, dimension, taskType, <embedded string>)),
+   * so the two can never silently diverge.
+   */
   contentHash: string;
   /**
    * False until the whole parent document finishes embedding and commits.
@@ -32,6 +41,11 @@ export const PolicyChunkSchema = new Schema<PolicyChunkDocument>(
     tenantId: { type: String, required: true, index: true },
     documentId: { type: Schema.Types.ObjectId, required: true, index: true },
     title: { type: String, required: true },
+    // NOT required: true - an empty string ('', the valid "no heading"
+    // case) fails Mongoose's own required check for String paths (it's
+    // `v.length > 0`, not `v != null` - confirmed directly, the same
+    // category of gotcha as `embedding`'s empty-array case above).
+    headingPath: { type: String, default: '' },
     position: { type: Number, required: true },
     text: { type: String, required: true },
     embedding: {

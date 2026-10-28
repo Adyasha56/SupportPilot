@@ -8,12 +8,14 @@ import { MongooseTenantRepository, TENANT_REPOSITORY } from './tenant.repository
 import { MongooseApiKeyRepository, API_KEY_REPOSITORY } from './api-key.repository';
 import { MongoosePolicyDocumentRepository, POLICY_DOCUMENT_REPOSITORY } from './policy-document.repository';
 import { MongoosePolicyChunkRepository, POLICY_CHUNK_REPOSITORY } from './policy-chunk.repository';
+import { MongooseTransactionRunner, TRANSACTION_RUNNER } from './transaction-runner';
 
 const repositoryProviders: Provider[] = [
   { provide: TENANT_REPOSITORY, useClass: MongooseTenantRepository },
   { provide: API_KEY_REPOSITORY, useClass: MongooseApiKeyRepository },
   { provide: POLICY_DOCUMENT_REPOSITORY, useClass: MongoosePolicyDocumentRepository },
   { provide: POLICY_CHUNK_REPOSITORY, useClass: MongoosePolicyChunkRepository },
+  { provide: TRANSACTION_RUNNER, useClass: MongooseTransactionRunner },
 ];
 
 /**
@@ -56,6 +58,7 @@ const repositoryProviders: Provider[] = [
     API_KEY_REPOSITORY,
     POLICY_DOCUMENT_REPOSITORY,
     POLICY_CHUNK_REPOSITORY,
+    TRANSACTION_RUNNER,
   ],
 })
 export class DatabaseModule {}

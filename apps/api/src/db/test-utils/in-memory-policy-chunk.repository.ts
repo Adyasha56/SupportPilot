@@ -36,14 +36,14 @@ export class InMemoryPolicyChunkRepository implements PolicyChunkRepository {
 
   async insertMany(chunks: NewPolicyChunk[]): Promise<void> {
     for (const chunk of chunks) {
-      this.chunks.push({ ...chunk, id: randomUUID(), active: false });
+      this.chunks.push({ ...chunk, id: randomUUID(), active: true });
     }
   }
 
-  async activateForDocument(tenantId: string, documentId: string): Promise<void> {
+  async deactivateForDocument(tenantId: string, documentId: string): Promise<void> {
     for (const chunk of this.chunks) {
       if (chunk.tenantId === tenantId && chunk.documentId === documentId) {
-        chunk.active = true;
+        chunk.active = false;
       }
     }
   }
@@ -54,6 +54,10 @@ export class InMemoryPolicyChunkRepository implements PolicyChunkRepository {
 
   async deleteForTenant(tenantId: string): Promise<void> {
     this.removeWhere((chunk) => chunk.tenantId === tenantId);
+  }
+
+  async countForTenant(tenantId: string): Promise<number> {
+    return this.chunks.filter((chunk) => chunk.tenantId === tenantId).length;
   }
 
   async vectorSearch(params: VectorSearchParams): Promise<VectorSearchResultItem[]> {

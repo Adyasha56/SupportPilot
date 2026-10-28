@@ -32,6 +32,25 @@ describe('PolicyChunkSchema', () => {
     await expect(doc.validate()).resolves.toBeUndefined();
   });
 
+  it('defaults headingPath to an empty string, and an empty string validates fine', async () => {
+    const doc = new PolicyChunkModel(validChunkData());
+    expect(doc.headingPath).toBe('');
+    await expect(doc.validate()).resolves.toBeUndefined();
+
+    // Confirmed directly: Mongoose's own required-check for String paths
+    // is `v.length > 0`, not `v != null` - required:true would reject the
+    // valid "no heading" case outright, the same category of gotcha as
+    // the `embedding` empty-array case below.
+    const withExplicitEmpty = new PolicyChunkModel(validChunkData({ headingPath: '' }));
+    await expect(withExplicitEmpty.validate()).resolves.toBeUndefined();
+  });
+
+  it('stores a non-empty headingPath as given', async () => {
+    const doc = new PolicyChunkModel(validChunkData({ headingPath: 'Refund Policy > Late Delivery' }));
+    expect(doc.headingPath).toBe('Refund Policy > Late Delivery');
+    await expect(doc.validate()).resolves.toBeUndefined();
+  });
+
   it('requires embeddingModel, embeddingDimension, and contentHash', async () => {
     const doc = new PolicyChunkModel(
       validChunkData({ embeddingModel: undefined, embeddingDimension: undefined, contentHash: undefined }),
