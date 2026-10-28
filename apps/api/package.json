@@ -2,7 +2,10 @@
   "name": "@supportpilot/api",
   "version": "0.0.0",
   "private": true,
-  "files": ["dist", "src/connectors/fixtures"],
+  "files": [
+    "dist",
+    "src/connectors/fixtures"
+  ],
   "scripts": {
     "build": "nest build",
     "start": "node dist/main.js",
@@ -10,9 +13,11 @@
     "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\"",
     "test": "vitest run",
     "db:ensure-indexes": "node --env-file-if-exists=.env dist/scripts/db-ensure-indexes.js",
-    "create-api-key": "node --env-file-if-exists=.env dist/scripts/create-api-key.js"
+    "create-api-key": "node --env-file-if-exists=.env dist/scripts/create-api-key.js",
+    "embedding-smoke-test": "node --env-file-if-exists=.env dist/scripts/embedding-smoke-test.js"
   },
   "dependencies": {
+    "@google/genai": "2.31.0",
     "@nestjs/common": "12.2.0",
     "@nestjs/config": "12.0.1",
     "@nestjs/core": "12.2.0",

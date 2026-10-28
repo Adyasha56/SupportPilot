@@ -30,6 +30,9 @@ coverage/
 # Docker
 *.pid
 
+# Manual embedding-smoke-test file cache (never used by the app itself)
+.embedding-cache/
+
 # Local-only project docs (kept in codebase, never pushed)
 /CLAUDE.md
 /PROJECT.md
