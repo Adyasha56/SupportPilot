@@ -52,6 +52,15 @@ describe('ensureCollectionExists', () => {
     });
     await expect(ensureCollectionExists(deps, () => undefined)).rejects.toThrow('connection refused');
   });
+
+  it('--dry-run reports it would create the collection, without creating it', async () => {
+    const deps = makeDeps({ listCollectionNames: vi.fn(async () => []) });
+    const logs: string[] = [];
+    await ensureCollectionExists(deps, (m) => logs.push(m), true);
+
+    expect(deps.createCollection).not.toHaveBeenCalled();
+    expect(logs.some((l) => l.includes('[dry-run]') && l.includes('would create'))).toBe(true);
+  });
 });
 
 describe('definitionsMatch', () => {
@@ -67,28 +76,44 @@ describe('definitionsMatch', () => {
   });
 });
 
+function makeRegularModel(name: string, diff: { toDrop: string[]; toCreate: string[] }): RegularIndexModel {
+  return {
+    name,
+    diffIndexes: vi.fn(async () => diff),
+    syncIndexes: vi.fn(async () => diff.toDrop),
+  };
+}
+
 describe('ensureRegularIndexes', () => {
-  it('syncs every model and logs nothing extra when nothing was dropped', async () => {
-    const models: RegularIndexModel[] = [
-      { name: 'Tenant', syncIndexes: vi.fn(async () => []) },
-      { name: 'ApiKey', syncIndexes: vi.fn(async () => []) },
-    ];
+  it('syncs every model and logs "already in sync" when nothing changed', async () => {
+    const models = [makeRegularModel('Tenant', { toDrop: [], toCreate: [] }), makeRegularModel('ApiKey', { toDrop: [], toCreate: [] })];
     const logs: string[] = [];
     await ensureRegularIndexes(models, (m) => logs.push(m));
 
     for (const model of models) {
-      expect(model.syncIndexes).toHaveBeenCalledTimes(1);
+      expect(model.syncIndexes).not.toHaveBeenCalled(); // nothing to do, so syncIndexes is skipped entirely
     }
-    expect(logs.some((l) => l.includes('dropped'))).toBe(false);
-    expect(logs.filter((l) => l.includes('in sync'))).toHaveLength(2);
+    expect(logs.filter((l) => l.includes('already in sync'))).toHaveLength(2);
   });
 
-  it('logs the dropped index names when syncIndexes removes a stale one', async () => {
-    const models: RegularIndexModel[] = [{ name: 'ApiKey', syncIndexes: vi.fn(async () => ['old_index_1']) }];
+  it('explicitly logs every index name to be created and dropped, then syncs', async () => {
+    const model = makeRegularModel('ApiKey', { toDrop: ['old_index_1'], toCreate: ['hash_1'] });
     const logs: string[] = [];
-    await ensureRegularIndexes(models, (m) => logs.push(m));
+    await ensureRegularIndexes([model], (m) => logs.push(m));
 
-    expect(logs.some((l) => l.includes('old_index_1'))).toBe(true);
+    expect(logs.some((l) => l.includes('creating') && l.includes('hash_1'))).toBe(true);
+    expect(logs.some((l) => l.includes('dropping') && l.includes('old_index_1'))).toBe(true);
+    expect(model.syncIndexes).toHaveBeenCalledTimes(1);
+  });
+
+  it('--dry-run reports the plan but never calls syncIndexes', async () => {
+    const model = makeRegularModel('ApiKey', { toDrop: ['old_index_1'], toCreate: ['hash_1'] });
+    const logs: string[] = [];
+    await ensureRegularIndexes([model], (m) => logs.push(m), { dryRun: true });
+
+    expect(logs.some((l) => l.includes('[dry-run]') && l.includes('would create') && l.includes('hash_1'))).toBe(true);
+    expect(logs.some((l) => l.includes('[dry-run]') && l.includes('would drop') && l.includes('old_index_1'))).toBe(true);
+    expect(model.syncIndexes).not.toHaveBeenCalled();
   });
 });
 
@@ -152,5 +177,31 @@ describe('ensureIndexes', () => {
 
     await expect(ensureIndexes(deps, () => undefined)).rejects.toThrow(/does not match/);
     expect(deps.createSearchIndex).not.toHaveBeenCalled();
+  });
+
+  it('--dry-run reports it would create the index, without creating it or the collection', async () => {
+    const deps = makeDeps({
+      listCollectionNames: vi.fn(async () => []),
+      listSearchIndexes: vi.fn(async () => []),
+    });
+    const logs: string[] = [];
+    await ensureIndexes(deps, (m) => logs.push(m), true);
+
+    expect(deps.createCollection).not.toHaveBeenCalled();
+    expect(deps.createSearchIndex).not.toHaveBeenCalled();
+    expect(logs.some((l) => l.includes('[dry-run]') && l.includes(POLICY_CHUNK_VECTOR_INDEX_NAME) && l.includes('would create'))).toBe(
+      true,
+    );
+  });
+
+  it('a mismatched existing definition is still an error under --dry-run', async () => {
+    const deps = makeDeps({
+      listCollectionNames: vi.fn(async () => ['policyChunks']),
+      listSearchIndexes: vi.fn(async () => [
+        { name: POLICY_CHUNK_VECTOR_INDEX_NAME, queryable: true, latestDefinition: { fields: [] } },
+      ]),
+    });
+
+    await expect(ensureIndexes(deps, () => undefined, true)).rejects.toThrow(/does not match/);
   });
 });
