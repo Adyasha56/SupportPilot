@@ -51,6 +51,16 @@ export interface PolicyChunkRepository {
   /** First step of delete (see policies.controller.ts): stop new reads from seeing these chunks before they're physically removed. */
   deactivateForDocument(tenantId: string, documentId: string): Promise<void>;
   deleteForDocument(tenantId: string, documentId: string): Promise<void>;
+  /**
+   * Used only by the stale-pending cleanup sweep. Scoped to `active:
+   * false` specifically - a pending document should structurally never
+   * have any active chunks (chunks only ever become active inside the
+   * same transaction that marks a document ready), but this makes that a
+   * hard guarantee rather than an assumption: even if some future bug
+   * left an active chunk under a document the sweep is about to fail,
+   * this never deletes it.
+   */
+  deleteInactiveForDocument(tenantId: string, documentId: string): Promise<void>;
   /** Test cleanup only - deletes by tenantId, never dropDatabase. */
   deleteForTenant(tenantId: string): Promise<void>;
   /** Used for the tenant chunk quota - counts all chunks regardless of active state (inactive ones are rare and transient, only existing mid-delete). */
@@ -88,6 +98,10 @@ export class MongoosePolicyChunkRepository implements PolicyChunkRepository {
 
   async deleteForDocument(tenantId: string, documentId: string): Promise<void> {
     await this.model.deleteMany({ tenantId, documentId: new Types.ObjectId(documentId) });
+  }
+
+  async deleteInactiveForDocument(tenantId: string, documentId: string): Promise<void> {
+    await this.model.deleteMany({ tenantId, documentId: new Types.ObjectId(documentId), active: false });
   }
 
   async deleteForTenant(tenantId: string): Promise<void> {

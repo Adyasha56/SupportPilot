@@ -52,6 +52,10 @@ export class InMemoryPolicyChunkRepository implements PolicyChunkRepository {
     this.removeWhere((chunk) => chunk.tenantId === tenantId && chunk.documentId === documentId);
   }
 
+  async deleteInactiveForDocument(tenantId: string, documentId: string): Promise<void> {
+    this.removeWhere((chunk) => chunk.tenantId === tenantId && chunk.documentId === documentId && !chunk.active);
+  }
+
   async deleteForTenant(tenantId: string): Promise<void> {
     this.removeWhere((chunk) => chunk.tenantId === tenantId);
   }
