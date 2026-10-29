@@ -187,3 +187,60 @@ describe('chunkMarkdown - large input performance', () => {
     expect(elapsedMs).toBeLessThan(5000);
   });
 });
+
+describe('chunkMarkdown - never returns an empty-text chunk', () => {
+  it('a heading with no body before its first subheading never produces an empty-text chunk (found against a real document)', () => {
+    // "## Refund Policy" has no body text before "### Standard Window" -
+    // the real bug this guarantee was moved here to fix (see
+    // docs/learning-notes.md): it has no same-parent sibling to merge
+    // into, so it used to survive as its own, sometimes-empty section.
+    const text =
+      '# Company Policy\n\nIntro paragraph with enough content to stand on its own as a real chunk here.\n\n## Refund Policy\n\n### Standard Window\n\nRefunds are accepted within 30 days of purchase, no exceptions apply at all.';
+    const chunks = okChunks(text, { documentSlug: 'doc' });
+
+    expect(chunks.every((c) => c.text.trim().length > 0)).toBe(true);
+  });
+
+  it('every chunk has non-empty text across a range of edge-case documents', () => {
+    const documents = [
+      '# A\n## B\n### C', // heading-only, deeply nested
+      '# OnlyHeading',
+      '# A\n\n## B\n\n## C\n\n### D\n\n## E', // mixed empty and real siblings
+    ];
+    for (const text of documents) {
+      const result = chunkMarkdown(text, { documentSlug: 'doc' });
+      if (result.ok) {
+        expect(result.chunks.every((c) => c.text.trim().length > 0)).toBe(true);
+      } else {
+        // The only acceptable failure here is "nothing embeddable at all".
+        expect(result.error.code).toBe('EMPTY_INPUT');
+      }
+    }
+  });
+
+  it('returns EMPTY_INPUT rather than an empty chunk array when every section is heading-only with no absorbed text either', () => {
+    // A single, completely bare heading with nothing before or after it -
+    // no sibling to merge with AND nothing for a backward merge to absorb.
+    const result = chunkMarkdown('#', { documentSlug: 'doc' });
+    if (!result.ok) {
+      expect(result.error.code).toBe('EMPTY_INPUT');
+    } else {
+      // If the parser treats a bare "#" as non-heading text instead, that's
+      // also fine - the real guarantee under test is "ok implies no chunk
+      // is empty", already covered by the test above.
+      expect(result.chunks.every((c) => c.text.trim().length > 0)).toBe(true);
+    }
+  });
+
+  it('positions and chunkKeys stay fully sequential (no gaps) when an internal empty section is dropped', () => {
+    const text =
+      '# Company Policy\n\n## Refund Policy\n\n### Window\n\nRefunds within 30 days, no exceptions apply here at all.\n\n## Shipping Policy\n\n### Domestic\n\nStandard shipping takes 4 to 6 business days for every order.';
+    const chunks = okChunks(text, { documentSlug: 'doc', minMergeTokens: 1 });
+
+    const positions = chunks.map((c) => c.position);
+    expect(positions).toEqual(positions.map((_, i) => i)); // 0,1,2,... - no gaps
+    chunks.forEach((c, i) => {
+      expect(c.chunkKey).toBe(`doc-${i}`);
+    });
+  });
+});

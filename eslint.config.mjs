@@ -23,6 +23,15 @@ export default [
       "@typescript-eslint/no-explicit-any": "error",
       "@typescript-eslint/explicit-function-return-type": "off",
       "no-unused-vars": "off",
+      // Flags a genuinely empty block (including `catch {}`) - a block
+      // containing only a comment is NOT flagged (ESLint's own default
+      // behavior), which is exactly the pattern used anywhere an error is
+      // deliberately, explicitly ignored (e.g. check-transactions.ts's
+      // disposable-collection cleanup). Zero violations as of this commit
+      // (every catch in the codebase either returns/throws a typed error
+      // or logs) - this is a guardrail against a FUTURE truly silent one,
+      // not a fix for an existing one.
+      "no-empty": "error",
     },
   },
   prettierConfig,

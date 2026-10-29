@@ -105,20 +105,10 @@ export class PolicyIngestionService {
       }
       return { ok: false, code: 'INVALID_CONTENT', message: chunkResult.error.message };
     }
-    // A heading with no body text of its own before its first subheading
-    // (e.g. "## Refund Policy" immediately followed by "### Standard Refund
-    // Window", nothing in between) legitimately produces an empty-text
-    // chunk from the chunker - it has no same-parent sibling to merge into,
-    // so it's kept as its own section rather than dropped silently inside
-    // the chunker itself (confirmed against a real document, not a
-    // hypothetical). Nothing is lost by skipping it here: its heading
-    // still appears in every one of its subsections' headingPath.
-    const chunks = chunkResult.chunks.filter((chunk) => chunk.text.trim().length > 0);
-    if (chunks.length === 0) {
-      // Every section the chunker found was heading-only, with no body
-      // text anywhere (e.g. a document that's only a table of contents).
-      return { ok: false, code: 'INVALID_CONTENT', message: 'Document has no embeddable content after chunking.' };
-    }
+    // chunkMarkdown() itself guarantees every returned chunk has non-empty
+    // text (and returns EMPTY_INPUT, handled above, if nothing survives
+    // that filter) - see markdown-chunker.ts.
+    const chunks = chunkResult.chunks;
 
     const existingDocumentCount = await documentRepository.countActiveForTenant(params.tenantId);
     if (existingDocumentCount >= this.settings.maxDocumentsPerTenant) {

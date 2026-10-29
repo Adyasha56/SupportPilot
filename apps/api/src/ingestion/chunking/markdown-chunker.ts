@@ -41,8 +41,30 @@ export function chunkMarkdown(text: string, options: ChunkerOptions): ChunkingOu
   for (const section of sections) {
     const spans = packSection(content, section.start, section.end, targetTokens, overlapTokens);
     for (const span of spans) {
+      // A heading with no body of its own before its first subheading
+      // (e.g. "## Refund Policy" directly followed by "### Standard
+      // Window", nothing between them) has no same-parent sibling to
+      // merge into (see mergeTinySections), so it's kept as its own
+      // section - sometimes genuinely empty, sometimes containing nothing
+      // but a backward-merge's absorbed heading-line text. Either way
+      // there's nothing worth embedding or storing, and a database
+      // schema requiring non-empty text would reject it outright (found
+      // against a real document, not a hypothetical - see
+      // docs/learning-notes.md). Dropped here, before positions are
+      // assigned, so chunkKey/position stay fully sequential - this is
+      // NOT a post-hoc filter that would leave gaps.
+      const [start, end] = span;
+      if (content.slice(start, end).trim().length === 0) {
+        continue;
+      }
       finalSpans.push({ section, span });
     }
+  }
+
+  if (finalSpans.length === 0) {
+    // Every section the chunker found was heading-only, with no body text
+    // anywhere (e.g. a document that's only a table of contents).
+    return { ok: false, error: { code: 'EMPTY_INPUT', message: 'Document has no embeddable content after chunking.' } };
   }
 
   if (finalSpans.length > maxChunks) {

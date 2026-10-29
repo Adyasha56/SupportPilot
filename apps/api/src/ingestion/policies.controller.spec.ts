@@ -475,5 +475,27 @@ describe('PoliciesController', () => {
       // And it was never actually touched.
       expect(await built.documentRepository.findById('acme', acmeDoc.id)).not.toBeNull();
     });
+
+    it('a second delete of the same (now-deleted) id returns the identical 404 as a nonexistent id', async () => {
+      const built = await buildApp();
+      app = built.app;
+      const { rawKey } = await built.createKey('acme');
+
+      const created = await request(app.getHttpServer())
+        .post('/v1/policies')
+        .set('Authorization', `Bearer ${rawKey}`)
+        .attach('file', Buffer.from(SAMPLE_MARKDOWN), 'policy.md');
+
+      const first = await request(app.getHttpServer()).delete(`/v1/policies/${created.body.id}`).set('Authorization', `Bearer ${rawKey}`);
+      expect(first.status).toBe(204);
+
+      const second = await request(app.getHttpServer()).delete(`/v1/policies/${created.body.id}`).set('Authorization', `Bearer ${rawKey}`);
+      const neverExisted = await request(app.getHttpServer())
+        .delete('/v1/policies/totally-made-up-id')
+        .set('Authorization', `Bearer ${rawKey}`);
+
+      expect(second.status).toBe(404);
+      expect(second.body).toEqual(neverExisted.body);
+    });
   });
 });
