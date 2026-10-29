@@ -242,6 +242,7 @@ describe('PolicyRetrievalService.retrieve', () => {
               headingPath: '',
               text: 'leaked secret chunk text',
               position: 0,
+              active: true,
               embeddingModel: EMBEDDING_MODEL,
               embeddingDimension: EMBEDDING_DIMENSION,
               score: 0.99,
@@ -259,6 +260,38 @@ describe('PolicyRetrievalService.retrieve', () => {
       expect(loggedText).toContain('DEFENSE_IN_DEPTH_CROSS_TENANT_RESULT');
       expect(loggedText).not.toContain('leaked secret chunk text');
       expect(loggedText).not.toContain('Leaked secret document title');
+    });
+
+    it('drops a result whose projected active field is not true, and logs it (the index-lag case, reproduced against a real cluster)', async () => {
+      const errorSpy = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      const laggingIndexRepository: PolicyChunkRepository = {
+        ...new InMemoryPolicyChunkRepository(),
+        vectorSearch: vi.fn(
+          async (_params: VectorSearchParams): Promise<VectorSearchResultItem[]> => [
+            {
+              chunkId: 'c1',
+              tenantId: 'acme', // correct tenant - only `active` is stale/wrong here
+              documentId: 'doc-a',
+              title: 'Deactivated document',
+              headingPath: '',
+              text: 'this chunk was just deactivated but the vector index has not caught up yet',
+              position: 0,
+              active: false, // the pre-filter's own index copy was stale and still surfaced this as a candidate
+              embeddingModel: EMBEDDING_MODEL,
+              embeddingDimension: EMBEDDING_DIMENSION,
+              score: 0.95,
+            },
+          ],
+        ),
+      } as unknown as PolicyChunkRepository;
+      const { service } = makeService({ chunkRepository: laggingIndexRepository });
+
+      const result = await service.retrieve('acme', 'query');
+
+      expect(result).toEqual({ ok: true, results: [] });
+      const loggedText = errorSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(loggedText).toContain('DEFENSE_IN_DEPTH_INACTIVE_RESULT');
+      expect(loggedText).not.toContain('this chunk was just deactivated');
     });
 
     it('skips a result embedded with a different model or dimension than the current configuration, and logs a count', async () => {

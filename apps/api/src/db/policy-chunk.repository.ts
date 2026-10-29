@@ -45,6 +45,18 @@ export interface VectorSearchResultItem {
   embeddingModel: string;
   embeddingDimension: number;
   /**
+   * Projected so the service layer can defend against Atlas Vector
+   * Search's own documented eventual consistency: the $vectorSearch
+   * pre-filter narrows candidates using the INDEX's copy of `active`,
+   * which can lag behind a just-written `active: false` for a few
+   * seconds - a real deactivation leak was reproduced against this
+   * project's own cluster (see docs/learning-notes.md for the measured
+   * lag and the experiment that confirmed $project's output for THIS
+   * field reflects the collection's current value even during that same
+   * lag window, which is what makes checking it after the search valid).
+   */
+  active: boolean;
+  /**
    * Atlas's own `vectorSearchScore`, unchanged - for a cosine-similarity
    * index this is normalized to [0, 1] via (1 + cosine) / 2, NOT the raw
    * cosine value (see packages/shared's retrieval.schema.ts for the full
@@ -58,10 +70,14 @@ export interface VectorSearchResultItem {
  * tested without mocking Mongoose at all: the test just calls this and
  * inspects the returned pipeline array directly. tenantId and active:true
  * are BOTH applied as $vectorSearch pre-filters (the index declares them
- * as "filter"-type fields) - never a post-filter on top-k results. A
- * pre-filter narrows the HNSW graph traversal itself before the ANN search
- * runs, so a tenant's results can never include another tenant's or an
- * inactive document's chunks even when those are the closer vector matches.
+ * as "filter"-type fields), narrowing the HNSW graph traversal itself
+ * rather than post-filtering top-k results. This is a real optimization
+ * but NOT a hard isolation guarantee on its own - Atlas Vector Search
+ * indexes are eventually consistent, so the pre-filter can briefly still
+ * admit a chunk whose active/tenantId just changed (reproduced directly
+ * against this project's own cluster - see docs/learning-notes.md).
+ * PolicyRetrievalService re-checks both fields on every result afterward,
+ * which is where the actual guarantee comes from.
  */
 export function buildVectorSearchPipeline(params: VectorSearchParams): PipelineStage[] {
   const { tenantId, queryVector, limit, exact } = params;
@@ -92,6 +108,7 @@ export function buildVectorSearchPipeline(params: VectorSearchParams): PipelineS
         headingPath: 1,
         text: 1,
         position: 1,
+        active: 1,
         embeddingModel: 1,
         embeddingDimension: 1,
         score: { $meta: 'vectorSearchScore' },
@@ -128,11 +145,19 @@ export interface PolicyChunkRepository {
   countForTenant(tenantId: string): Promise<number>;
   /**
    * tenantId and active are BOTH applied as $vectorSearch pre-filters (the
-   * index declares them as "filter"-type fields) - never a post-filter on
-   * top-k results. A pre-filter narrows the HNSW graph traversal itself
-   * before the ANN search runs, so a tenant's results can never include
-   * another tenant's or an inactive document's chunks even when those are
-   * the closer vector matches.
+   * index declares them as "filter"-type fields), narrowing the HNSW graph
+   * traversal itself rather than post-filtering top-k results - this is
+   * still correct and worth doing (cheaper, and right the moment the index
+   * has caught up). It is NOT, on its own, a hard guarantee: Atlas Vector
+   * Search indexes are eventually consistent, so the pre-filter can
+   * briefly still admit a chunk whose `active`/`tenantId` just changed -
+   * reproduced directly against this project's own cluster (see
+   * docs/learning-notes.md). The real guarantee comes from
+   * PolicyRetrievalService re-checking `tenantId` and `active` on every
+   * result AFTER the search, against the same document's live field
+   * values (confirmed to reflect the current collection state even during
+   * that lag window) - callers of this method must not treat its raw
+   * output as already safe to serve.
    */
   vectorSearch(params: VectorSearchParams): Promise<VectorSearchResultItem[]>;
 }

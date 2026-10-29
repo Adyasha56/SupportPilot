@@ -81,6 +81,7 @@ export class InMemoryPolicyChunkRepository implements PolicyChunkRepository {
         headingPath: chunk.headingPath,
         text: chunk.text,
         position: chunk.position,
+        active: chunk.active,
         embeddingModel: chunk.embeddingModel,
         embeddingDimension: chunk.embeddingDimension,
         score: normalizedScore(cosineSimilarity(chunk.embedding, queryVector)),

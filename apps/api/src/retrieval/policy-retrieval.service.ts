@@ -81,19 +81,35 @@ export class PolicyRetrievalService {
       return { ok: false, error: { code: 'SEARCH_UNAVAILABLE', message: 'Search is temporarily unavailable.' } };
     }
 
-    // Defense in depth: the pre-filter should make this structurally
-    // impossible, but this is the one place a tenant-isolation bug would
-    // actually leak data, so it's asserted again here rather than trusted.
+    // Defense in depth: the $vectorSearch pre-filter should make both of
+    // these structurally impossible, but it narrows candidates using the
+    // INDEX's own copy of tenantId/active, which is eventually consistent
+    // - a just-written active:false (or, in principle, a tenant change)
+    // can lag behind for a few seconds. Reproduced directly against this
+    // project's own Atlas cluster: a chunk deactivated via
+    // deactivateForDocument() was still returned by $vectorSearch
+    // immediately afterward (see docs/learning-notes.md for the measured
+    // lag). tenantId and active are both read via $project from the
+    // matched document itself, which reflects the CURRENT collection
+    // value even during that same lag window - confirmed by the same
+    // experiment - so checking them here, after the search, is what
+    // actually closes the gap the pre-filter's lag leaves open.
     const crossTenantCount = rawResults.filter((r) => r.tenantId !== tenantId).length;
     const sameTenant = rawResults.filter((r) => r.tenantId === tenantId);
     if (crossTenantCount > 0) {
       this.logger.error(`DEFENSE_IN_DEPTH_CROSS_TENANT_RESULT: dropped ${crossTenantCount} result(s) not belonging to tenant ${tenantId}`);
     }
 
-    const staleModelCount = sameTenant.filter(
+    const inactiveCount = sameTenant.filter((r) => r.active !== true).length;
+    const activeOnly = sameTenant.filter((r) => r.active === true);
+    if (inactiveCount > 0) {
+      this.logger.error(`DEFENSE_IN_DEPTH_INACTIVE_RESULT: dropped ${inactiveCount} inactive result(s) for tenant ${tenantId} (index lag)`);
+    }
+
+    const staleModelCount = activeOnly.filter(
       (r) => r.embeddingModel !== EMBEDDING_MODEL || r.embeddingDimension !== EMBEDDING_DIMENSION,
     ).length;
-    const current = sameTenant.filter((r) => r.embeddingModel === EMBEDDING_MODEL && r.embeddingDimension === EMBEDDING_DIMENSION);
+    const current = activeOnly.filter((r) => r.embeddingModel === EMBEDDING_MODEL && r.embeddingDimension === EMBEDDING_DIMENSION);
     if (staleModelCount > 0) {
       this.logger.warn(`STALE_EMBEDDING_CONFIG_SKIPPED: skipped ${staleModelCount} result(s) embedded with a different model/dimension`);
     }

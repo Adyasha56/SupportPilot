@@ -38,10 +38,22 @@ describe('buildVectorSearchPipeline', () => {
     expect(project).not.toHaveProperty('embedding');
   });
 
-  it('projects position, headingPath, embeddingModel, and embeddingDimension for the service layer to use', () => {
+  it('projects position, headingPath, embeddingModel, embeddingDimension, tenantId, and active for the service layer to use', () => {
+    // active and tenantId specifically are what the service's post-search
+    // defense-in-depth check relies on to catch the $vectorSearch
+    // pre-filter's own index lag (a real deactivation leak, reproduced
+    // against this project's cluster - see docs/learning-notes.md) -
+    // dropping either from this projection would silently break that check.
     const pipeline = buildVectorSearchPipeline(params());
     const project = (pipeline[1] as { $project: Record<string, unknown> }).$project;
-    expect(project).toMatchObject({ position: 1, headingPath: 1, embeddingModel: 1, embeddingDimension: 1, tenantId: 1 });
+    expect(project).toMatchObject({
+      position: 1,
+      headingPath: 1,
+      embeddingModel: 1,
+      embeddingDimension: 1,
+      tenantId: 1,
+      active: 1,
+    });
   });
 
   it('targets the real vector index by name', () => {
