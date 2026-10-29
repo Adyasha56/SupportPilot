@@ -69,9 +69,20 @@ export class PolicyRetrievalService {
     }
     const queryVector = embedResult.result.vectors[0].values;
 
+    // Over-fetch: while the index is stale (see the defense-in-depth
+    // comment below), a stale candidate can occupy a top-k slot that a
+    // genuinely active chunk would otherwise have won, crowding it out
+    // before this service ever gets a chance to drop the stale one.
+    // Asking for more candidates than the caller needs, filtering, THEN
+    // trimming to topK leaves enough headroom for that to self-correct.
+    // 2x is a plain, cheap multiplier - well within Atlas's own limits
+    // (numCandidates is already capped separately, at 10000, inside
+    // buildVectorSearchPipeline).
+    const overFetchLimit = topK * 2;
+
     let rawResults: VectorSearchResultItem[];
     try {
-      rawResults = await this.chunkRepository.vectorSearch({ tenantId, queryVector, limit: topK, exact: options.exact });
+      rawResults = await this.chunkRepository.vectorSearch({ tenantId, queryVector, limit: overFetchLimit, exact: options.exact });
     } catch (err) {
       // Covers an index that isn't queryable yet (e.g. freshly created, see
       // db:ensure-indexes) and any other search-layer failure - never the
@@ -103,7 +114,13 @@ export class PolicyRetrievalService {
     const inactiveCount = sameTenant.filter((r) => r.active !== true).length;
     const activeOnly = sameTenant.filter((r) => r.active === true);
     if (inactiveCount > 0) {
-      this.logger.error(`DEFENSE_IN_DEPTH_INACTIVE_RESULT: dropped ${inactiveCount} inactive result(s) for tenant ${tenantId} (index lag)`);
+      // WARN, not ERROR: this is the one case in this block that's a known,
+      // expected, self-correcting condition (Atlas's own documented
+      // eventual consistency, measured at well under a second for a field
+      // update - see docs/learning-notes.md), not a sign something is
+      // actually broken. ERROR is reserved for a cross-tenant result,
+      // which should never happen regardless of index freshness.
+      this.logger.warn(`DEFENSE_IN_DEPTH_INACTIVE_RESULT: dropped ${inactiveCount} inactive result(s) for tenant ${tenantId} (index lag)`);
     }
 
     const staleModelCount = activeOnly.filter(
@@ -114,7 +131,11 @@ export class PolicyRetrievalService {
       this.logger.warn(`STALE_EMBEDDING_CONFIG_SKIPPED: skipped ${staleModelCount} result(s) embedded with a different model/dimension`);
     }
 
-    const results: RetrievalResult[] = current.map((r) => ({
+    // Trimmed AFTER filtering, not before - results were over-fetched
+    // above specifically so this slice still has topK genuinely valid
+    // candidates to choose from even when some of the over-fetched batch
+    // had to be dropped.
+    const results: RetrievalResult[] = current.slice(0, topK).map((r) => ({
       chunkKey: `${r.documentId}-${r.position}`,
       documentId: r.documentId,
       documentTitle: r.title,

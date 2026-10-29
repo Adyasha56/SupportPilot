@@ -262,7 +262,8 @@ describe('PolicyRetrievalService.retrieve', () => {
       expect(loggedText).not.toContain('Leaked secret document title');
     });
 
-    it('drops a result whose projected active field is not true, and logs it (the index-lag case, reproduced against a real cluster)', async () => {
+    it('drops a result whose projected active field is not true, and logs it at WARN (not ERROR - index lag is expected and self-correcting, unlike a cross-tenant leak)', async () => {
+      const warnSpy = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
       const errorSpy = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
       const laggingIndexRepository: PolicyChunkRepository = {
         ...new InMemoryPolicyChunkRepository(),
@@ -289,9 +290,57 @@ describe('PolicyRetrievalService.retrieve', () => {
       const result = await service.retrieve('acme', 'query');
 
       expect(result).toEqual({ ok: true, results: [] });
-      const loggedText = errorSpy.mock.calls.map((c) => String(c[0])).join('\n');
-      expect(loggedText).toContain('DEFENSE_IN_DEPTH_INACTIVE_RESULT');
-      expect(loggedText).not.toContain('this chunk was just deactivated');
+      const warnedText = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(warnedText).toContain('DEFENSE_IN_DEPTH_INACTIVE_RESULT');
+      expect(warnedText).not.toContain('this chunk was just deactivated');
+      // Never logged as an error - that severity is reserved for a
+      // cross-tenant leak, which should never happen regardless of timing.
+      expect(errorSpy).not.toHaveBeenCalled();
+    });
+
+    it('over-fetches so stale inactive chunks ranked ahead of valid ones do not crowd out the real top-k', async () => {
+      const capturedParams: VectorSearchParams[] = [];
+      const crowdingRepository: PolicyChunkRepository = {
+        ...new InMemoryPolicyChunkRepository(),
+        vectorSearch: vi.fn(async (params: VectorSearchParams): Promise<VectorSearchResultItem[]> => {
+          capturedParams.push(params);
+          // Two stale (already-deactivated, index-lagging) chunks score
+          // HIGHER and rank ahead of the two genuinely active ones - the
+          // exact shape of the crowding problem: with no over-fetch, a
+          // plain `limit: topK` request would return only the two stale
+          // ones, and the service would have nothing valid left to serve.
+          const item = (overrides: Partial<VectorSearchResultItem>): VectorSearchResultItem => ({
+            chunkId: 'c',
+            tenantId: 'acme',
+            documentId: 'doc',
+            title: 'x',
+            headingPath: '',
+            text: 'x',
+            position: 0,
+            active: true,
+            embeddingModel: EMBEDDING_MODEL,
+            embeddingDimension: EMBEDDING_DIMENSION,
+            score: 0,
+            ...overrides,
+          });
+          return [
+            item({ chunkId: 'stale-1', documentId: 'doc-stale-1', active: false, score: 0.99 }),
+            item({ chunkId: 'stale-2', documentId: 'doc-stale-2', active: false, score: 0.98 }),
+            item({ chunkId: 'valid-1', documentId: 'doc-valid-1', score: 0.8 }),
+            item({ chunkId: 'valid-2', documentId: 'doc-valid-2', score: 0.79 }),
+          ];
+        }),
+      } as unknown as PolicyChunkRepository;
+      const { service } = makeService({ chunkRepository: crowdingRepository });
+
+      const result = await service.retrieve('acme', 'query', { topK: 2 });
+
+      expect(capturedParams[0].limit).toBe(4); // topK * 2 - asked for headroom beyond the plain topK
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.results).toHaveLength(2);
+        expect(result.results.map((r) => r.documentId)).toEqual(['doc-valid-1', 'doc-valid-2']);
+      }
     });
 
     it('skips a result embedded with a different model or dimension than the current configuration, and logs a count', async () => {
@@ -315,7 +364,7 @@ describe('PolicyRetrievalService.retrieve', () => {
   });
 
   describe('privacy: logs never contain the query text or chunk text', () => {
-    it('logs only tenantId, query length, result count, top score, and duration', async () => {
+    it('logs exactly tenantId, query length, result count, top score, and duration - nothing else, never the query or chunk text', async () => {
       const logSpy = vi.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
       const { service, chunkRepository } = makeService();
       await chunkRepository.insertMany([chunkFixture({ text: 'This exact sentence must never appear in a log line.' })]);
@@ -323,9 +372,21 @@ describe('PolicyRetrievalService.retrieve', () => {
       const secretQuery = 'a very specific customer query that must never be logged verbatim';
       await service.retrieve('acme', secretQuery);
 
+      const policyRetrieveCall = logSpy.mock.calls.find((c) => String(c[0]).includes('"event":"policy_retrieve"'));
+      expect(policyRetrieveCall).toBeDefined();
+      const logged = JSON.parse(String(policyRetrieveCall![0])) as Record<string, unknown>;
+
+      // Every field the title claims, actually present with the right shape -
+      // not just substrings somewhere in the log output.
+      expect(logged.tenantId).toBe('acme');
+      expect(logged.queryLength).toBe(secretQuery.length);
+      expect(typeof logged.resultCount).toBe('number');
+      expect(typeof logged.topScore === 'number' || logged.topScore === null).toBe(true);
+      expect(typeof logged.durationMs).toBe('number');
+      // Exactly these five fields plus the event name - nothing extra snuck in.
+      expect(Object.keys(logged).sort()).toEqual(['durationMs', 'event', 'queryLength', 'resultCount', 'tenantId', 'topScore'].sort());
+
       const loggedText = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
-      expect(loggedText).toContain('acme');
-      expect(loggedText).toContain('policy_retrieve');
       expect(loggedText).not.toContain(secretQuery);
       expect(loggedText).not.toContain('This exact sentence must never appear in a log line.');
     });
