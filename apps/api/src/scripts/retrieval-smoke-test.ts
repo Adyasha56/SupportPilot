@@ -62,6 +62,25 @@ async function pollUntilSearchable(
   throw new Error(`Timed out after ${POLL_TIMEOUT_MS / 1000}s waiting for tenant ${tenantId}'s chunk to become searchable.`);
 }
 
+/** Returns seconds until `goneDocumentId` stops appearing, or null if it never does within the timeout - informational only, never a hard assertion. */
+async function pollUntilGone(
+  retrieval: PolicyRetrievalService,
+  tenantId: string,
+  query: string,
+  goneDocumentId: string,
+): Promise<number | null> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
+    const result = await retrieval.retrieve(tenantId, query, { topK: 5 });
+    const stillThere = result.ok && result.results.some((r) => r.documentId === goneDocumentId);
+    if (!stillThere) {
+      return (Date.now() - startedAt) / 1000;
+    }
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+  return null;
+}
+
 async function main(): Promise<void> {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
@@ -204,15 +223,83 @@ async function main(): Promise<void> {
       log(`Exact and approximate agree: ${JSON.stringify(exactKeys) === JSON.stringify(approxKeys)}`);
     }
 
-    // Inactive chunks are never returned.
-    await chunkRepository.deactivateForDocument(tenantA, resultA.document.id);
-    const afterDeactivate = await retrieval.retrieve(tenantA, queryA, { topK: 5 });
-    log(
-      `After deactivating tenant A's chunks, retrieve() returned ${afterDeactivate.ok ? afterDeactivate.results.length : 'an error'} result(s) (expected 0)`,
-    );
-    if (!afterDeactivate.ok || afterDeactivate.results.length !== 0) {
-      throw new Error('INACTIVE CHUNK LEAK: a deactivated chunk was still returned by retrieve().');
+    // --- Deactivation: diagnose, then assert (the hard assertion expects
+    // an IMMEDIATE 0 - the defense-in-depth fix means this must never
+    // depend on index freshness; the poll below is purely informational,
+    // measuring how long the pre-filter's own lag would otherwise last). ---
+    log('--- Deactivating tenant A\'s chunk and diagnosing ---');
+    const docObjectIdA = new mongoose.Types.ObjectId(resultA.document.id);
+
+    const rawUpdateResult = await chunkModel.updateMany({ tenantId: tenantA, documentId: docObjectIdA }, { $set: { active: false } });
+    log(`Deactivation write: matched ${rawUpdateResult.matchedCount}, modified ${rawUpdateResult.modifiedCount}`);
+
+    const storedChunksAfterDeactivate = await chunkModel.find({ tenantId: tenantA, documentId: docObjectIdA }).select('active').lean();
+    log(`Direct collection read, 'active' value(s): ${JSON.stringify(storedChunksAfterDeactivate.map((c) => c.active))}`);
+
+    // Field-freshness experiment: does $vectorSearch's own $project output
+    // reflect the CURRENT collection value for a field, even if the index
+    // still surfaces the document as a stale candidate? Checked via the
+    // repository directly (not retrieve(), which already applies the new
+    // defense-in-depth filtering) so this measures the RAW search output.
+    const queryEmbedResult = await llmProvider.embed([queryA], 'RETRIEVAL_QUERY');
+    if (!queryEmbedResult.ok) {
+      throw new Error(`Unexpected: FakeLlmProvider.embed() failed: ${queryEmbedResult.error.code}`);
     }
+    const rawSearchImmediate = await chunkRepository.vectorSearch({
+      tenantId: tenantA,
+      queryVector: queryEmbedResult.result.vectors[0].values,
+      limit: 5,
+      exact: true,
+    });
+    const rawMatch = rawSearchImmediate.find((r) => r.documentId === resultA.document.id);
+    if (rawMatch) {
+      log(
+        `Immediately after deactivation, raw $vectorSearch still returned this chunk as a candidate - its projected 'active' field: ${rawMatch.active}`,
+      );
+      log(`Field freshness: projected 'active' matches the live collection value: ${rawMatch.active === storedChunksAfterDeactivate[0]?.active}`);
+    } else {
+      log('Immediately after deactivation, raw $vectorSearch no longer returned this chunk as a candidate at all (no lag observed on this attempt).');
+    }
+
+    const immediateAfterDeactivate = await retrieval.retrieve(tenantA, queryA, { topK: 5 });
+    log(
+      `Immediately after deactivation, retrieve() (with the defense-in-depth fix) returned: ${
+        immediateAfterDeactivate.ok ? JSON.stringify(immediateAfterDeactivate.results.map((r) => r.documentId)) : 'an error'
+      }`,
+    );
+
+    // Informational only - never thrown on.
+    const goneAfterSeconds = await pollUntilGone(retrieval, tenantA, queryA, resultA.document.id);
+    if (rawMatch) {
+      if (goneAfterSeconds === null) {
+        log(`DIAGNOSIS: the raw pre-filter still had NOT excluded this chunk after ${POLL_TIMEOUT_MS / 1000}s of polling.`);
+      } else {
+        log(`DIAGNOSIS (informational): the pre-filter's own index lag cleared after ${goneAfterSeconds.toFixed(1)}s - retrieve() itself was already correct the whole time because of the fix above.`);
+      }
+    }
+
+    // The hard assertion: with the fix, this must be 0 immediately, not eventually.
+    if (!immediateAfterDeactivate.ok || immediateAfterDeactivate.results.length !== 0) {
+      throw new Error('INACTIVE CHUNK LEAK: a deactivated chunk was still returned by retrieve() immediately after deactivation.');
+    }
+    log('Immediate post-deactivation check passed (0 results, as required).');
+
+    // --- Deletion: the same lag can apply to a hard delete. A deleted
+    // document can never be "read live" to confirm its current state (it
+    // doesn't exist), so this checks retrieve() itself never leaks it,
+    // rather than inspecting field freshness the way deactivation allows. ---
+    log('--- Deleting tenant B\'s chunk and checking immediately ---');
+    await chunkRepository.deleteForDocument(tenantB, resultB.document.id);
+    const immediateAfterDelete = await retrieval.retrieve(tenantB, queryB, { topK: 5 });
+    log(
+      `Immediately after deletion, retrieve() returned: ${
+        immediateAfterDelete.ok ? JSON.stringify(immediateAfterDelete.results.map((r) => r.documentId)) : 'an error'
+      }`,
+    );
+    if (!immediateAfterDelete.ok || immediateAfterDelete.results.some((r) => r.documentId === resultB.document.id)) {
+      throw new Error('DELETED CHUNK LEAK: a deleted chunk was still returned by retrieve() immediately after deletion.');
+    }
+    log('Immediate post-deletion check passed.');
 
     log('RESULT: all checks passed.');
   } catch (err) {
