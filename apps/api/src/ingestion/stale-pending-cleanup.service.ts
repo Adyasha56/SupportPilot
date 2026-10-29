@@ -1,4 +1,4 @@
-import { Inject, Injectable, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
 import { INGESTION_SETTINGS } from './ingestion-settings.provider';
 import { IngestionSettings } from './ingestion.settings';
 import { POLICY_CHUNK_REPOSITORY, PolicyChunkRepository } from '../db/policy-chunk.repository';
@@ -14,6 +14,7 @@ import { POLICY_DOCUMENT_REPOSITORY, PolicyDocumentRepository } from '../db/poli
  */
 @Injectable()
 export class StalePendingCleanupService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(StalePendingCleanupService.name);
   private intervalHandle: ReturnType<typeof setInterval> | undefined;
 
   constructor(
@@ -35,7 +36,16 @@ export class StalePendingCleanupService implements OnModuleInit, OnModuleDestroy
     }
     const intervalMs = Math.max(this.settings.ingestionDeadlineMs, 10_000);
     this.intervalHandle = setInterval(() => {
-      this.sweep().catch(() => undefined); // a failed sweep attempt just retries on the next tick, never crashes the process
+      // A failed sweep attempt retries on the next tick rather than
+      // crashing the process - but silently was a mistake: with no
+      // logging, a sweep that fails every single tick (e.g. a permissions
+      // or network issue) would be invisible forever. Logs the error
+      // message only - never document content, same rule as every other
+      // log line in this pipeline.
+      this.sweep().catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.error(`Stale-pending sweep failed, will retry next tick: ${message}`);
+      });
     }, intervalMs);
     // Doesn't by itself keep the process alive - the HTTP listener already
     // does that. Without unref(), this interval would be the one thing

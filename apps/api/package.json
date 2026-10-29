@@ -15,7 +15,8 @@
     "db:ensure-indexes": "node --env-file-if-exists=.env dist/scripts/db-ensure-indexes.js",
     "create-api-key": "node --env-file-if-exists=.env dist/scripts/create-api-key.js",
     "embedding-smoke-test": "node --env-file-if-exists=.env dist/scripts/embedding-smoke-test.js",
-    "check-transactions": "node --env-file-if-exists=.env dist/scripts/check-transactions.js"
+    "check-transactions": "node --env-file-if-exists=.env dist/scripts/check-transactions.js",
+    "retrieval-smoke-test": "node --env-file-if-exists=.env dist/scripts/retrieval-smoke-test.js"
   },
   "dependencies": {
     "@google/genai": "2.31.0",
