@@ -63,3 +63,95 @@ jobs:
       - name: Docker Compose down
         if: always()
         run: docker compose down
+
+      # Built independently of docker-compose.yml (not just relying on the
+      # fact that compose happens to set no DB/LLM vars today) so this keeps
+      # proving the app boots and answers /health with NO database and NO
+      # LLM key configured, even if docker-compose.yml itself changes later.
+      - name: Build image for the no-env boot check
+        run: docker build -t supportpilot-api-no-env -f apps/api/Dockerfile .
+
+      - name: Boot with no database/Gemini env vars and check /health
+        run: |
+          docker run -d --name supportpilot-api-no-env -p 3001:3000 -e API_PORT=3000 supportpilot-api-no-env
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3001/health; then
+              echo "API is healthy with no MONGODB_URI/GEMINI_API_KEY set"
+              exit 0
+            fi
+            echo "Waiting for API to become healthy... (attempt $i)"
+            sleep 2
+          done
+          echo "API did not become healthy in time"
+          exit 1
+
+      - name: No-env container logs
+        if: always()
+        run: docker logs supportpilot-api-no-env || true
+
+      - name: No-env container cleanup
+        if: always()
+        run: docker rm -f supportpilot-api-no-env || true
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6.1.0
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "24"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm -r run build
+
+      # Pinned to a specific build (not :latest or :8.0), confirmed directly
+      # against MongoDB's own docs and Docker Hub (not assumed) - see
+      # docs/learning-notes.md's Stage 7 entry. Runs as a single-node
+      # replica set internally, which is what makes multi-document
+      # transactions AND Atlas Vector Search both work in it, the same as
+      # real Atlas - this is the only reason it's usable for this project's
+      # integration suite at all, not just a generic "local mongo" stand-in.
+      - name: Start MongoDB Atlas Local
+        run: |
+          docker run -d --name atlas-local -p 27017:27017 mongodb/mongodb-atlas-local:8.0.20-20261027T181252Z
+
+      - name: Wait for Atlas Local to report healthy
+        run: |
+          for i in $(seq 1 60); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' atlas-local 2>/dev/null || echo "starting")
+            if [ "$status" = "healthy" ]; then
+              echo "Atlas Local is healthy"
+              exit 0
+            fi
+            echo "Waiting for Atlas Local to become healthy... (attempt $i, status: $status)"
+            sleep 2
+          done
+          echo "Atlas Local did not become healthy in time"
+          exit 1
+
+      - name: Run integration tests
+        env:
+          # directConnection=true is required - Atlas Local runs as a
+          # single-node replica set, and without it the driver's topology
+          # discovery can behave unexpectedly against a single host
+          # (documented by MongoDB, see docs/learning-notes.md).
+          MONGODB_TEST_URI: "mongodb://localhost:27017/test_ci?directConnection=true"
+        run: pnpm --filter @supportpilot/api run test:integration
+
+      - name: Atlas Local container logs
+        if: always()
+        run: docker logs atlas-local || true
+
+      - name: Atlas Local cleanup
+        if: always()
+        run: docker rm -f atlas-local || true
