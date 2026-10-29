@@ -26,6 +26,11 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
+/** Mirrors Atlas's own normalization for a cosine-similarity index score, so a unit test asserting "score is in [0,1]" behaves the same against this fake as against the real thing. */
+function normalizedScore(cosine: number): number {
+  return (1 + cosine) / 2;
+}
+
 /**
  * Brute-force cosine similarity over everything matching the tenantId+active
  * pre-filter - mirrors $vectorSearch's pre-filter semantics (filter first,
@@ -70,10 +75,15 @@ export class InMemoryPolicyChunkRepository implements PolicyChunkRepository {
       .filter((chunk) => chunk.tenantId === tenantId && chunk.active)
       .map((chunk) => ({
         chunkId: chunk.id,
+        tenantId: chunk.tenantId,
         documentId: chunk.documentId,
         title: chunk.title,
+        headingPath: chunk.headingPath,
         text: chunk.text,
-        score: cosineSimilarity(chunk.embedding, queryVector),
+        position: chunk.position,
+        embeddingModel: chunk.embeddingModel,
+        embeddingDimension: chunk.embeddingDimension,
+        score: normalizedScore(cosineSimilarity(chunk.embedding, queryVector)),
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
