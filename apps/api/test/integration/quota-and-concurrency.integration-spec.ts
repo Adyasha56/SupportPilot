@@ -30,9 +30,13 @@ class GatedLlmProvider implements LlmProvider {
   private gatePromise: Promise<void> | undefined;
   private resolveEntered: (() => void) | undefined;
   private enteredPromise: Promise<void> | undefined;
+  private held = false;
+  /** Proves this instance - not some other provider - is really the one the ingestion path calls (see the sanity check below). */
+  callCount = 0;
 
   /** Call BEFORE the request that should block - sets up a gate embed() will wait on. */
   hold(): void {
+    this.held = true;
     this.gatePromise = new Promise((resolve) => {
       this.releaseGate = resolve;
     });
@@ -41,14 +45,11 @@ class GatedLlmProvider implements LlmProvider {
     });
   }
 
-  /**
-   * Resolves the instant embed() is actually called and gated - an
-   * explicit signal from the provider itself, not a timing guess. The
-   * previous version of this test used a single setImmediate tick to
-   * assume request 1 had reached the lock before firing request 2; that
-   * assumption wasn't guaranteed under real network/multer overhead and
-   * the test hung for the full 90s timeout in CI instead of failing fast.
-   */
+  isHeld(): boolean {
+    return this.held;
+  }
+
+  /** Resolves the instant embed() is actually called and gated - an explicit signal from the provider itself, never a timing guess. */
   waitUntilEntered(): Promise<void> {
     if (!this.enteredPromise) {
       throw new Error('hold() must be called before waitUntilEntered()');
@@ -57,15 +58,38 @@ class GatedLlmProvider implements LlmProvider {
   }
 
   release(): void {
+    this.held = false;
     this.releaseGate?.();
   }
 
   async embed(texts: string[], taskType: EmbeddingTaskType): Promise<EmbedOutcome> {
+    this.callCount += 1;
     if (this.gatePromise) {
       this.resolveEntered?.();
       await this.gatePromise;
     }
     return this.inner.embed(texts, taskType);
+  }
+}
+
+/**
+ * Every wait in the TENANT_BUSY test below goes through this - no wait is
+ * ever allowed to hang for the full test timeout (90s) silently again, the
+ * way it did twice before (once with a setImmediate timing guess, once
+ * because the request it was waiting on was never actually sent - see this
+ * file's own history). A timeout here fails fast, at a bounded, known cost,
+ * with the state that would otherwise only be visible by reading supertest
+ * internals mid-hang.
+ */
+async function withBoundedWait<T>(promise: Promise<T>, ms: number, describeState: () => string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timed out after ${ms}ms waiting for: ${describeState()}`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer!);
   }
 }
 
@@ -167,40 +191,97 @@ describe.skipIf(!integrationTestsEnabled())('Concurrency limit: one ingestion pe
   it('returns 429 TENANT_BUSY for a second concurrent upload while the first is still embedding', async () => {
     const tenant = await createTenantFixture(uri);
     createdTenants.push(tenant.tenantId);
+    const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    // --- Sanity check first (diagnosed, not assumed): prove the override
+    // wiring actually routes a real upload's embed() calls through THIS
+    // provider instance, before testing anything about gating at all. A
+    // mismatch here would misdirect every assertion below at a wiring bug
+    // dressed up as a concurrency bug.
+    const wiringCheck = await request(app.getHttpServer())
+      .post('/v1/policies')
+      .set('Authorization', `Bearer ${tenant.secretKey}`)
+      .attach('file', Buffer.from(`# Wiring check ${nonce}\n\nConfirms GatedLlmProvider is the real provider in use.`), 'wiring-check.md');
+    expect(wiringCheck.status, `wiring check upload failed: ${JSON.stringify(wiringCheck.body)}`).toBe(201);
+    expect(gatedProvider.callCount, 'GatedLlmProvider.embed() was not called exactly once for a normal upload - wrong provider is wired in').toBe(1);
 
     gatedProvider.hold();
 
+    // Dispatched IMMEDIATELY by calling .then() directly on the supertest
+    // chain, not left as a bare superagent Test object. A superagent Test
+    // is a thenable that only actually sends the HTTP request the first
+    // time something calls .then()/.end() on it (confirmed directly in
+    // superagent's own source, lib/request-base.js:
+    // RequestBase.prototype.then constructs `this._fullfilledPromise` via
+    // `new Promise((resolve, reject) => { ...; self.end(...); })` - a
+    // Promise executor runs SYNCHRONOUSLY the moment `new Promise(...)` is
+    // called, so `self.end()` - the thing that actually sends the request -
+    // fires synchronously, inside this `.then()` call, at this exact line.
+    // Wrapping in Promise.resolve() instead (a previous version of this
+    // fix) does NOT do this: resolving a promise with a thenable value is
+    // its own spec'd procedure (PromiseResolveThenableJob) that schedules a
+    // MICROTASK to call the thenable's .then() later, not synchronously -
+    // so Promise.resolve() would have deferred the actual dispatch by at
+    // least one microtask tick instead of firing it at this line. The
+    // previous version of this test (neither form) built this request and
+    // only ever awaited it at the very end, AFTER already waiting on a
+    // signal (embed() being entered) that only the server receiving this
+    // exact request could ever produce - a self-deadlock, not a
+    // server-side hang.
+    /** A one-line, always-safe-to-print summary of request 1's state - undefined means "no response yet", never throws. */
+    let describeFirst = (): string => 'not yet settled';
     const firstRequest = request(app.getHttpServer())
       .post('/v1/policies')
       .set('Authorization', `Bearer ${tenant.secretKey}`)
-      .attach('file', Buffer.from('# Held\n\nThis upload is held open by the gate.'), 'held.md');
+      .attach('file', Buffer.from(`# Held ${nonce}\n\nThis upload is held open by the gate.`), 'held.md')
+      .then((res) => res);
+    firstRequest.then(
+      (res) => {
+        describeFirst = () => `status ${res.status}, body ${JSON.stringify(res.body)}`;
+      },
+      (err) => {
+        describeFirst = () => `rejected: ${err instanceof Error ? err.message : String(err)}`;
+      },
+    );
 
+    const WAIT_MS = 10_000;
+    let second: { status: number; body: { code?: string } } | undefined;
     try {
-      // Wait for the provider's own explicit signal that embed() was
-      // actually entered - tryAcquire() happens synchronously before any
-      // await in ingest(), so the lock is guaranteed held by the time
-      // embed() runs, and this promise only resolves once that's true.
-      // Not a timing guess (a previous version used a single setImmediate
-      // tick here, which wasn't a real guarantee and hung for the full 90s
-      // timeout in CI instead of failing fast).
-      await gatedProvider.waitUntilEntered();
+      await withBoundedWait(
+        gatedProvider.waitUntilEntered(),
+        WAIT_MS,
+        () => `embed() being entered for request 1 - gate held: ${gatedProvider.isHeld()}, request 1: ${describeFirst()}`,
+      );
 
-      const second = await request(app.getHttpServer())
-        .post('/v1/policies')
-        .set('Authorization', `Bearer ${tenant.secretKey}`)
-        .attach('file', Buffer.from('# Second\n\nThis upload must be rejected as busy.'), 'second.md');
-
-      expect(second.status).toBe(429);
-      expect(second.body.code).toBe('TENANT_BUSY');
+      second = await withBoundedWait(
+        request(app.getHttpServer())
+          .post('/v1/policies')
+          .set('Authorization', `Bearer ${tenant.secretKey}`)
+          .attach('file', Buffer.from(`# Second ${nonce}\n\nThis upload must be rejected as busy.`), 'second.md'),
+        WAIT_MS,
+        () => `request 2's response - request 1: ${describeFirst()}`,
+      );
     } finally {
-      // Always released, even if an assertion above failed - otherwise the
-      // first request's handler stays suspended forever inside embed(),
-      // which keeps an HTTP connection open and hangs this file's own
-      // afterAll (app.close() waiting for in-flight connections to finish).
+      // Deliberately no assertion in here - a throwing assertion inside a
+      // finally block would mask whatever the try block itself failed
+      // with. This block's only job is to guarantee cleanup can never be
+      // skipped: release the gate and drain request 1, even if an
+      // assertion above already failed - otherwise request 1's handler
+      // stays suspended forever inside embed(), keeping an HTTP connection
+      // open and hanging this file's own afterAll (app.close() waiting for
+      // in-flight connections to finish) the same way a previous version
+      // of this test did.
       gatedProvider.release();
+      await withBoundedWait(firstRequest, WAIT_MS, () => 'request 1 to finish after releasing the gate');
     }
 
+    expect(second?.status, `expected 429, got ${JSON.stringify(second)}`).toBe(429);
+    expect(second?.body.code).toBe('TENANT_BUSY');
+
+    // firstRequest is already settled by this point (awaited inside the
+    // finally block above) - re-awaiting a settled promise just returns
+    // its cached value, no new network round trip.
     const first = await firstRequest;
-    expect(first.status).toBe(201);
+    expect(first.status, `expected request 1 to succeed with 201, got ${first.status}: ${JSON.stringify(first.body)}`).toBe(201);
   });
 });

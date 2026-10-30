@@ -46,6 +46,16 @@ export default defineConfig({
     expect: {
       requireAssertions: true,
     },
+    // TEMPORARY - remove once CI confirms the "something prevents 2 Vite
+    // servers from exiting" warning is gone (see the root-cause fix in
+    // quota-and-concurrency.integration-spec.ts: a supertest request that
+    // was built but never actually dispatched, which plausibly explains
+    // that warning too - an in-flight connection to a server vitest/vite
+    // itself spun up never got a response, so the process never cleanly
+    // idled out). If the warning still appears after that fix, this
+    // reporter prints exactly what's keeping the process alive instead of
+    // guessing.
+    reporters: ['default', 'hanging-process'],
   },
   plugins: [swc.vite()],
 });
