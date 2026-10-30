@@ -50,3 +50,20 @@ export function assertNotTestDatabase(uri: string, allowTestDb: boolean): void {
     );
   }
 }
+
+/**
+ * The mirror image of assertNotTestDatabase, for the integration test
+ * harness (Stage 7): refuses to run unless the database name DOES look
+ * like the shared test database. A bug that let MONGODB_TEST_URI default
+ * to (or get confused with) a real database must fail loudly here rather
+ * than let integration tests write/delete real tenant data.
+ */
+export function assertIsTestDatabase(uri: string): void {
+  const name = getDatabaseNameFromUri(uri);
+  if (!name.startsWith(TEST_DATABASE_PREFIX)) {
+    throw new Error(
+      `Refusing to run integration tests against database "${name}" - its name must start with ` +
+        `"${TEST_DATABASE_PREFIX}". MONGODB_TEST_URI must point at the one fixed test database.`,
+    );
+  }
+}

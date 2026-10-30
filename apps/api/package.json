@@ -12,6 +12,7 @@
     "dev": "nest start --watch",
     "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\"",
     "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.mts",
     "db:ensure-indexes": "node --env-file-if-exists=.env dist/scripts/db-ensure-indexes.js",
     "create-api-key": "node --env-file-if-exists=.env dist/scripts/create-api-key.js",
     "embedding-smoke-test": "node --env-file-if-exists=.env dist/scripts/embedding-smoke-test.js",

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { assertNotTestDatabase, getDatabaseNameFromUri, TEST_DATABASE_PREFIX } from './database-name';
+import { assertIsTestDatabase, assertNotTestDatabase, getDatabaseNameFromUri, TEST_DATABASE_PREFIX } from './database-name';
 
 describe('getDatabaseNameFromUri', () => {
   it('extracts the database name from a mongodb+srv:// URI', () => {
@@ -44,5 +44,17 @@ describe('assertNotTestDatabase', () => {
     expect(() =>
       assertNotTestDatabase('mongodb://127.0.0.1:27017/test_supportpilot', true),
     ).not.toThrow();
+  });
+});
+
+describe('assertIsTestDatabase', () => {
+  it(`allows a database name starting with "${TEST_DATABASE_PREFIX}"`, () => {
+    expect(() => assertIsTestDatabase('mongodb://127.0.0.1:27017/test_supportpilot')).not.toThrow();
+  });
+
+  it('refuses a database name that does not look like a test database', () => {
+    expect(() => assertIsTestDatabase('mongodb://127.0.0.1:27017/supportpilot')).toThrow(
+      /Refusing to run integration tests/,
+    );
   });
 });
