@@ -14,7 +14,6 @@ import './test-env';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { INestApplication } from '@nestjs/common';
 import { bootApp } from './app-harness';
-import { ensureTestIndexes } from './ensure-test-indexes';
 import { cleanupTenant, createTenantFixture, disconnectFixtureConnection } from './tenant-fixture';
 import { getTestMongoUri, integrationTestsEnabled } from './test-env';
 import { TRANSACTION_RUNNER, TransactionRunner } from '../../src/db/transaction-runner';
@@ -28,7 +27,6 @@ describe.skipIf(!integrationTestsEnabled())('Mid-commit transaction rollback (in
   const createdTenants: string[] = [];
 
   beforeAll(async () => {
-    await ensureTestIndexes(uri);
     const harness = await bootApp();
     app = harness.app;
     close = harness.close;

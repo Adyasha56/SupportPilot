@@ -9,7 +9,6 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import type { INestApplication } from '@nestjs/common';
 import { bootApp } from './app-harness';
-import { ensureTestIndexes } from './ensure-test-indexes';
 import { cleanupTenant, createTenantFixture, disconnectFixtureConnection } from './tenant-fixture';
 import { getTestMongoUri, integrationTestsEnabled } from './test-env';
 import { pollUntil } from './poll';
@@ -22,7 +21,6 @@ describe.skipIf(!integrationTestsEnabled())('Exact vs approximate search agreeme
   const createdTenants: string[] = [];
 
   beforeAll(async () => {
-    await ensureTestIndexes(uri);
     const harness = await bootApp();
     app = harness.app;
     close = harness.close;
@@ -41,10 +39,18 @@ describe.skipIf(!integrationTestsEnabled())('Exact vs approximate search agreeme
       createdTenants.push(tenant.tenantId);
       const topic = `agreementcheck${Date.now()}`;
 
-      const sections = Array.from(
-        { length: 6 },
-        (_, i) => `# Section ${i}\n\n${topic} appears here in section ${i} with some different filler word${'x'.repeat(i)}.`,
-      ).join('\n\n');
+      // Each section's body must be well over ~400 characters (the
+      // chunker's default 100-token merge floor, approxTokens ~= chars/4 -
+      // see markdown-chunker.ts's mergeTinySections) or same-parent
+      // sibling sections get merged into one chunk regardless of heading
+      // count. A short one-line body (the original version of this test)
+      // produced exactly 1 merged chunk instead of 6 - confirmed by
+      // reading mergeTinySections directly, not assumed.
+      const sectionBody = (i: number): string =>
+        `${topic} appears here in section ${i} as part of a longer passage with enough unique content of its own that this section stays distinct from its neighbors during chunking and is never merged with them. `.repeat(
+          4,
+        );
+      const sections = Array.from({ length: 6 }, (_, i) => `# Section ${i}\n\n${sectionBody(i)}`).join('\n\n');
 
       const uploadRes = await request(app.getHttpServer())
         .post('/v1/policies')

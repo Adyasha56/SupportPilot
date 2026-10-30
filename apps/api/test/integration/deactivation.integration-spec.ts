@@ -15,7 +15,6 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import type { INestApplication } from '@nestjs/common';
 import { bootApp } from './app-harness';
-import { ensureTestIndexes } from './ensure-test-indexes';
 import { cleanupTenant, createTenantFixture, disconnectFixtureConnection } from './tenant-fixture';
 import { getTestMongoUri, integrationTestsEnabled } from './test-env';
 import { pollUntil } from './poll';
@@ -29,7 +28,6 @@ describe.skipIf(!integrationTestsEnabled())('Deactivation without deletion (inte
   const createdTenants: string[] = [];
 
   beforeAll(async () => {
-    await ensureTestIndexes(uri);
     const harness = await bootApp();
     app = harness.app;
     close = harness.close;

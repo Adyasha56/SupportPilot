@@ -23,7 +23,6 @@ import { AppModule } from '../../src/app.module';
 import { LLM_PROVIDER } from '../../src/llm/llm.module';
 import { EmbedOutcome, EmbeddingTaskType, LlmProvider } from '../../src/llm/llm-provider.interface';
 import { FakeLlmProvider } from '../../src/llm/test-utils/fake-llm-provider';
-import { ensureTestIndexes } from './ensure-test-indexes';
 import { cleanupTenant, createTenantFixture, disconnectFixtureConnection } from './tenant-fixture';
 import { getTestMongoUri, integrationTestsEnabled } from './test-env';
 
@@ -46,7 +45,6 @@ describe.skipIf(!integrationTestsEnabled())('Embedding failure mid-pipeline (int
   const createdTenants: string[] = [];
 
   beforeAll(async () => {
-    await ensureTestIndexes(uri);
     process.env.INGESTION_EMBEDDING_BATCH_SIZE = '1';
 
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
@@ -69,8 +67,19 @@ describe.skipIf(!integrationTestsEnabled())('Embedding failure mid-pipeline (int
     createdTenants.push(tenant.tenantId);
 
     // Two headings -> two chunks -> two embeddingBatchSize=1 batches - the
-    // second one is the one FailsOnSecondCallLlmProvider rejects.
-    const markdown = '# First section\n\nFirst section body text.\n\n# Second section\n\nSecond section body text.';
+    // second one is the one FailsOnSecondCallLlmProvider rejects. Each
+    // section's body must be well over ~400 characters (the chunker's
+    // default 100-token merge floor, approxTokens ~= chars/4 - see
+    // markdown-chunker.ts's mergeTinySections) or the two same-parent
+    // sections get merged into a single chunk and only one embed() call
+    // ever happens - confirmed directly by reading mergeTinySections, not
+    // assumed (a short one-line body, the original version of this test,
+    // produced exactly 1 chunk and the upload wrongly succeeded).
+    const longBody = (label: string): string =>
+      `${label} body text with enough unique content of its own that this section stays distinct from its sibling during chunking and is never merged with it. `.repeat(
+        4,
+      );
+    const markdown = `# First section\n\n${longBody('First section')}\n\n# Second section\n\n${longBody('Second section')}`;
 
     const res = await request(app.getHttpServer())
       .post('/v1/policies')

@@ -5,9 +5,17 @@
  * is proven to set up the test database the identical way a developer
  * would via `pnpm run db:ensure-indexes -- --allow-test-db` (Stage 7 item 5).
  *
- * Idempotent and safe to call from every test file's beforeAll: ensureIndexes
- * itself checks what already exists before creating anything (see that
- * file's own doc comment on why createSearchIndex is never called blindly).
+ * Called exactly once, from global-setup.ts's vitest globalSetup hook -
+ * NOT from individual spec files' beforeAll. That per-file approach was
+ * the original design and raced for real in CI: vitest runs each spec
+ * file in its own worker process, so a module-level "only once" guard
+ * like the one below only protects one file at a time, and two files
+ * simultaneously calling the real, non-idempotent createSearchIndex
+ * produced "duplicate index names" (see global-setup.ts and
+ * docs/learning-notes.md). The `ensured` guard below stays as cheap
+ * defense-in-depth against a future accidental second call within the
+ * same process, not as the actual concurrency guarantee - that guarantee
+ * is globalSetup running once, in one process, before any worker spawns.
  */
 import mongoose from 'mongoose';
 import { assertIsTestDatabase } from '../../src/db/database-name';

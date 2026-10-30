@@ -21,7 +21,6 @@ import { AppModule } from '../../src/app.module';
 import { LLM_PROVIDER } from '../../src/llm/llm.module';
 import { EmbedOutcome, EmbeddingTaskType, LlmProvider } from '../../src/llm/llm-provider.interface';
 import { FakeLlmProvider } from '../../src/llm/test-utils/fake-llm-provider';
-import { ensureTestIndexes } from './ensure-test-indexes';
 import { cleanupTenant, createTenantFixture, disconnectFixtureConnection } from './tenant-fixture';
 import { getTestMongoUri, integrationTestsEnabled } from './test-env';
 
@@ -29,12 +28,32 @@ class GatedLlmProvider implements LlmProvider {
   private readonly inner = new FakeLlmProvider();
   private releaseGate: (() => void) | undefined;
   private gatePromise: Promise<void> | undefined;
+  private resolveEntered: (() => void) | undefined;
+  private enteredPromise: Promise<void> | undefined;
 
   /** Call BEFORE the request that should block - sets up a gate embed() will wait on. */
   hold(): void {
     this.gatePromise = new Promise((resolve) => {
       this.releaseGate = resolve;
     });
+    this.enteredPromise = new Promise((resolve) => {
+      this.resolveEntered = resolve;
+    });
+  }
+
+  /**
+   * Resolves the instant embed() is actually called and gated - an
+   * explicit signal from the provider itself, not a timing guess. The
+   * previous version of this test used a single setImmediate tick to
+   * assume request 1 had reached the lock before firing request 2; that
+   * assumption wasn't guaranteed under real network/multer overhead and
+   * the test hung for the full 90s timeout in CI instead of failing fast.
+   */
+  waitUntilEntered(): Promise<void> {
+    if (!this.enteredPromise) {
+      throw new Error('hold() must be called before waitUntilEntered()');
+    }
+    return this.enteredPromise;
   }
 
   release(): void {
@@ -43,6 +62,7 @@ class GatedLlmProvider implements LlmProvider {
 
   async embed(texts: string[], taskType: EmbeddingTaskType): Promise<EmbedOutcome> {
     if (this.gatePromise) {
+      this.resolveEntered?.();
       await this.gatePromise;
     }
     return this.inner.embed(texts, taskType);
@@ -55,7 +75,6 @@ describe.skipIf(!integrationTestsEnabled())('Quota limits (integration, real dat
   const createdTenants: string[] = [];
 
   beforeAll(async () => {
-    await ensureTestIndexes(uri);
     process.env.INGESTION_MAX_DOCUMENTS_PER_TENANT = '1';
     process.env.INGESTION_MAX_CHUNKS_PER_TENANT = '3';
 
@@ -99,8 +118,18 @@ describe.skipIf(!integrationTestsEnabled())('Quota limits (integration, real dat
 
     // Four headings -> four chunks -> exceeds the chunk cap of 3 on the
     // very first (and, per the document cap above being separate per
-    // tenant, only) upload.
-    const markdown = '# One\n\nOne.\n\n# Two\n\nTwo.\n\n# Three\n\nThree.\n\n# Four\n\nFour.';
+    // tenant, only) upload. Each section's body must be well over ~400
+    // characters (the chunker's default 100-token merge floor - see
+    // markdown-chunker.ts's mergeTinySections) or same-parent sections get
+    // merged into one chunk and the cap is never actually exceeded - a
+    // short one-line body here, like the ones this file originally used,
+    // produces exactly 1 merged chunk, not 4 (confirmed by reading
+    // mergeTinySections directly, not assumed).
+    const longBody = (label: string): string =>
+      `${label} body text with enough unique content of its own that this section stays distinct from its siblings during chunking and is never merged with them. `.repeat(
+        4,
+      );
+    const markdown = ['One', 'Two', 'Three', 'Four'].map((label) => `# ${label}\n\n${longBody(label)}`).join('\n\n');
     const res = await request(app.getHttpServer())
       .post('/v1/policies')
       .set('Authorization', `Bearer ${tenant.secretKey}`)
@@ -119,7 +148,6 @@ describe.skipIf(!integrationTestsEnabled())('Concurrency limit: one ingestion pe
   const createdTenants: string[] = [];
 
   beforeAll(async () => {
-    await ensureTestIndexes(uri);
     gatedProvider = new GatedLlmProvider();
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(LLM_PROVIDER)
@@ -147,22 +175,31 @@ describe.skipIf(!integrationTestsEnabled())('Concurrency limit: one ingestion pe
       .set('Authorization', `Bearer ${tenant.secretKey}`)
       .attach('file', Buffer.from('# Held\n\nThis upload is held open by the gate.'), 'held.md');
 
-    // Give the first request's handler a tick to actually acquire the lock
-    // and reach the gated embed() call before firing the second request -
-    // deterministic ordering, not a timing guess: tryAcquire() happens
-    // synchronously at the very start of ingest(), before any await, so by
-    // the time this microtask runs the lock is already held.
-    await new Promise((resolve) => setImmediate(resolve));
+    try {
+      // Wait for the provider's own explicit signal that embed() was
+      // actually entered - tryAcquire() happens synchronously before any
+      // await in ingest(), so the lock is guaranteed held by the time
+      // embed() runs, and this promise only resolves once that's true.
+      // Not a timing guess (a previous version used a single setImmediate
+      // tick here, which wasn't a real guarantee and hung for the full 90s
+      // timeout in CI instead of failing fast).
+      await gatedProvider.waitUntilEntered();
 
-    const second = await request(app.getHttpServer())
-      .post('/v1/policies')
-      .set('Authorization', `Bearer ${tenant.secretKey}`)
-      .attach('file', Buffer.from('# Second\n\nThis upload must be rejected as busy.'), 'second.md');
+      const second = await request(app.getHttpServer())
+        .post('/v1/policies')
+        .set('Authorization', `Bearer ${tenant.secretKey}`)
+        .attach('file', Buffer.from('# Second\n\nThis upload must be rejected as busy.'), 'second.md');
 
-    expect(second.status).toBe(429);
-    expect(second.body.code).toBe('TENANT_BUSY');
+      expect(second.status).toBe(429);
+      expect(second.body.code).toBe('TENANT_BUSY');
+    } finally {
+      // Always released, even if an assertion above failed - otherwise the
+      // first request's handler stays suspended forever inside embed(),
+      // which keeps an HTTP connection open and hangs this file's own
+      // afterAll (app.close() waiting for in-flight connections to finish).
+      gatedProvider.release();
+    }
 
-    gatedProvider.release();
     const first = await firstRequest;
     expect(first.status).toBe(201);
   });
