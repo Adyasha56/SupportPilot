@@ -95,6 +95,16 @@ jobs:
 
   integration-tests:
     runs-on: ubuntu-latest
+    # Backstop so a genuine hang (e.g. the TENANT_BUSY deadlock this job
+    # actually hit once, before being fixed - see docs/learning-notes.md)
+    # cannot silently burn through free CI minutes. 15 minutes is generous
+    # against observed reality: the slowest real run so far finished in
+    # ~4 minutes once everything worked, and the worst-case budget any
+    # single piece of this job can legitimately need is bounded and known
+    # (Atlas Local's own health check loop: 2 min; globalSetup's index wait,
+    # QUERYABLE_TIMEOUT_MS: 2 min; each spec file's own pollUntil ceiling: 1
+    # min) - 15 minutes leaves real margin on top of that sum, not a guess.
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
@@ -109,9 +119,11 @@ jobs:
           cache: "pnpm"
 
       - name: Install dependencies
+        timeout-minutes: 5
         run: pnpm install --frozen-lockfile
 
       - name: Build
+        timeout-minutes: 5
         run: pnpm -r run build
 
       # Pinned to a specific build (not :latest or :8.0), confirmed directly
@@ -126,6 +138,9 @@ jobs:
           docker run -d --name atlas-local -p 27017:27017 mongodb/mongodb-atlas-local:8.0.20-20261027T181252Z
 
       - name: Wait for Atlas Local to report healthy
+        # The loop below is already self-bounded to 60 * 2s = 2 minutes;
+        # this is a backstop in case the loop itself ever misbehaves.
+        timeout-minutes: 3
         run: |
           for i in $(seq 1 60); do
             status=$(docker inspect --format '{{.State.Health.Status}}' atlas-local 2>/dev/null || echo "starting")
@@ -140,6 +155,12 @@ jobs:
           exit 1
 
       - name: Run integration tests
+        # The real risk step - covers globalSetup's index-queryable wait
+        # (up to 2 min) plus all 7 spec files' own work. 10 minutes leaves
+        # real margin over every observed real run so far (slowest was
+        # well under 5 minutes end to end) without being as loose as the
+        # old per-hook 150s timeout this job used before it was tightened.
+        timeout-minutes: 10
         env:
           # directConnection=true is required - Atlas Local runs as a
           # single-node replica set, and without it the driver's topology
