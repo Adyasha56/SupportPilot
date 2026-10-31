@@ -188,6 +188,82 @@ describe('chunkMarkdown - large input performance', () => {
   });
 });
 
+describe('chunkMarkdown - merged section labels list every merged title', () => {
+  it('a merged chunk\'s headingPath lists every absorbed title, separated by "; ", and headingTitles carries the same list structured', () => {
+    const text =
+      '# Policy\n\nRoot intro, long enough on its own to not be absorbed into anything below this point in the document.\n\n' +
+      '## Standard Refund Window\n\nShort.\n\n## Final Sale\n\nAlso short.\n\n## Damaged Items\n\nStill short.';
+    const chunks = okChunks(text, { documentSlug: 'doc', minMergeTokens: 50 });
+    const merged = chunks.find((c) => c.headingPath.includes('Standard Refund Window'));
+    expect(merged).toBeDefined();
+    expect(merged!.headingPath).toBe('Policy > Standard Refund Window; Final Sale; Damaged Items');
+    expect(merged!.headingTitles).toEqual(['Standard Refund Window', 'Final Sale', 'Damaged Items']);
+    // Short enough that the full and truncated labels are identical here -
+    // the case where they DIFFER is covered by the dedicated truncation
+    // test below, which is the one that actually matters for this contract.
+    expect(merged!.embeddingText.startsWith(merged!.headingPath)).toBe(true);
+  });
+
+  it('a long chain of merged titles is capped and truncated with an ellipsis in headingPath, not left unbounded', () => {
+    const tinyHeadings = Array.from({ length: 20 }, (_, i) => `## Topic ${i} With A Reasonably Long Descriptive Title\n\nx`).join('\n\n');
+    const text = `# Policy\n\n${tinyHeadings}`;
+    const chunks = okChunks(text, { documentSlug: 'doc', minMergeTokens: 10 });
+    const merged = chunks.find((c) => c.headingPath.includes('Topic 0'));
+    expect(merged).toBeDefined();
+    expect(merged!.headingPath.length).toBeLessThanOrEqual(150);
+    expect(merged!.headingPath.endsWith('...')).toBe(true);
+  });
+
+  it('embeddingText is built from the FULL, untruncated title list even when the display headingPath is truncated - a display cap must never silently drop a real topic from what is actually embedded', () => {
+    const tinyHeadings = Array.from({ length: 20 }, (_, i) => `## Topic ${i} With A Reasonably Long Descriptive Title\n\nx`).join('\n\n');
+    const text = `# Policy\n\n${tinyHeadings}`;
+    const chunks = okChunks(text, { documentSlug: 'doc', minMergeTokens: 10 });
+    const merged = chunks.find((c) => c.headingPath.includes('Topic 0'));
+    expect(merged).toBeDefined();
+
+    // The display label IS truncated (same fact the test above checks) ...
+    expect(merged!.headingPath.endsWith('...')).toBe(true);
+    // ... all 20 titles are tracked structurally regardless ...
+    expect(merged!.headingTitles).toHaveLength(20);
+    // ... and critically, every single one of them - including the later
+    // ones the truncated display label had to drop - is actually present
+    // in embeddingText, the thing that gets sent to the embedding model.
+    for (const title of merged!.headingTitles) {
+      expect(merged!.embeddingText).toContain(title);
+    }
+    // Concretely: "Topic 19" is definitely past the 150-char display cap,
+    // so this is the case that would have failed before this fix.
+    expect(merged!.headingPath).not.toContain('Topic 19');
+    expect(merged!.embeddingText).toContain('Topic 19');
+  });
+
+  it('a chain of tiny siblings that grows past the pack target is split by packSection into multiple chunks, EVERY ONE of which carries the same full merged-title label', () => {
+    // Each sibling is individually tiny (well under minMergeTokens: 60, so
+    // mergeTinySections absorbs all of them into one section), but there
+    // are enough of them that the combined section comfortably exceeds a
+    // small targetTokens of 80 (~320 chars) - packSection must then split
+    // that one oversized merged section back into multiple chunks. This is
+    // the scenario item 1 explicitly asks to confirm: mergeTinySections has
+    // no upper bound of its own, so the two steps can interact this way,
+    // and every resulting split chunk must still carry the SAME accurate,
+    // full multi-title label - not a partial or misleading one.
+    const body = (n: number): string => `This is body text for section ${n}, with enough words to add real weight. `;
+    const siblings = Array.from({ length: 8 }, (_, i) => `## Part ${i}\n\n${body(i)}`).join('\n\n');
+    const text = `# Policy\n\n${siblings}`;
+    const chunks = okChunks(text, { documentSlug: 'doc', minMergeTokens: 60, targetTokens: 80, overlapTokens: 10 });
+
+    const mergedChunks = chunks.filter((c) => c.headingPath.includes('Part 0'));
+    expect(mergedChunks.length).toBeGreaterThan(1); // confirms packSection actually split it
+    const expectedLabel = 'Policy > Part 0; Part 1; Part 2; Part 3; Part 4; Part 5; Part 6; Part 7';
+    for (const c of mergedChunks) {
+      expect(c.headingPath).toBe(expectedLabel);
+      expect(c.embeddingText.startsWith(expectedLabel)).toBe(true);
+    }
+    // And the splits really do carry different body text, not duplicates.
+    expect(new Set(mergedChunks.map((c) => c.text)).size).toBe(mergedChunks.length);
+  });
+});
+
 describe('chunkMarkdown - never returns an empty-text chunk', () => {
   it('a heading with no body before its first subheading never produces an empty-text chunk (found against a real document)', () => {
     // "## Refund Policy" has no body text before "### Standard Window" -

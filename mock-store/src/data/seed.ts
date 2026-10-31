@@ -131,12 +131,24 @@ export function buildSeedData(clock: Clock): SeedData {
       trackingNumber: 'TRK-1002',
       carrier: 'AcmeShip',
       status: 'in_transit',
+      // Still due in the future (negative daysAgo = days from now, not
+      // days in the past) - placed 2 days ago, a normal shipping estimate
+      // puts delivery a few days out still. In transit, not late, matches
+      // the policy's "more than 7 calendar days past" late-delivery rule
+      // (sample-policy.md) not even being reachable yet.
+      estimatedDelivery: daysAgo(now, -3),
     },
     {
       orderId: 'ORD-1003',
       trackingNumber: 'TRK-1003',
       carrier: 'AcmeShip',
       status: 'delayed',
+      // 8 calendar days past due - one day past sample-policy.md's "more
+      // than 7 calendar days past its estimated delivery date" late
+      // threshold, so this is the one seeded scenario that IS confirmed
+      // late under the current policy wording (see docs/learning-notes.md's
+      // Stage 9 consistency table).
+      estimatedDelivery: daysAgo(now, 8),
     },
     {
       orderId: 'ORD-1004',

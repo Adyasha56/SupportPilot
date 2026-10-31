@@ -13,10 +13,25 @@ export interface Tenant {
  * their own. These exist only so a freshly-created tenant has something
  * usable rather than undefined settings breaking downstream logic (e.g. the
  * Milestone 4 verifier reading refundCap).
+ *
+ * approvalThreshold (250) matches sample-policy.md's own stated $250
+ * manager-approval trigger ("Refunds Above $250") - kept in agreement on
+ * purpose, see docs/learning-notes.md's Stage 9 consistency table.
+ *
+ * refundCap (2000) is a DEMO operational ceiling, not a number stated
+ * anywhere in the policy text - the policy itself states no maximum refund
+ * amount at all, only the $250 approval trigger. This is deliberately an
+ * operational safety limit (every real system needs SOME hard ceiling on
+ * an automated money-moving action), not a fact the agent could ever cite
+ * from the policy, and the Milestone 3 agent must never present it as one.
+ * $2000 is chosen high enough that no seeded mock-store order (the
+ * highest, ORD-1006, is $1249.00) is ever blocked by it in an eval case -
+ * a cap that silently blocked a seeded scenario would be a harder-to-spot
+ * bug than one that's simply never exercised by this project's own fixtures.
  */
 export const DEMO_TENANT_SETTINGS = {
-  refundCap: 500,
-  approvalThreshold: 100,
+  refundCap: 2000,
+  approvalThreshold: 250,
   tone: 'friendly and professional',
 } as const;
 
