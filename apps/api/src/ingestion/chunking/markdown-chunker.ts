@@ -1,5 +1,5 @@
 import { normalizeLineEndings, stripFrontMatter } from './normalize';
-import { headingPathLabel, mergeTinySections, parseHeadingSections, Section } from './heading-sections';
+import { fullHeadingPathLabel, headingPathLabel, mergeTinySections, parseHeadingSections, Section } from './heading-sections';
 import { packSection } from './section-packer';
 import { approxTokens } from './text-metrics';
 import { Chunk, ChunkerOptions, ChunkingOutcome } from './markdown-chunker.types';
@@ -80,13 +80,19 @@ export function chunkMarkdown(text: string, options: ChunkerOptions): ChunkingOu
   const chunks: Chunk[] = finalSpans.map(({ section, span }, position) => {
     const [start, end] = span;
     const chunkText = content.slice(start, end);
-    const headingPath = headingPathLabel(section.headingPath);
+    // headingPath (display/citation) may be truncated; embeddingText is
+    // always built from the FULL, untruncated title list - a display cap
+    // must never silently remove real topic information from what's
+    // actually sent to the embedding model.
+    const headingPath = headingPathLabel(section);
+    const fullHeadingPath = fullHeadingPathLabel(section);
     return {
       position,
       chunkKey: `${options.documentSlug}-${position}`,
       headingPath,
+      headingTitles: section.titles,
       text: chunkText,
-      embeddingText: buildEmbeddingText(headingPath, chunkText),
+      embeddingText: buildEmbeddingText(fullHeadingPath, chunkText),
       approxTokens: approxTokens(chunkText),
       startOffset: start,
       endOffset: end,

@@ -15,11 +15,13 @@ export interface Chunk {
   position: number;
   /** `${documentSlug}-${position}` - stable across re-chunking the same document with the same options. */
   chunkKey: string;
-  /** e.g. "Refund Policy > Late Delivery", or '' for content before any heading. */
+  /** e.g. "Refund Policy > Late Delivery", or '' for content before any heading. DISPLAY/citation only - capped at MAX_HEADING_LABEL_LENGTH (heading-sections.ts) and truncated with "..." for a long merge chain. Never used to build embeddingText - see headingTitles. */
   headingPath: string;
+  /** Every section title merged into this chunk, in document order, NEVER truncated (unlike headingPath) - the structured source embeddingText's full heading path is built from. One element normally; more after mergeTinySections absorbs sibling(s); empty for content before any heading. */
+  headingTitles: string[];
   /** Clean body text, for display. Always exactly `content.slice(startOffset, endOffset)` of the normalized, front-matter-stripped content - never the raw input string. */
   text: string;
-  /** What should actually be sent to the embedding model: headingPath + a blank line + text (or just `text` when headingPath is ''), so a chunk about "30 days" still carries which policy it belongs to. Hash THIS string for the embedding cache key, not `text`. */
+  /** What should actually be sent to the embedding model: the FULL, untruncated heading path (parentPath + every title in headingTitles, never the capped headingPath) + a blank line + text, so a chunk about "30 days" still carries every policy topic it belongs to, even past headingPath's display cap. Hash THIS string for the embedding cache key, not `text`. */
   embeddingText: string;
   approxTokens: number;
   /** Offsets into the normalized, front-matter-stripped content (not the raw input). */

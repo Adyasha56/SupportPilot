@@ -21,7 +21,10 @@ export function splitLines(content: string): Line[] {
 }
 
 export interface Section {
-  headingPath: string[];
+  /** Ancestor path shared by every heading ever merged into this section (e.g. ["Policy", "Refund Policy"]) - never includes this section's own leaf title(s). Invariant across a merge: mergeTinySections only ever merges same-parent siblings. */
+  parentPath: string[];
+  /** Leaf title(s) covered by this section, in document order. One element normally; more than one after mergeTinySections absorbs sibling(s). Empty for the span before any heading. */
+  titles: string[];
   start: number;
   end: number;
 }
@@ -49,7 +52,9 @@ export function parseHeadingSections(content: string): Section[] {
   let fenceLen = 0;
 
   const closeSectionAt = (end: number): void => {
-    sections.push({ headingPath: headingStack.map((h) => h.title), start: currentStart, end });
+    const parentPath = headingStack.slice(0, -1).map((h) => h.title);
+    const titles = headingStack.length > 0 ? [headingStack[headingStack.length - 1].title] : [];
+    sections.push({ parentPath, titles, start: currentStart, end });
   };
 
   for (const line of lines) {
@@ -102,17 +107,11 @@ export function trimSection(content: string, section: Section): Section {
   while (end > start && isWhitespace(content[end - 1])) {
     end--;
   }
-  return { headingPath: section.headingPath, start, end };
-}
-
-function parentOf(headingPath: string[]): string[] {
-  return headingPath.slice(0, -1);
+  return { parentPath: section.parentPath, titles: section.titles, start, end };
 }
 
 function sameParent(a: string[], b: string[]): boolean {
-  const pa = parentOf(a);
-  const pb = parentOf(b);
-  return pa.length === pb.length && pa.every((v, i) => v === pb[i]);
+  return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
 /**
@@ -122,11 +121,10 @@ function sameParent(a: string[], b: string[]): boolean {
  * other, so a tiny section's own parent is never a valid merge target.
  *
  * Preference: absorb backward into the previous sibling first, then
- * forward into the next one. Whichever section survives keeps its OWN
- * headingPath. Both directions extend one section's offset range to cover
- * the other's, so `content.slice(start, end)` stays exactly correct for
- * every merged chunk too, not just untouched ones - but the two
- * directions aren't quite symmetric: backward merge (prev absorbs
+ * forward into the next one. Both directions extend one section's offset
+ * range to cover the other's, so `content.slice(start, end)` stays exactly
+ * correct for every merged chunk too, not just untouched ones - but the
+ * two directions aren't quite symmetric: backward merge (prev absorbs
  * current) extends into territory that includes current's OWN heading
  * line (the text "## Tiny" itself becomes inline plain text in the
  * surviving chunk), because that heading line sits in the gap between
@@ -136,6 +134,16 @@ function sameParent(a: string[], b: string[]): boolean {
  * rather than inlined. Both are correct and offset-consistent; this is
  * just a cosmetic difference in whether a stray "## Heading" line ends up
  * inside the merged chunk's body text.
+ *
+ * Every merged-in section's title is kept, in document order, in the
+ * surviving section's `titles` array - the resulting label (see
+ * headingPathLabel) lists every topic a merged chunk actually covers,
+ * rather than silently keeping only one survivor's title and dropping the
+ * others from the label entirely (the earlier behavior - a real problem,
+ * not a hypothetical: on this project's own sample policy, the merged
+ * "Refund Policy" chunk's label used to read only "Standard Refund
+ * Window" even though the same chunk also covers final-sale items,
+ * damaged items, double refunds, and the approval threshold).
  *
  * A tiny section with no same-parent neighbor (an only child) is left as
  * its own chunk - merging it into unrelated content under a different
@@ -148,8 +156,10 @@ export function mergeTinySections(content: string, rawSections: Section[], minMe
   for (const section of trimmed) {
     const prev = backwardPass[backwardPass.length - 1];
     const text = content.slice(section.start, section.end);
-    if (prev && sameParent(prev.headingPath, section.headingPath) && approxTokens(text) < minMergeTokens) {
+    if (prev && sameParent(prev.parentPath, section.parentPath) && approxTokens(text) < minMergeTokens) {
+      // prev comes first in the document - prev's titles stay first.
       prev.end = section.end;
+      prev.titles = [...prev.titles, ...section.titles];
       continue;
     }
     backwardPass.push({ ...section });
@@ -158,8 +168,9 @@ export function mergeTinySections(content: string, rawSections: Section[], minMe
   const result: Section[] = [...backwardPass];
   for (let i = 0; i < result.length - 1; i++) {
     const text = content.slice(result[i].start, result[i].end);
-    if (approxTokens(text) < minMergeTokens && sameParent(result[i].headingPath, result[i + 1].headingPath)) {
-      result[i + 1] = { ...result[i + 1], start: result[i].start };
+    if (approxTokens(text) < minMergeTokens && sameParent(result[i].parentPath, result[i + 1].parentPath)) {
+      // result[i] comes first in the document - its titles go first.
+      result[i + 1] = { ...result[i + 1], start: result[i].start, titles: [...result[i].titles, ...result[i + 1].titles] };
       result.splice(i, 1);
       i -= 1;
     }
@@ -168,6 +179,43 @@ export function mergeTinySections(content: string, rawSections: Section[], minMe
   return result;
 }
 
-export function headingPathLabel(headingPath: string[]): string {
-  return headingPath.join(' > ');
+/**
+ * No system or storage constraint drives this number (PolicyChunk.headingPath
+ * has no length limit of its own) - it exists only so a long chain of merged
+ * titles can't produce an unbounded label. Chosen generously: long enough to
+ * show several merged titles in full on a realistic policy document (see
+ * docs/learning-notes.md's Stage 9 entry for the real sample-policy.md
+ * numbers), short enough to stay a one-line label, not a paragraph.
+ */
+export const MAX_HEADING_LABEL_LENGTH = 150;
+const ELLIPSIS = '...';
+
+/**
+ * "Parent > Path > title1; title2; title3", in full, never truncated - the
+ * complete record of every section merged into this chunk. This is the
+ * version embeddingText is built from (see markdown-chunker.ts): a
+ * display-only truncation must never silently remove real topic
+ * information from what's actually sent to the embedding model, only from
+ * what's shown to a human.
+ */
+export function fullHeadingPathLabel(section: Pick<Section, 'parentPath' | 'titles'>): string {
+  const parentPart = section.parentPath.join(' > ');
+  const titlePart = section.titles.join('; ');
+  return parentPart.length === 0 ? titlePart : titlePart.length === 0 ? parentPart : `${parentPart} > ${titlePart}`;
+}
+
+/**
+ * The DISPLAY/citation version of fullHeadingPathLabel - capped at
+ * MAX_HEADING_LABEL_LENGTH and truncated (from the end, with an ellipsis)
+ * if longer. Truncating the END naturally keeps the parent path and the
+ * earliest-merged titles intact and only ever drops the LATER titles in a
+ * long merge chain, since those are the ones nearest the end of the
+ * string. Never used to build embeddingText - see fullHeadingPathLabel.
+ */
+export function headingPathLabel(section: Pick<Section, 'parentPath' | 'titles'>): string {
+  const full = fullHeadingPathLabel(section);
+  if (full.length <= MAX_HEADING_LABEL_LENGTH) {
+    return full;
+  }
+  return `${full.slice(0, MAX_HEADING_LABEL_LENGTH - ELLIPSIS.length)}${ELLIPSIS}`;
 }
