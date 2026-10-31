@@ -1,7 +1,20 @@
 import { describe, expect, it, vi } from 'vitest';
 import { GeminiLlmProvider } from './gemini-llm-provider';
+import { GenerateOptions } from './llm-provider.interface';
 import { LlmSettings } from './llm.settings';
-import { EmbedContentRequest, GeminiEmbedClient } from './throttled-gemini-client';
+import { EmbedContentRequest, GeminiEmbedClient, GeminiGenerateClient, GenerateContentRequest } from './throttled-gemini-client';
+
+function makeGenerateOptions(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
+  return {
+    systemInstruction: 'You are a fictional test fixture.',
+    messages: [{ role: 'user', text: 'hello' }],
+    responseSchema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
+    maxOutputTokens: 100,
+    temperature: 0,
+    timeoutMs: 5000,
+    ...overrides,
+  };
+}
 
 function makeSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
   return {
@@ -13,6 +26,13 @@ function makeSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
     maxTextsPerBatch: 32,
     maxCharsPerText: 8000,
     cacheMaxEntries: 500,
+    generateModel: 'gemini-3.5-flash-lite',
+    generateRequestsPerMinute: 1000,
+    generateMaxConcurrency: 1000,
+    generateMaxRetries: 0,
+    generateTimeoutMs: 5000,
+    generateMaxOutputTokens: 1024,
+    generateTemperature: 0,
     ...overrides,
   };
 }
@@ -147,5 +167,127 @@ describe('GeminiLlmProvider', () => {
     const result = await provider.embed(['a', 'b'], 'RETRIEVAL_DOCUMENT');
 
     expect(result).toMatchObject({ ok: false, error: { code: 'TRANSIENT' } });
+  });
+
+  describe('generate', () => {
+    it('returns NOT_CONFIGURED when no API key is set, and never touches any client', async () => {
+      const provider = new GeminiLlmProvider(makeSettings({ geminiApiKey: undefined }));
+      const result = await provider.generate(makeGenerateOptions());
+      expect(result).toEqual({ ok: false, error: { code: 'NOT_CONFIGURED', message: expect.stringContaining('GEMINI_API_KEY') } });
+    });
+
+    it('rejects an empty messages array without touching the client', async () => {
+      const generateContent = vi.fn();
+      const provider = new GeminiLlmProvider(makeSettings(), undefined, { generateContent });
+      const result = await provider.generate(makeGenerateOptions({ messages: [] }));
+      expect(result).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+      expect(generateContent).not.toHaveBeenCalled();
+    });
+
+    it('sends systemInstruction, messages, and the response JSON schema through to the client, and returns usage', async () => {
+      const receivedRequests: GenerateContentRequest[] = [];
+      const fakeClient: GeminiGenerateClient = {
+        generateContent: vi.fn(async (request) => {
+          receivedRequests.push(request);
+          return { text: '{"ok":true}', usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 3 } };
+        }),
+      };
+      const provider = new GeminiLlmProvider(makeSettings(), undefined, fakeClient);
+
+      const result = await provider.generate(
+        makeGenerateOptions({
+          systemInstruction: 'be fictional',
+          messages: [
+            { role: 'user', text: 'first' },
+            { role: 'model', text: 'second' },
+          ],
+        }),
+      );
+
+      expect(receivedRequests).toHaveLength(1);
+      expect(receivedRequests[0].systemInstruction).toBe('be fictional');
+      expect(receivedRequests[0].contents).toEqual([
+        { role: 'user', parts: [{ text: 'first' }] },
+        { role: 'model', parts: [{ text: 'second' }] },
+      ]);
+      expect(receivedRequests[0].config.responseJsonSchema).toEqual(makeGenerateOptions().responseSchema);
+      expect(receivedRequests[0].config.responseMimeType).toBe('application/json');
+
+      expect(result).toEqual({ ok: true, result: { text: '{"ok":true}', usage: { inputTokens: 12, outputTokens: 3 } } });
+    });
+
+    it('returns INVALID_OUTPUT when the response has no text at all', async () => {
+      const fakeClient: GeminiGenerateClient = { generateContent: vi.fn(async () => ({})) };
+      const provider = new GeminiLlmProvider(makeSettings(), undefined, fakeClient);
+
+      const result = await provider.generate(makeGenerateOptions());
+
+      expect(result).toMatchObject({ ok: false, error: { code: 'INVALID_OUTPUT' } });
+    });
+
+    it('returns INVALID_OUTPUT when the response text is not valid JSON, and never echoes the raw response text in the error', async () => {
+      const secretLookingText = 'not json { "leakMarker": "sk_should_never_appear_in_error" }';
+      const fakeClient: GeminiGenerateClient = { generateContent: vi.fn(async () => ({ text: secretLookingText })) };
+      const provider = new GeminiLlmProvider(makeSettings(), undefined, fakeClient);
+
+      const result = await provider.generate(makeGenerateOptions());
+
+      expect(result).toMatchObject({ ok: false, error: { code: 'INVALID_OUTPUT' } });
+      if (!result.ok) {
+        expect(result.error.message).not.toContain(secretLookingText);
+        expect(result.error.message).not.toContain('sk_should_never_appear_in_error');
+      }
+    });
+
+    it('never echoes the prompt (systemInstruction or message text) in a thrown-error message', async () => {
+      const fakeClient: GeminiGenerateClient = {
+        generateContent: vi.fn(async () => {
+          throw new Error('upstream failure');
+        }),
+      };
+      const provider = new GeminiLlmProvider(makeSettings(), undefined, fakeClient);
+
+      const result = await provider.generate(
+        makeGenerateOptions({
+          systemInstruction: 'SECRET_SYSTEM_MARKER',
+          messages: [{ role: 'user', text: 'SECRET_MESSAGE_MARKER' }],
+        }),
+      );
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).not.toContain('SECRET_SYSTEM_MARKER');
+        expect(result.error.message).not.toContain('SECRET_MESSAGE_MARKER');
+      }
+    });
+
+    it('maps a thrown error to a typed GenerateError and never leaks the API key', async () => {
+      const fakeClient: GeminiGenerateClient = {
+        generateContent: vi.fn(async () => {
+          throw Object.assign(new Error('request to https://x?key=sk_test_secret_12345 failed'), { status: 401 });
+        }),
+      };
+      const provider = new GeminiLlmProvider(makeSettings(), undefined, fakeClient);
+
+      const result = await provider.generate(makeGenerateOptions());
+
+      expect(result).toMatchObject({ ok: false, error: { code: 'UNAUTHORIZED' } });
+      if (!result.ok) {
+        expect(result.error.message).not.toContain('sk_test_secret_12345');
+        expect(result.error.message).toContain('[REDACTED]');
+      }
+    });
+
+    it('uses its own throttle, independent of the embed client', async () => {
+      const embedContent = vi.fn(async () => ({ embeddings: [{ values: [1] }] }));
+      const generateContent = vi.fn(async () => ({ text: '{}' }));
+      const provider = new GeminiLlmProvider(makeSettings(), { embedContent }, { generateContent });
+
+      await provider.generate(makeGenerateOptions());
+      await provider.embed(['text'], 'RETRIEVAL_DOCUMENT');
+
+      expect(generateContent).toHaveBeenCalledTimes(1);
+      expect(embedContent).toHaveBeenCalledTimes(1);
+    });
   });
 });

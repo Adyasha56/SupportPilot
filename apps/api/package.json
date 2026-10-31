@@ -18,7 +18,8 @@
     "embedding-smoke-test": "node --env-file-if-exists=.env dist/scripts/embedding-smoke-test.js",
     "check-transactions": "node --env-file-if-exists=.env dist/scripts/check-transactions.js",
     "retrieval-smoke-test": "node --env-file-if-exists=.env dist/scripts/retrieval-smoke-test.js",
-    "retrieval-quality-check": "node --env-file-if-exists=.env dist/scripts/retrieval-quality-check.js"
+    "retrieval-quality-check": "node --env-file-if-exists=.env dist/scripts/retrieval-quality-check.js",
+    "generate-schema-check": "node --env-file-if-exists=.env dist/scripts/generate-schema-check.js"
   },
   "dependencies": {
     "@google/genai": "2.31.0",

@@ -1,5 +1,9 @@
-import { EmbedErrorCode } from './llm-provider.interface';
-import { LlmSettings } from './llm.settings';
+/** Decoupled from LlmSettings on purpose - embed and generate have their own differently-named env settings (GEMINI_EMBED_RPM vs GEMINI_GENERATE_RPM etc, see llm.settings.ts), and this class shouldn't care which one it's fed. */
+export interface ThrottleSettings {
+  requestsPerMinute: number;
+  maxConcurrency: number;
+  maxRetries: number;
+}
 
 /**
  * The minimal surface this file needs from @google/genai's `ai.models`,
@@ -25,9 +29,43 @@ export interface GeminiEmbedClient {
   embedContent(request: EmbedContentRequest): Promise<EmbedContentResult>;
 }
 
+/**
+ * Same reasoning as GeminiEmbedClient above, for generateContent. `role`
+ * mirrors GenerateMessage's own 'user' | 'model' (llm-provider.interface.ts) -
+ * GeminiLlmProvider is what maps one to the other, this interface never
+ * imports from there to avoid a circular dependency.
+ */
+export interface GenerateContentRequest {
+  model: string;
+  systemInstruction: string;
+  contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }>;
+  config: {
+    responseMimeType: string;
+    responseJsonSchema: unknown;
+    maxOutputTokens: number;
+    temperature: number;
+    abortSignal?: AbortSignal;
+  };
+}
+
+export interface GenerateContentResult {
+  text?: string;
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+  };
+}
+
+export interface GeminiGenerateClient {
+  generateContent(request: GenerateContentRequest): Promise<GenerateContentResult>;
+}
+
+/** The subset of error codes ThrottledClient itself ever produces - shared by EmbedErrorCode and GenerateErrorCode (llm-provider.interface.ts), both supersets of exactly these five literals, so a ThrottledClientError's code is always assignable into either without a cast. */
+export type ThrottleErrorCode = 'INVALID_INPUT' | 'RATE_LIMITED' | 'UNAUTHORIZED' | 'TRANSIENT' | 'UNAVAILABLE';
+
 export class ThrottledClientError extends Error {
   constructor(
-    public readonly code: EmbedErrorCode,
+    public readonly code: ThrottleErrorCode,
     message: string,
   ) {
     super(message);
@@ -49,7 +87,7 @@ function hasStatus(err: unknown): err is StatusError {
   return typeof err === 'object' && err !== null && 'status' in err;
 }
 
-function classifyError(err: unknown): { code: EmbedErrorCode; retryable: boolean } {
+function classifyError(err: unknown): { code: ThrottleErrorCode; retryable: boolean } {
   const status = hasStatus(err) ? err.status : undefined;
   if (status === 429) {
     return { code: 'RATE_LIMITED', retryable: true };
@@ -87,37 +125,46 @@ function backoffDelayMs(attempt: number): number {
 }
 
 /**
- * Wraps a GeminiEmbedClient with: a requests-per-minute limiter (sliding
- * 60s window), bounded concurrency, and exponential backoff with jitter on
- * 429/5xx only (never on 400/401/403 - those are never going to succeed on
- * retry). Tests drive this with vi.useFakeTimers() - sleep() above is a
- * plain setTimeout, so no real waiting happens in test runs.
+ * Generic over request/response type - wraps ANY single-call-style client
+ * method with: a requests-per-minute limiter (sliding 60s window), bounded
+ * concurrency, and exponential backoff with jitter on 429/5xx only (never
+ * on 400/401/403 - those are never going to succeed on retry). Tests drive
+ * this with vi.useFakeTimers() - sleep() above is a plain setTimeout, so no
+ * real waiting happens in test runs.
+ *
+ * GeminiLlmProvider constructs TWO separate instances - one wrapping
+ * embedContent, one wrapping generateContent - each with its OWN settings
+ * (RPM, concurrency, retries) and its OWN independent rate-limit state
+ * (recentCallTimestamps, activeCount are per-instance fields). Generation
+ * and embedding traffic can never share or starve each other's budget,
+ * because there is structurally no shared state between the two instances
+ * at all, not just separate numbers.
  */
-export class ThrottledClient implements GeminiEmbedClient {
+export class ThrottledClient<TRequest, TResponse> {
   private readonly recentCallTimestamps: number[] = [];
   private activeCount = 0;
   private readonly waiters: Array<() => void> = [];
 
   constructor(
-    private readonly inner: GeminiEmbedClient,
-    private readonly settings: Pick<LlmSettings, 'requestsPerMinute' | 'maxConcurrency' | 'maxRetries'>,
+    private readonly innerCall: (request: TRequest) => Promise<TResponse>,
+    private readonly settings: ThrottleSettings,
   ) {}
 
-  async embedContent(request: EmbedContentRequest): Promise<EmbedContentResult> {
+  async call(request: TRequest): Promise<TResponse> {
     const release = await this.acquireConcurrencySlot();
     try {
-      return await this.embedContentWithRetry(request);
+      return await this.callWithRetry(request);
     } finally {
       release();
     }
   }
 
-  private async embedContentWithRetry(request: EmbedContentRequest): Promise<EmbedContentResult> {
-    let lastCode: EmbedErrorCode = 'TRANSIENT';
+  private async callWithRetry(request: TRequest): Promise<TResponse> {
+    let lastCode: ThrottleErrorCode = 'TRANSIENT';
     for (let attempt = 0; attempt <= this.settings.maxRetries; attempt++) {
       await this.waitForRateLimitSlot();
       try {
-        return await this.inner.embedContent(request);
+        return await this.innerCall(request);
       } catch (err) {
         const { code, retryable } = classifyError(err);
         if (!retryable) {

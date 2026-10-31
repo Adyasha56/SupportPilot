@@ -1,11 +1,29 @@
 import { Inject, Injectable, Optional } from '@nestjs/common';
 import { GoogleGenAI } from '@google/genai';
 import { EMBEDDING_DIMENSION, EMBEDDING_MODEL } from '@supportpilot/shared';
-import { EmbedError, EmbedErrorCode, EmbedOutcome, EmbeddingTaskType, EmbeddingVector, LlmProvider } from './llm-provider.interface';
+import {
+  EmbedError,
+  EmbedErrorCode,
+  EmbedOutcome,
+  EmbeddingTaskType,
+  EmbeddingVector,
+  GenerateOptions,
+  GenerateOutcome,
+  LlmProvider,
+} from './llm-provider.interface';
 import { LLM_SETTINGS } from './llm-settings.provider';
 import { LlmSettings } from './llm.settings';
 import { EmbeddingLruCache } from './embedding-cache';
-import { GeminiEmbedClient, ThrottledClient, ThrottledClientError } from './throttled-gemini-client';
+import {
+  EmbedContentRequest,
+  EmbedContentResult,
+  GenerateContentRequest,
+  GenerateContentResult,
+  GeminiEmbedClient,
+  GeminiGenerateClient,
+  ThrottledClient,
+  ThrottledClientError,
+} from './throttled-gemini-client';
 
 function error(code: EmbedErrorCode, message: string): EmbedOutcome {
   return { ok: false, error: { code, message } };
@@ -35,29 +53,44 @@ function l2Normalize(values: number[]): number[] {
 
 @Injectable()
 export class GeminiLlmProvider implements LlmProvider {
-  private readonly client: ThrottledClient | undefined;
+  private readonly client: ThrottledClient<EmbedContentRequest, EmbedContentResult> | undefined;
+  private readonly generateClient: ThrottledClient<GenerateContentRequest, GenerateContentResult> | undefined;
   private readonly cache: EmbeddingLruCache;
 
   /**
-   * `testClient`, when provided, is used instead of constructing the real
-   * SDK - the sole seam for injecting a fake in tests. It's @Optional()
-   * because it has no injection token for Nest to resolve by type (the
-   * interface is erased at runtime); production DI always resolves it to
-   * undefined, and the real SDK client is built below.
+   * `testClient`/`testGenerateClient`, when provided, are used instead of
+   * constructing the real SDK - the sole seam for injecting a fake in
+   * tests. They're @Optional() because they have no injection token for
+   * Nest to resolve by type (the interfaces are erased at runtime);
+   * production DI always resolves them to undefined, and the real SDK
+   * clients are built below.
    */
   constructor(
     @Inject(LLM_SETTINGS) private readonly settings: LlmSettings,
     @Optional() testClient?: GeminiEmbedClient,
+    @Optional() testGenerateClient?: GeminiGenerateClient,
   ) {
     this.cache = new EmbeddingLruCache(settings.cacheMaxEntries);
 
     if (!settings.geminiApiKey) {
       this.client = undefined;
+      this.generateClient = undefined;
       return;
     }
 
     const sdkClient = testClient ?? GeminiLlmProvider.buildSdkClient(settings.geminiApiKey);
-    this.client = new ThrottledClient(sdkClient, settings);
+    this.client = new ThrottledClient(sdkClient.embedContent.bind(sdkClient), {
+      requestsPerMinute: settings.requestsPerMinute,
+      maxConcurrency: settings.maxConcurrency,
+      maxRetries: settings.maxRetries,
+    });
+
+    const sdkGenerateClient = testGenerateClient ?? GeminiLlmProvider.buildSdkGenerateClient(settings.geminiApiKey);
+    this.generateClient = new ThrottledClient(sdkGenerateClient.generateContent.bind(sdkGenerateClient), {
+      requestsPerMinute: settings.generateRequestsPerMinute,
+      maxConcurrency: settings.generateMaxConcurrency,
+      maxRetries: settings.generateMaxRetries,
+    });
   }
 
   // Adapted explicitly to our own narrow interface rather than passing
@@ -74,6 +107,29 @@ export class GeminiLlmProvider implements LlmProvider {
           config: {
             taskType: request.config.taskType,
             outputDimensionality: request.config.outputDimensionality,
+            abortSignal: request.config.abortSignal,
+          },
+        }),
+    };
+  }
+
+  // Same adaptation reasoning as buildSdkClient above. systemInstruction
+  // lives on GenerateContentConfig in the SDK (not as a separate top-level
+  // parameter), and responseJsonSchema is passed exactly as given - this
+  // provider never touches the SDK's own narrower `responseSchema` field.
+  private static buildSdkGenerateClient(apiKey: string): GeminiGenerateClient {
+    const ai = new GoogleGenAI({ apiKey });
+    return {
+      generateContent: (request) =>
+        ai.models.generateContent({
+          model: request.model,
+          contents: request.contents,
+          config: {
+            systemInstruction: request.systemInstruction,
+            responseMimeType: request.config.responseMimeType,
+            responseJsonSchema: request.config.responseJsonSchema,
+            maxOutputTokens: request.config.maxOutputTokens,
+            temperature: request.config.temperature,
             abortSignal: request.config.abortSignal,
           },
         }),
@@ -147,7 +203,7 @@ export class GeminiLlmProvider implements LlmProvider {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.settings.requestTimeoutMs);
     try {
-      const response = await this.client!.embedContent({
+      const response = await this.client!.call({
         model: EMBEDDING_MODEL,
         contents: texts,
         config: {
@@ -165,6 +221,66 @@ export class GeminiLlmProvider implements LlmProvider {
       return {
         ok: true,
         vectors: embeddings.map((embedding) => l2Normalize(embedding.values ?? [])),
+      };
+    } catch (err) {
+      if (err instanceof ThrottledClientError) {
+        return { ok: false, error: { code: err.code, message: scrubSecret(err.message, this.settings.geminiApiKey) } };
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: { code: 'TRANSIENT', message: scrubSecret(message, this.settings.geminiApiKey) } };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async generate(options: GenerateOptions): Promise<GenerateOutcome> {
+    if (!this.generateClient) {
+      return { ok: false, error: { code: 'NOT_CONFIGURED', message: 'GEMINI_API_KEY is not set; generation is unavailable.' } };
+    }
+    if (options.messages.length === 0) {
+      return { ok: false, error: { code: 'INVALID_INPUT', message: 'At least one message is required.' } };
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
+    try {
+      const response = await this.generateClient.call({
+        model: this.settings.generateModel,
+        systemInstruction: options.systemInstruction,
+        contents: options.messages.map((message) => ({ role: message.role, parts: [{ text: message.text }] })),
+        config: {
+          responseMimeType: 'application/json',
+          responseJsonSchema: options.responseSchema,
+          maxOutputTokens: options.maxOutputTokens,
+          temperature: options.temperature,
+          abortSignal: controller.signal,
+        },
+      });
+
+      const text = response.text;
+      if (text === undefined) {
+        return { ok: false, error: { code: 'INVALID_OUTPUT', message: 'Gemini returned no text in its response.' } };
+      }
+      try {
+        // Only proves the text is SOME valid JSON value - the caller's own
+        // Zod schema is what checks it's the RIGHT shape (see
+        // GenerateErrorCode's INVALID_OUTPUT doc comment in
+        // llm-provider.interface.ts); generate() has no access to that
+        // schema, only to the raw JSON Schema object it was given.
+        JSON.parse(text);
+      } catch {
+        return { ok: false, error: { code: 'INVALID_OUTPUT', message: 'Gemini response text was not valid JSON.' } };
+      }
+
+      return {
+        ok: true,
+        result: {
+          text,
+          usage: {
+            inputTokens: response.usageMetadata?.promptTokenCount ?? 0,
+            outputTokens: response.usageMetadata?.candidatesTokenCount ?? 0,
+          },
+        },
       };
     } catch (err) {
       if (err instanceof ThrottledClientError) {

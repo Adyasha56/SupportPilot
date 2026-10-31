@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { EMBEDDING_DIMENSION } from '@supportpilot/shared';
-import { EmbedOutcome, EmbeddingTaskType, LlmProvider } from '../llm-provider.interface';
+import { EmbedOutcome, EmbeddingTaskType, GenerateOptions, GenerateOutcome, LlmProvider } from '../llm-provider.interface';
 
 /**
  * Deterministic feature-hashing ("hashing trick") bag-of-words embedder:
@@ -26,6 +26,18 @@ function hashEmbed(text: string, dimension: number): number[] {
 }
 
 export class FakeLlmProvider implements LlmProvider {
+  private generateCallCount = 0;
+
+  /**
+   * A fixed, pre-scripted queue of generate() responses, one per call -
+   * never a function of the actual options passed in. This mirrors how
+   * every other fake in this project works (the tool runner's fixtures,
+   * the mock store's seeded scenarios): the test itself decides what the
+   * "model" says, so a step function's own logic is what's under test, not
+   * a real model's behavior.
+   */
+  constructor(private readonly scriptedGenerateResponses: GenerateOutcome[] = []) {}
+
   async embed(texts: string[], _taskType: EmbeddingTaskType): Promise<EmbedOutcome> {
     return {
       ok: true,
@@ -35,5 +47,24 @@ export class FakeLlmProvider implements LlmProvider {
         dimension: EMBEDDING_DIMENSION,
       },
     };
+  }
+
+  async generate(_options: GenerateOptions): Promise<GenerateOutcome> {
+    const next = this.scriptedGenerateResponses[this.generateCallCount];
+    this.generateCallCount += 1;
+    if (!next) {
+      // A deliberate throw, not a fallback response: an unscripted call
+      // means the test under-provisioned its script or the step logic
+      // under test is calling generate() more times than expected -
+      // either way, a silent default would hide a real test bug.
+      throw new Error(
+        `FakeLlmProvider.generate() called ${this.generateCallCount} time(s), but only ${this.scriptedGenerateResponses.length} response(s) were scripted. Script more responses or fix the caller.`,
+      );
+    }
+    return next;
+  }
+
+  get generateCalls(): number {
+    return this.generateCallCount;
   }
 }

@@ -31,6 +31,24 @@ export const LlmSettingsSchema = z.object({
    */
   maxCharsPerText: z.number().int().positive(),
   cacheMaxEntries: z.number().int().positive(),
+  /**
+   * Google's own current recommendation for new projects (ai.google.dev/gemini-api/docs/models,
+   * checked live 2026-10-31) - cheapest/fastest GA tier, and critically never
+   * needs native function calling + structured output together (that
+   * combination is gated to Gemini-3-series preview only), so this model is
+   * never at risk of silently losing structured-output support.
+   */
+  generateModel: z.string().min(1),
+  /** Same honest caveat as requestsPerMinute above - a conservative default, verify the real number in AI Studio. Override with GEMINI_GENERATE_RPM. */
+  generateRequestsPerMinute: z.number().int().positive(),
+  generateMaxConcurrency: z.number().int().positive(),
+  generateMaxRetries: z.number().int().nonnegative(),
+  /** 20s per call, per PROJECT.md's Milestone 3 agent loop design (amendment H) - a plan or compose call that hasn't returned by then is abandoned, not awaited indefinitely. */
+  generateTimeoutMs: z.number().int().positive(),
+  /** Planner/compose outputs are short structured JSON, not prose - bounded well below a full response to cap cost and latency per call. */
+  generateMaxOutputTokens: z.number().int().positive(),
+  /** Non-zero by default for normal traffic; the agent loop overrides this to 0 in deterministic/eval mode (PROJECT.md's Milestone 6 note - not a byte-identical guarantee, only a variance reducer). */
+  generateTemperature: z.number().nonnegative(),
 });
 export type LlmSettings = z.infer<typeof LlmSettingsSchema>;
 
@@ -44,6 +62,13 @@ export function loadLlmSettingsFromEnv(env: NodeJS.ProcessEnv): LlmSettings {
     maxTextsPerBatch: Number(env.GEMINI_EMBED_MAX_BATCH ?? 32),
     maxCharsPerText: Number(env.GEMINI_EMBED_MAX_CHARS_PER_TEXT ?? 8000),
     cacheMaxEntries: Number(env.GEMINI_EMBED_CACHE_MAX_ENTRIES ?? 500),
+    generateModel: env.GEMINI_GENERATE_MODEL || 'gemini-3.5-flash-lite',
+    generateRequestsPerMinute: Number(env.GEMINI_GENERATE_RPM ?? 10),
+    generateMaxConcurrency: Number(env.GEMINI_GENERATE_MAX_CONCURRENCY ?? 2),
+    generateMaxRetries: Number(env.GEMINI_GENERATE_MAX_RETRIES ?? 5),
+    generateTimeoutMs: Number(env.GEMINI_GENERATE_TIMEOUT_MS ?? 20_000),
+    generateMaxOutputTokens: Number(env.GEMINI_GENERATE_MAX_OUTPUT_TOKENS ?? 1024),
+    generateTemperature: Number(env.GEMINI_GENERATE_TEMPERATURE ?? 0.2),
   };
 
   const result = LlmSettingsSchema.safeParse(candidate);

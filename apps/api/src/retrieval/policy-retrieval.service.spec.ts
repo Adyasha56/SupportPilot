@@ -23,6 +23,13 @@ function llmSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
     maxTextsPerBatch: 32,
     maxCharsPerText: 8000,
     cacheMaxEntries: 500,
+    generateModel: 'gemini-3.5-flash-lite',
+    generateRequestsPerMinute: 1000,
+    generateMaxConcurrency: 1000,
+    generateMaxRetries: 0,
+    generateTimeoutMs: 5000,
+    generateMaxOutputTokens: 1024,
+    generateTemperature: 0,
     ...overrides,
   };
 }
