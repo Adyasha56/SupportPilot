@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { FakeLlmProvider } from './fake-llm-provider';
+import { GenerateOptions } from '../llm-provider.interface';
+
+function generateOptions(): GenerateOptions {
+  return {
+    systemInstruction: 'fictional',
+    messages: [{ role: 'user', text: 'hello' }],
+    responseSchema: {},
+    maxOutputTokens: 100,
+    temperature: 0,
+    timeoutMs: 1000,
+  };
+}
 
 function cosineSimilarity(a: number[], b: number[]): number {
   let dot = 0;
@@ -62,5 +74,30 @@ describe('FakeLlmProvider', () => {
 
     expect(relatedSimilarity).toBeGreaterThan(crossSimilarity1);
     expect(relatedSimilarity).toBeGreaterThan(crossSimilarity2);
+  });
+
+  describe('generate', () => {
+    it('returns scripted responses in order, one per call', async () => {
+      const first = { ok: true as const, result: { text: '{"n":1}', usage: { inputTokens: 1, outputTokens: 1 } } };
+      const second = { ok: true as const, result: { text: '{"n":2}', usage: { inputTokens: 1, outputTokens: 1 } } };
+      const provider = new FakeLlmProvider([first, second]);
+
+      await expect(provider.generate(generateOptions())).resolves.toEqual(first);
+      await expect(provider.generate(generateOptions())).resolves.toEqual(second);
+      expect(provider.generateCalls).toBe(2);
+    });
+
+    it('throws loudly, rather than returning a default, when called more times than scripted', async () => {
+      const provider = new FakeLlmProvider([{ ok: true, result: { text: '{}', usage: { inputTokens: 0, outputTokens: 0 } } }]);
+
+      await provider.generate(generateOptions());
+
+      await expect(provider.generate(generateOptions())).rejects.toThrow(/called 2 time\(s\), but only 1 response\(s\) were scripted/);
+    });
+
+    it('with no script at all, throws on the very first call', async () => {
+      const provider = new FakeLlmProvider();
+      await expect(provider.generate(generateOptions())).rejects.toThrow(/0 response\(s\) were scripted/);
+    });
   });
 });

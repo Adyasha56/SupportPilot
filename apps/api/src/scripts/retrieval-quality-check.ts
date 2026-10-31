@@ -59,7 +59,7 @@ import { Chunk } from '../ingestion/chunking/markdown-chunker.types';
 import { PolicyIngestionService } from '../ingestion/policy-ingestion.service';
 import { TenantIngestionLock } from '../ingestion/tenant-ingestion-lock';
 import { GeminiLlmProvider } from '../llm/gemini-llm-provider';
-import { EmbedOutcome, EmbeddingTaskType, LlmProvider } from '../llm/llm-provider.interface';
+import { EmbedOutcome, EmbeddingTaskType, GenerateOptions, GenerateOutcome, LlmProvider } from '../llm/llm-provider.interface';
 import { loadLlmSettingsFromEnv } from '../llm/llm.settings';
 import { PolicyRetrievalService } from '../retrieval/policy-retrieval.service';
 import { EmbeddingFileCache } from './embedding-file-cache';
@@ -133,6 +133,12 @@ class CachingLlmProvider implements LlmProvider {
         dimension: EMBEDDING_DIMENSION,
       },
     };
+  }
+
+  // This script only ever exercises retrieval (embed()); generate() is
+  // passed through uncached and unused, just to satisfy LlmProvider.
+  generate(options: GenerateOptions): Promise<GenerateOutcome> {
+    return this.inner.generate(options);
   }
 }
 

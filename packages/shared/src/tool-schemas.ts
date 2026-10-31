@@ -1,11 +1,6 @@
 import { z } from 'zod';
 import { idSchema } from './ids';
-import { hasAtMostTwoDecimals } from './money';
-
-const moneyAmountSchema = z
-  .number()
-  .positive()
-  .refine(hasAtMostTwoDecimals, 'amount must have at most two decimal places');
+import { moneyAmountSchema } from './money';
 
 export const GetOrderInputSchema = z.object({
   order_id: idSchema(),

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { centsEqual, centsGreaterThan, hasAtMostTwoDecimals, toCents } from '../src/money';
+import { centsEqual, centsGreaterThan, hasAtMostTwoDecimals, moneyAmountSchema, toCents } from '../src/money';
 
 describe('toCents', () => {
   it('converts decimal dollars to integer cents', () => {
@@ -36,5 +36,20 @@ describe('centsEqual / centsGreaterThan', () => {
     expect(centsGreaterThan(49.99, 49.98)).toBe(true);
     expect(centsGreaterThan(49.99, 49.99)).toBe(false);
     expect(centsGreaterThan(49.98, 49.99)).toBe(false);
+  });
+});
+
+describe('moneyAmountSchema', () => {
+  it('accepts a positive amount with at most two decimals', () => {
+    expect(moneyAmountSchema.safeParse(49.99).success).toBe(true);
+  });
+
+  it('rejects zero and negative amounts', () => {
+    expect(moneyAmountSchema.safeParse(0).success).toBe(false);
+    expect(moneyAmountSchema.safeParse(-5).success).toBe(false);
+  });
+
+  it('rejects more than two decimal places', () => {
+    expect(moneyAmountSchema.safeParse(49.999).success).toBe(false);
   });
 });
