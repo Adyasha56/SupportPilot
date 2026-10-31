@@ -1,16 +1,37 @@
 import { z } from 'zod';
 import { idSchema } from './ids';
-import { moneyAmountSchema } from './money';
+import { hasAtMostTwoDecimals, moneyAmountSchema, toCents } from './money';
 
 export const GetOrderInputSchema = z.object({
   order_id: idSchema(),
 });
 export type GetOrderInput = z.infer<typeof GetOrderInputSchema>;
 
+/**
+ * Money fields are converted to integer CENTS right here - the boundary
+ * where a tool's raw upstream response becomes GetOrderOutput, the shape
+ * the rest of the agent (derived-facts.ts, validate-proposed-refund.ts)
+ * consumes. Downstream code never re-does a dollars-to-cents conversion
+ * for `total`/`alreadyRefundedTotal` - it already received cents.
+ */
 export const GetOrderOutputSchema = z.object({
   status: z.string(),
-  total: moneyAmountSchema,
+  total: moneyAmountSchema.transform(toCents),
   placedAt: z.string(),
+  /** Absent for an order not yet delivered - mirrors the mock store's own `Order.deliveredAt?: string`. */
+  deliveredAt: z.string().optional(),
+  /**
+   * Defaults to 0 (then still converted to cents) when a connector's
+   * responseMap doesn't map this field at all - keeps every
+   * already-committed connector fixture and test fixture that predates
+   * this field validating unchanged, reading as "nothing refunded yet."
+   */
+  alreadyRefundedTotal: z
+    .number()
+    .nonnegative()
+    .refine(hasAtMostTwoDecimals, 'amount must have at most two decimal places')
+    .default(0)
+    .transform(toCents),
   customerRef: idSchema(),
 });
 export type GetOrderOutput = z.infer<typeof GetOrderOutputSchema>;

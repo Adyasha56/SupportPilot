@@ -1,5 +1,3 @@
-import { toCents } from '@supportpilot/shared';
-
 /**
  * Pure facts derived from tool results, computed in code - never by the
  * model (PROJECT.md's Agent loop design: "the model only ever reads facts,
@@ -9,15 +7,14 @@ import { toCents } from '@supportpilot/shared';
  * function reads the real wall clock directly, so every edge case below is
  * exactly reproducible in a test.
  *
- * KNOWN GAP (flagged, not fixed in Stage 2): the current get_order
- * connector fixtures (acme/widgetco) and GetOrderOutputSchema don't expose
- * a delivery timestamp or an "already refunded" amount at all - the mock
- * store's own Order type has `deliveredAt?: string`, but no connector's
- * responseMap maps it through yet. These functions are deliberately
- * parameter-driven (plain strings/numbers, not GetOrderOutput) rather than
- * schema-coupled, specifically so that gap doesn't block this stage - but
- * Stage 3/4's loop cannot compute real daysSinceDelivery/remainingRefundable
- * against the real mock store until that mapping is added.
+ * GAP CLOSED (Stage 2 flagged this, Stage 3's data-contract follow-up fixed
+ * it): GetOrderOutputSchema now exposes `deliveredAt` and
+ * `alreadyRefundedTotal`, and converts both of its money fields
+ * (`total`, `alreadyRefundedTotal`) to integer CENTS at that boundary
+ * (packages/shared/src/tool-schemas.ts). `remainingRefundable` below
+ * therefore takes cents directly and does no unit conversion of its own -
+ * by the time a caller has a GetOrderOutput, the conversion already
+ * happened once, at the one place it belongs.
  */
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -76,17 +73,16 @@ export function daysPastEstimate(estimatedDelivery: string | undefined, clock: (
 
 /**
  * Integer cents remaining refundable on an order, given its total and
- * whatever has already been refunded against it (both decimal dollars,
- * this project's standard money representation at any boundary - see
- * money.ts). Converts to cents before subtracting so floating-point
- * representation never affects the result (same reasoning as every other
- * money comparison in this project), and clamps at 0: if `alreadyRefunded`
- * ever exceeds `orderTotal` (a data inconsistency that should never happen
- * but must never be trusted blindly), the safe reading is "nothing left to
- * refund," never a negative number a careless `amount <= remainingRefundable`
- * check could be tricked by.
+ * whatever has already been refunded against it - BOTH already integer
+ * cents (straight from a verified GetOrderOutput's `total`/
+ * `alreadyRefundedTotal`, already converted at the tool-output boundary -
+ * see this file's top comment). No unit conversion happens here; this is
+ * a plain integer subtraction, clamped at 0: if `alreadyRefundedCents`
+ * ever exceeds `orderTotalCents` (a data inconsistency that should never
+ * happen but must never be trusted blindly), the safe reading is "nothing
+ * left to refund," never a negative number a careless
+ * `amount <= remainingRefundable` check could be tricked by.
  */
-export function remainingRefundable(orderTotal: number, alreadyRefunded: number): number {
-  const remaining = toCents(orderTotal) - toCents(alreadyRefunded);
-  return Math.max(remaining, 0);
+export function remainingRefundable(orderTotalCents: number, alreadyRefundedCents: number): number {
+  return Math.max(orderTotalCents - alreadyRefundedCents, 0);
 }

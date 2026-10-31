@@ -83,7 +83,9 @@ describe('ToolRunnerService via Nest module wiring (e2e)', () => {
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.data).toMatchObject({ status: 'delivered', total: 49.99 });
+      // total is integer cents - GetOrderOutputSchema converts money to
+      // cents at the tool-output boundary (Milestone 3, Stage 2 follow-up).
+      expect(result.data).toMatchObject({ status: 'delivered', total: 4999 });
     }
   });
 });

@@ -5,8 +5,8 @@ function makeState(overrides: Partial<ValidateProposedRefundState> = {}): Valida
   return {
     runId: 'run_1',
     verifiedOrderIds: new Set(['ORD-1001']),
-    orderTotal: 100,
-    alreadyRefunded: 0,
+    orderTotalCents: 10000,
+    alreadyRefundedCents: 0,
     reasonCitations: ['k1'],
     ...overrides,
   };
@@ -47,24 +47,31 @@ describe('validateProposedRefund', () => {
 
   it('accepts the classic 0.1 + 0.2 float edge case as a valid two-decimal amount', () => {
     const amount = 0.1 + 0.2; // 0.30000000000000004 in raw IEEE-754
-    const result = validateProposedRefund({ order_id: 'ORD-1001', amount }, makeState({ orderTotal: 1 }));
+    const result = validateProposedRefund({ order_id: 'ORD-1001', amount }, makeState({ orderTotalCents: 100 }));
     expect(result.ok).toBe(true);
   });
 
   it('rejects an amount that exceeds remainingRefundable', () => {
-    const result = validateProposedRefund({ order_id: 'ORD-1001', amount: 100.01 }, makeState({ orderTotal: 100 }));
+    const result = validateProposedRefund({ order_id: 'ORD-1001', amount: 100.01 }, makeState({ orderTotalCents: 10000 }));
     expect(result).toEqual({ ok: false, reason: 'AMOUNT_EXCEEDS_REMAINING_REFUNDABLE' });
   });
 
   it('rejects an amount that exactly equals the total but the order was already fully refunded', () => {
-    const result = validateProposedRefund({ order_id: 'ORD-1001', amount: 100 }, makeState({ orderTotal: 100, alreadyRefunded: 100 }));
+    const result = validateProposedRefund(
+      { order_id: 'ORD-1001', amount: 100 },
+      makeState({ orderTotalCents: 10000, alreadyRefundedCents: 10000 }),
+    );
     expect(result).toEqual({ ok: false, reason: 'AMOUNT_EXCEEDS_REMAINING_REFUNDABLE' });
   });
 
   it('accepts an amount that exactly equals remainingRefundable at the cent boundary (float edge case)', () => {
-    // 0.1 + 0.2 style boundary: orderTotal - alreadyRefunded should equal
-    // exactly 0.30 in cents (30), not drift due to float error.
-    const result = validateProposedRefund({ order_id: 'ORD-1001', amount: 0.3 }, makeState({ orderTotal: 0.5, alreadyRefunded: 0.2 }));
+    // orderTotalCents - alreadyRefundedCents = 30 cents; the proposed
+    // amount (0.1 + 0.2 dollars) must convert to exactly 30 cents too, not
+    // drift due to float error.
+    const result = validateProposedRefund(
+      { order_id: 'ORD-1001', amount: 0.1 + 0.2 },
+      makeState({ orderTotalCents: 50, alreadyRefundedCents: 20 }),
+    );
     expect(result.ok).toBe(true);
   });
 

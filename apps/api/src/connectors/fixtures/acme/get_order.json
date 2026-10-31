@@ -13,6 +13,8 @@
     "status": "$.status",
     "total": "$.total",
     "placedAt": "$.placedAt",
+    "deliveredAt": "$.deliveredAt",
+    "alreadyRefundedTotal": "$.alreadyRefundedTotal",
     "customerRef": "$.customerRef"
   },
   "riskLevel": "low",

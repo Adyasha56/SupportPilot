@@ -90,7 +90,10 @@ describe('runTool', () => {
     expect(result).toEqual({
       ok: true,
       riskLevel: 'low',
-      data: { status: 'delivered', total: 49.99, placedAt: '2026-01-01T00:00:00.000Z', customerRef: 'cust_1' },
+      // total is 4999 (integer cents), not 49.99 - GetOrderOutputSchema
+      // converts money to cents at the tool-output boundary; alreadyRefundedTotal
+      // defaults to 0 since this fixture's responseMap doesn't map it.
+      data: { status: 'delivered', total: 4999, placedAt: '2026-01-01T00:00:00.000Z', customerRef: 'cust_1', alreadyRefundedTotal: 0 },
     });
   });
 
