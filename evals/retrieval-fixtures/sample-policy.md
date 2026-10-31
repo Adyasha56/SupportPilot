@@ -65,7 +65,7 @@ by their country; these are never included in the order total.
 
 ### Late or Missing Deliveries
 
-If a tracked order shows no movement for more than 10 business days past
+If a tracked order shows no movement for more than 7 calendar days past
 its estimated delivery date, contact support with the order number for
 an investigation. Confirmed lost packages are either reshipped at no
 cost or fully refunded, customer's choice. Orders that show as
