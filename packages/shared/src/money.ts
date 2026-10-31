@@ -1,3 +1,5 @@
+import { z } from 'zod';
+
 /**
  * Money is accepted and returned as decimal dollars (e.g. 49.99) for
  * readability, but every comparison converts to integer cents first so
@@ -22,3 +24,6 @@ export function centsEqual(a: number, b: number): boolean {
 export function centsGreaterThan(a: number, b: number): boolean {
   return toCents(a) > toCents(b);
 }
+
+/** A decimal-dollar amount, positive, at most two decimal places - the one schema every money-accepting field in this project should reuse rather than redefine. */
+export const moneyAmountSchema = z.number().positive().refine(hasAtMostTwoDecimals, 'amount must have at most two decimal places');
