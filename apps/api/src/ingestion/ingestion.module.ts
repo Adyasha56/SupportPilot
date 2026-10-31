@@ -22,11 +22,23 @@ import { TenantIngestionLock } from './tenant-ingestion-lock';
  * controller-level tests never caught because they provide repositories
  * directly rather than exercising this real import graph. Caught by
  * running the real server against a real .env.)
+ *
+ * A plain, exported function - not an inline expression - specifically so
+ * ingestion.module.spec.ts can call it directly with a fake env object and
+ * assert on its return value, instead of needing a fresh dynamic
+ * import()/vi.resetModules() cycle (which re-transforms and re-executes
+ * this module's entire real dependency graph from scratch) just to see a
+ * different env value take effect. Real decorator metadata (the exact
+ * thing that was actually wrong in the original bug this test guards
+ * against) is still read directly off the real DatabaseModule class by
+ * both this function and the test - nothing here is faked.
  */
-const ingestionDatabaseImports = process.env.MONGODB_URI ? [DatabaseModule] : [];
+export function ingestionDatabaseImportsFor(env: NodeJS.ProcessEnv): [typeof DatabaseModule] | [] {
+  return env.MONGODB_URI ? [DatabaseModule] : [];
+}
 
 @Module({
-  imports: [AuthModule, LlmModule, ...ingestionDatabaseImports],
+  imports: [AuthModule, LlmModule, ...ingestionDatabaseImportsFor(process.env)],
   controllers: [PoliciesController],
   providers: [
     ingestionSettingsProvider,
