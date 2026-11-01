@@ -15,13 +15,13 @@ describe('TenantSchema', () => {
 
   it('rejects a tenant id that does not match the shared slug pattern', async () => {
     const doc = new TenantModel({ _id: 'Acme!', name: 'Acme Inc' });
-    const err = await doc.validate().catch((e: mongoose.Error.ValidationError) => e);
+    const err = (await doc.validate().catch((e: mongoose.Error.ValidationError) => e)) as mongoose.Error.ValidationError;
     expect(err.errors._id).toBeDefined();
   });
 
   it('requires a name', async () => {
     const doc = new TenantModel({ _id: 'acme' });
-    const err = await doc.validate().catch((e: mongoose.Error.ValidationError) => e);
+    const err = (await doc.validate().catch((e: mongoose.Error.ValidationError) => e)) as mongoose.Error.ValidationError;
     expect(err.errors.name).toBeDefined();
   });
 });

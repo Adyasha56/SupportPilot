@@ -104,8 +104,8 @@ describe('IngestionModule regression guard (the one case that still needs a real
     // production code).
     vi.resetModules();
     vi.stubEnv('MONGODB_URI', 'mongodb://127.0.0.1:59999/test');
-    const fresh = await import('./ingestion.module');
-    const freshDb = await import('../db/database.module');
+    const fresh = await import('./ingestion.module.js');
+    const freshDb = await import('../db/database.module.js');
 
     const imports = Reflect.getMetadata('imports', fresh.IngestionModule) as unknown[];
     expect(imports).toContain(freshDb.DatabaseModule);

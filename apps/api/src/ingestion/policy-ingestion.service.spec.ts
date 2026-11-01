@@ -6,8 +6,12 @@ import { InMemoryPolicyChunkRepository } from '../db/test-utils/in-memory-policy
 import { InMemoryPolicyDocumentRepository } from '../db/test-utils/in-memory-policy-document.repository';
 import { TransactionRunner } from '../db/transaction-runner';
 import { FakeLlmProvider } from '../llm/test-utils/fake-llm-provider';
-import { LlmProvider, EmbedOutcome, EmbeddingTaskType } from '../llm/llm-provider.interface';
+import { LlmProvider, EmbedOutcome, EmbeddingTaskType, GenerateOutcome } from '../llm/llm-provider.interface';
 import { LlmSettings } from '../llm/llm.settings';
+
+async function unusedGenerate(): Promise<GenerateOutcome> {
+  return { ok: false, error: { code: 'NOT_CONFIGURED', message: 'generate() is not used by this test' } };
+}
 
 function settings(overrides: Partial<IngestionSettings> = {}): IngestionSettings {
   return {
@@ -40,6 +44,7 @@ function llmSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
     generateTimeoutMs: 5000,
     generateMaxOutputTokens: 1024,
     generateTemperature: 0,
+    dailyGenerateBudget: 300,
     ...overrides,
   };
 }
@@ -55,6 +60,7 @@ class FailingLlmProvider implements LlmProvider {
     const fake = new FakeLlmProvider();
     return fake.embed(texts, _taskType);
   }
+  generate = unusedGenerate;
 }
 
 function makeService(opts: {
@@ -256,7 +262,7 @@ describe('PolicyIngestionService.ingest', () => {
       expect(taskType).toBe('RETRIEVAL_DOCUMENT');
       return fake.embed(texts, taskType);
     });
-    const { service } = makeService({ llmProvider: { embed } });
+    const { service } = makeService({ llmProvider: { embed, generate: unusedGenerate } });
 
     await service.ingest({ tenantId: 'acme', text: SAMPLE_MARKDOWN, title: 'Refund Policy' });
 

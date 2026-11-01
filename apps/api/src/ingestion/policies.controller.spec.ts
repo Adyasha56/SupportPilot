@@ -54,6 +54,7 @@ function llmSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
     generateTimeoutMs: 5000,
     generateMaxOutputTokens: 1024,
     generateTemperature: 0,
+    dailyGenerateBudget: 300,
     ...overrides,
   };
 }
@@ -241,7 +242,7 @@ describe('PoliciesController', () => {
       // interleave (policy-ingestion.service.spec.ts's equivalent test
       // avoids this race entirely by not going through HTTP/multipart).
       let signalEmbedStarted: () => void;
-      let releaseFirst: () => void;
+      let releaseFirst!: () => void; // assigned synchronously inside the Promise executor below - TS can't see that on its own
       const embedStarted = new Promise<void>((resolve) => {
         signalEmbedStarted = resolve;
       });
