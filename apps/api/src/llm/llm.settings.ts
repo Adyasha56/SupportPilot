@@ -49,6 +49,16 @@ export const LlmSettingsSchema = z.object({
   generateMaxOutputTokens: z.number().int().positive(),
   /** Non-zero by default for normal traffic; the agent loop overrides this to 0 in deterministic/eval mode (PROJECT.md's Milestone 6 note - not a byte-identical guarantee, only a variance reducer). */
   generateTemperature: z.number().nonnegative(),
+  /**
+   * Global, in-memory, single-process cap on real generate() calls per
+   * rolling day - see apps/api/src/agent/loop/daily-generate-budget.ts.
+   * Default (300) is well under the real per-day cap this project's own
+   * AI Studio project reported for the default model (500/day, recorded
+   * docs/learning-notes.md, Stage 4 finding 7, checked 2026-11-02) -
+   * never assume that number holds for a different project or a later
+   * date (RULES.md section 7).
+   */
+  dailyGenerateBudget: z.number().int().positive(),
 });
 export type LlmSettings = z.infer<typeof LlmSettingsSchema>;
 
@@ -69,6 +79,7 @@ export function loadLlmSettingsFromEnv(env: NodeJS.ProcessEnv): LlmSettings {
     generateTimeoutMs: Number(env.GEMINI_GENERATE_TIMEOUT_MS ?? 20_000),
     generateMaxOutputTokens: Number(env.GEMINI_GENERATE_MAX_OUTPUT_TOKENS ?? 1024),
     generateTemperature: Number(env.GEMINI_GENERATE_TEMPERATURE ?? 0.2),
+    dailyGenerateBudget: Number(env.GEMINI_DAILY_GENERATE_BUDGET ?? 300),
   };
 
   const result = LlmSettingsSchema.safeParse(candidate);

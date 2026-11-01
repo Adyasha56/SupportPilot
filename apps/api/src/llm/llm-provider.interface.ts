@@ -19,7 +19,7 @@ export interface EmbedResult {
   dimension: number;
 }
 
-export type EmbedErrorCode = 'NOT_CONFIGURED' | 'INVALID_INPUT' | 'RATE_LIMITED' | 'UNAUTHORIZED' | 'TRANSIENT' | 'UNAVAILABLE';
+export type EmbedErrorCode = 'NOT_CONFIGURED' | 'INVALID_INPUT' | 'RATE_LIMITED' | 'UNAUTHORIZED' | 'TRANSIENT' | 'UNAVAILABLE' | 'ABORTED';
 
 export interface EmbedError {
   code: EmbedErrorCode;
@@ -67,6 +67,15 @@ export interface GenerateOptions {
   /** 0 in deterministic/eval mode - see PROJECT.md's Milestone 6 note: not a byte-identical-output guarantee, only a variance reducer. */
   temperature: number;
   timeoutMs: number;
+  /**
+   * Optional - when provided, generate() aborts (ABORTED, never a hang)
+   * the instant this fires, including mid-retry/mid-backoff, not just for
+   * the underlying network call. Callers with their own run-level
+   * deadline (the agent loop's total-run budget) pass a signal tied to
+   * that deadline so retries can never silently run past it - see
+   * ThrottledClient's own doc comment for the real bug this closes.
+   */
+  abortSignal?: AbortSignal;
 }
 
 export type GenerateErrorCode =
@@ -77,11 +86,15 @@ export type GenerateErrorCode =
   | 'TRANSIENT'
   | 'UNAVAILABLE'
   /** The SDK returned a response, but its text wasn't valid JSON at all - distinct from the caller's OWN Zod schema rejecting a validly-shaped-but-wrong JSON value, which generate() has no way to know about (it only knows the raw JSON Schema object it was given, not the Zod type it came from). */
-  | 'INVALID_OUTPUT';
+  | 'INVALID_OUTPUT'
+  /** options.abortSignal fired before a usable response came back - distinct from TRANSIENT, which means a network-level hiccup, not a caller-imposed deadline. */
+  | 'ABORTED';
 
 export interface GenerateError {
   code: GenerateErrorCode;
   message: string;
+  /** How many attempts (including the final one) actually ran before giving up - absent when the failure happened before any attempt (e.g. NOT_CONFIGURED, INVALID_INPUT). */
+  attempts?: number;
 }
 
 export interface GenerateUsage {

@@ -147,6 +147,7 @@ async function main(): Promise<void> {
     generateTimeoutMs: 5000,
     generateMaxOutputTokens: 1024,
     generateTemperature: 0,
+    dailyGenerateBudget: 300,
   };
   const ingestionSettings = {
     maxFileBytes: 1_000_000,

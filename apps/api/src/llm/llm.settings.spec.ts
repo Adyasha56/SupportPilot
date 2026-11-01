@@ -15,6 +15,17 @@ describe('loadLlmSettingsFromEnv', () => {
     expect(settings.generateMaxConcurrency).toBeGreaterThan(0);
     expect(settings.generateTimeoutMs).toBeGreaterThan(0);
     expect(settings.generateMaxOutputTokens).toBeGreaterThan(0);
+    expect(settings.dailyGenerateBudget).toBeGreaterThan(0);
+  });
+
+  it('defaults GEMINI_DAILY_GENERATE_BUDGET to 300 when unset', () => {
+    const settings = loadLlmSettingsFromEnv({});
+    expect(settings.dailyGenerateBudget).toBe(300);
+  });
+
+  it('picks up GEMINI_DAILY_GENERATE_BUDGET from env', () => {
+    const settings = loadLlmSettingsFromEnv({ GEMINI_DAILY_GENERATE_BUDGET: '50' });
+    expect(settings.dailyGenerateBudget).toBe(50);
   });
 
   it('picks up every overridable embed value from env', () => {

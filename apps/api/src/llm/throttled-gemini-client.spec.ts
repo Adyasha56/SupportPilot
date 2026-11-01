@@ -188,4 +188,116 @@ describe('ThrottledClient', () => {
     expect(embedCalls).toHaveLength(1);
     expect(generateCalls).toHaveLength(2);
   });
+
+  describe('abortSignal - the real deadline-overrun bug, fixed', () => {
+    it('never calls innerCall at all when the signal is already aborted', async () => {
+      const innerCall = vi.fn(async (): Promise<EmbedContentResult> => ({ embeddings: [{ values: [1] }] }));
+      const client = new ThrottledClient(innerCall, makeSettings());
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(client.call(request, controller.signal)).rejects.toMatchObject({ code: 'ABORTED', attempts: 0 });
+      expect(innerCall).not.toHaveBeenCalled();
+    });
+
+    it('aborts mid-backoff instead of sleeping out the full exponential delay - every attempt returns 429', async () => {
+      const innerCall = vi.fn(async (): Promise<EmbedContentResult> => {
+        throw statusError(429);
+      });
+      const client = new ThrottledClient(innerCall, makeSettings({ maxRetries: 10 }));
+      const controller = new AbortController();
+
+      const resultPromise = client.call(request, controller.signal);
+      let caught: unknown;
+      resultPromise.catch((err) => {
+        caught = err;
+      });
+
+      // One real attempt happens, then backoff starts - abort during it,
+      // long before 10 retries' worth of exponential backoff could ever
+      // elapse (which would be tens of seconds).
+      await vi.advanceTimersByTimeAsync(100);
+      controller.abort();
+      await vi.waitFor(() => expect(caught).toBeInstanceOf(ThrottledClientError));
+
+      expect((caught as ThrottledClientError).code).toBe('ABORTED');
+      expect(innerCall).toHaveBeenCalledTimes(1); // never reached a 2nd attempt
+    });
+
+    it('aborts while waiting for a rate-limit slot - every attempt would otherwise time out waiting', async () => {
+      const innerCall = vi.fn(async (): Promise<EmbedContentResult> => ({ embeddings: [{ values: [1] }] }));
+      const client = new ThrottledClient(innerCall, makeSettings({ requestsPerMinute: 1 }));
+      const controller = new AbortController();
+
+      await client.call(request); // consumes the only slot in this 60s window
+      const secondPromise = client.call(request, controller.signal);
+      let caught: unknown;
+      secondPromise.catch((err) => {
+        caught = err;
+      });
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      controller.abort();
+      await vi.waitFor(() => expect(caught).toBeInstanceOf(ThrottledClientError));
+
+      expect((caught as ThrottledClientError).code).toBe('ABORTED');
+      expect(innerCall).toHaveBeenCalledTimes(1); // the second call never ran at all
+    });
+
+    it('mixed failures (429 then a 5xx) still abort promptly rather than exhausting all retries', async () => {
+      let calls = 0;
+      const innerCall = vi.fn(async (): Promise<EmbedContentResult> => {
+        calls++;
+        throw statusError(calls % 2 === 1 ? 429 : 503);
+      });
+      const client = new ThrottledClient(innerCall, makeSettings({ maxRetries: 10 }));
+      const controller = new AbortController();
+
+      const resultPromise = client.call(request, controller.signal);
+      let caught: unknown;
+      resultPromise.catch((err) => {
+        caught = err;
+      });
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      controller.abort();
+      await vi.waitFor(() => expect(caught).toBeInstanceOf(ThrottledClientError));
+
+      expect((caught as ThrottledClientError).code).toBe('ABORTED');
+      expect(innerCall.mock.calls.length).toBeLessThan(11); // nowhere near all 11 possible attempts
+    });
+
+    it('reports the real attempt count on the thrown error', async () => {
+      let calls = 0;
+      const innerCall = vi.fn(async (): Promise<EmbedContentResult> => {
+        calls++;
+        throw statusError(429);
+      });
+      const client = new ThrottledClient(innerCall, makeSettings({ maxRetries: 10 }));
+      const controller = new AbortController();
+
+      const resultPromise = client.call(request, controller.signal);
+      let caught: unknown;
+      resultPromise.catch((err) => {
+        caught = err;
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+      controller.abort();
+      await vi.waitFor(() => expect(caught).toBeInstanceOf(ThrottledClientError));
+
+      expect((caught as ThrottledClientError).attempts).toBe(calls);
+      expect(calls).toBeGreaterThan(0);
+    });
+
+    it('a call that succeeds before the signal ever fires is unaffected', async () => {
+      const innerCall = vi.fn(async (): Promise<EmbedContentResult> => ({ embeddings: [{ values: [1] }] }));
+      const client = new ThrottledClient(innerCall, makeSettings());
+      const controller = new AbortController();
+
+      const result = await client.call(request, controller.signal);
+
+      expect(result.embeddings).toEqual([{ values: [1] }]);
+    });
+  });
 });

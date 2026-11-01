@@ -33,6 +33,7 @@ function makeSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
     generateTimeoutMs: 5000,
     generateMaxOutputTokens: 1024,
     generateTemperature: 0,
+    dailyGenerateBudget: 300,
     ...overrides,
   };
 }
@@ -73,7 +74,7 @@ describe('GeminiLlmProvider', () => {
   it('sends every text as one batch request and maps each embedding back to its input, in order', async () => {
     const receivedRequests: EmbedContentRequest[] = [];
     const fakeClient: GeminiEmbedClient = {
-      embedContent: vi.fn(async (request) => {
+      embedContent: vi.fn(async (request: EmbedContentRequest) => {
         receivedRequests.push(request);
         // Mirrors the real SDK's documented contract: one ContentEmbedding
         // per input content, in the same order as the request's `contents`.
@@ -81,7 +82,7 @@ describe('GeminiLlmProvider', () => {
         // different inputs to the same direction (a plain scalar multiple,
         // e.g. [1,0,0] vs [2,0,0], would normalize to the same vector).
         return {
-          embeddings: request.contents.map((_, i) => ({
+          embeddings: request.contents.map((_: string, i: number) => ({
             values: [0, 1, 2].map((position) => (position === i ? 1 : 0)),
           })),
         };

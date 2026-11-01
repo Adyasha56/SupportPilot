@@ -40,6 +40,26 @@ export interface ConnectorConfigRepository {
 }
 
 /**
+ * Wired in when CONNECTOR_CONFIG_DIR is unset - connectors are disabled,
+ * but the app still boots (never a startup crash over a missing path).
+ * findAllForTenant returns an empty list (so allowed-tools.ts's
+ * intersection naturally comes out empty, a tenant with no connectors
+ * behaves identically); findByTool throws the SAME typed error a real
+ * FileConnectorConfigRepository throws for an unconfigured tool, which
+ * runTool() already converts to CONFIG_ERROR - no new error handling
+ * needed anywhere downstream.
+ */
+export class DisabledConnectorConfigRepository implements ConnectorConfigRepository {
+  findAllForTenant(_tenantId: string): ConnectorConfig[] {
+    return [];
+  }
+
+  findByTool(_tenantId: string, _tool: string): ConnectorConfig {
+    throw new ConnectorConfigNotFoundError('Connector configs are not configured (CONNECTOR_CONFIG_DIR is not set).');
+  }
+}
+
+/**
  * File-backed implementation, standing in for the future DB-backed
  * ConnectorConfig table (PROJECT.md section 5). Swappable behind the
  * interface above without touching any caller.

@@ -243,19 +243,29 @@ export class GeminiLlmProvider implements LlmProvider {
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
+    // Fires on EITHER this call's own per-call timeout OR the caller's
+    // run-level deadline, whichever comes first - and, critically, is
+    // passed to ThrottledClient.call() too (not just the SDK request's own
+    // config.abortSignal), so it also cuts short any retry/backoff still
+    // in progress, not just the single network call in flight at that
+    // instant. See ThrottledClient's own doc comment for the bug this closes.
+    const combinedSignal = options.abortSignal ? AbortSignal.any([controller.signal, options.abortSignal]) : controller.signal;
     try {
-      const response = await this.generateClient.call({
-        model: this.settings.generateModel,
-        systemInstruction: options.systemInstruction,
-        contents: options.messages.map((message) => ({ role: message.role, parts: [{ text: message.text }] })),
-        config: {
-          responseMimeType: 'application/json',
-          responseJsonSchema: options.responseSchema,
-          maxOutputTokens: options.maxOutputTokens,
-          temperature: options.temperature,
-          abortSignal: controller.signal,
+      const response = await this.generateClient.call(
+        {
+          model: this.settings.generateModel,
+          systemInstruction: options.systemInstruction,
+          contents: options.messages.map((message) => ({ role: message.role, parts: [{ text: message.text }] })),
+          config: {
+            responseMimeType: 'application/json',
+            responseJsonSchema: options.responseSchema,
+            maxOutputTokens: options.maxOutputTokens,
+            temperature: options.temperature,
+            abortSignal: combinedSignal,
+          },
         },
-      });
+        combinedSignal,
+      );
 
       const text = response.text;
       if (text === undefined) {
@@ -284,7 +294,7 @@ export class GeminiLlmProvider implements LlmProvider {
       };
     } catch (err) {
       if (err instanceof ThrottledClientError) {
-        return { ok: false, error: { code: err.code, message: scrubSecret(err.message, this.settings.geminiApiKey) } };
+        return { ok: false, error: { code: err.code, message: scrubSecret(err.message, this.settings.geminiApiKey), attempts: err.attempts } };
       }
       const message = err instanceof Error ? err.message : String(err);
       return { ok: false, error: { code: 'TRANSIENT', message: scrubSecret(message, this.settings.geminiApiKey) } };

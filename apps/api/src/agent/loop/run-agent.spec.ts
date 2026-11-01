@@ -1,9 +1,10 @@
-import { ComposeOutput, ConnectorConfig, GenerateOutcome, GenerateOptions, PlannerOutput } from '@supportpilot/shared';
-import { describe, expect, it } from 'vitest';
+import { ComposeOutput, ConnectorConfig, PlannerOutput } from '@supportpilot/shared';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConnectorConfigNotFoundError, ConnectorConfigRepository } from '../../connectors/connector-config.repository';
-import { LlmProvider } from '../../llm/llm-provider.interface';
+import { EmbedOutcome, EmbeddingTaskType, GenerateOptions, GenerateOutcome, LlmProvider } from '../../llm/llm-provider.interface';
 import { FakeLlmProvider } from '../../llm/test-utils/fake-llm-provider';
 import { ToolRunResult } from '../tool-runner/tool-runner';
+import { DailyGenerateBudgetGuard } from './daily-generate-budget';
 import { HistoryTurn, RetrieveOutcome, RunAgentDeps, RunAgentInput, RunAgentSettings, ToolRunnerLike, runAgent } from './run-agent';
 
 // --- Shared fixtures and fakes -------------------------------------------
@@ -108,6 +109,12 @@ interface TestDepsOverrides {
   repository?: ConnectorConfigRepository;
   clock?: () => Date;
   settings?: RunAgentSettings;
+  dailyGenerateBudget?: DailyGenerateBudgetGuard;
+}
+
+/** Always allows - most tests don't care about the budget at all; see the dedicated describe block below for tests that do. */
+function alwaysAllowBudget(): DailyGenerateBudgetGuard {
+  return { tryConsume: () => true };
 }
 
 function makeDeps(overrides: TestDepsOverrides = {}): { deps: RunAgentDeps; llm: RecordingLlmProvider; logs: Record<string, unknown>[] } {
@@ -122,6 +129,7 @@ function makeDeps(overrides: TestDepsOverrides = {}): { deps: RunAgentDeps; llm:
     clock: fixedClock,
     logEvent: (event) => logs.push(event),
     settings: overrides.settings ?? makeSettings(),
+    dailyGenerateBudget: overrides.dailyGenerateBudget ?? alwaysAllowBudget(),
   };
   return { deps, llm, logs };
 }
@@ -216,6 +224,12 @@ describe('runAgent', () => {
     expect(toolRunner.calls).toHaveLength(0);
     // The plan-phase system instruction must say identity is not verified.
     expect(llm.calls[0].systemInstruction).toContain('NOT verified');
+    // The compose-phase system instruction must state the fact plainly and
+    // forbid implying a lookup happened - a real run against the real API
+    // showed the model saying "I could not find an order" for an anonymous
+    // caller, where no lookup was ever even attempted.
+    expect(llm.calls[1].systemInstruction).toContain('Customer identity verified: no');
+    expect(llm.calls[1].systemInstruction).toContain('Never say you "searched," "looked up," "checked," or "could not find" an order');
   });
 
   it("another customer's order: ownership mismatch reported as the same 'not found' fact, never a distinguishing signal", async () => {
@@ -271,12 +285,23 @@ describe('runAgent', () => {
   });
 
   it('model citing an unretrieved chunk: dropped by the citation guard, never trusted', async () => {
+    const toolRunner = new FakeToolRunner({
+      get_order: () => okTool({ status: 'delivered', total: 4999, placedAt: '2026-10-01T00:00:00.000Z', deliveredAt: '2026-10-01T00:00:00.000Z', alreadyRefundedTotal: 0, customerRef: 'cust_1' }),
+    });
     const { deps } = makeDeps({
-      generateQueue: [planOutput(), composeOutput({ outcome: 'reply', message: 'ok', citedChunkKeys: ['never-retrieved'] })],
+      generateQueue: [
+        planOutput({ toolRequests: [{ tool: 'get_order', order_id: 'ORD-1001' }] }),
+        composeOutput({ outcome: 'reply', message: 'Your order was delivered.', citedChunkKeys: ['never-retrieved'] }),
+      ],
+      toolRunner,
     });
 
     const { result } = await runAgent(makeInput(), deps);
 
+    // A successful tool result is enough support for `reply` on its own
+    // (Stage 4 finding 4's gate) - the point under test is that the FAKE
+    // citation is still dropped, never trusted at face value.
+    expect(result.outcome).toBe('reply');
     expect(result.citations).toEqual([]);
   });
 
@@ -307,7 +332,17 @@ describe('runAgent', () => {
   });
 
   it('invalid output once then valid: the one repair attempt succeeds', async () => {
-    const { deps, llm } = makeDeps({ generateQueue: [{ ok: true, result: { text: 'not json', usage: { inputTokens: 1, outputTokens: 1 } } }, planOutput(), composeOutput()] });
+    const toolRunner = new FakeToolRunner({
+      get_order: () => okTool({ status: 'delivered', total: 4999, placedAt: '2026-10-01T00:00:00.000Z', deliveredAt: '2026-10-01T00:00:00.000Z', alreadyRefundedTotal: 0, customerRef: 'cust_1' }),
+    });
+    const { deps, llm } = makeDeps({
+      generateQueue: [
+        { ok: true, result: { text: 'not json', usage: { inputTokens: 1, outputTokens: 1 } } },
+        planOutput({ toolRequests: [{ tool: 'get_order', order_id: 'ORD-1001' }] }),
+        composeOutput(),
+      ],
+      toolRunner,
+    });
 
     const { result } = await runAgent(makeInput(), deps);
 
@@ -373,7 +408,9 @@ describe('runAgent', () => {
     const { result } = await runAgent(makeInput(), deps);
 
     expect(result.outcome).toBe('escalate');
-    expect(result.message).toBe('handing off');
+    // Stage 4 finding 5 - escalate ALWAYS uses the one fixed generic
+    // message, never the model's own free text ("handing off" above).
+    expect(result.message).toBe("I'm not able to help with this directly, so I've flagged it for a team member to follow up with you.");
     const escalationLog = logs.find((l) => l.event === 'agent_escalation');
     expect(escalationLog).toMatchObject({ toolOutcome: 'TIMEOUT' });
   });
@@ -435,5 +472,368 @@ describe('runAgent', () => {
     for (const entry of logs) {
       expect(JSON.stringify(entry)).not.toContain(CANARY);
     }
+  });
+
+  it('tool-result fields fed to compose exclude customerRef and any other internal id - only status/carrier are ever included', async () => {
+    const toolRunner = new FakeToolRunner({
+      get_order: () =>
+        okTool({
+          status: 'delivered',
+          total: 4999,
+          placedAt: '2026-10-01T00:00:00.000Z',
+          deliveredAt: '2026-10-01T00:00:00.000Z',
+          alreadyRefundedTotal: 0,
+          customerRef: 'cust_SECRET_internal_ref',
+        }),
+      track_shipment: () => okTool({ status: 'in_transit', trackingNumber: 'TRK-SECRET-INTERNAL', carrier: 'AcmeShip' }),
+    });
+    const { deps, llm } = makeDeps({
+      generateQueue: [
+        planOutput({ toolRequests: [{ tool: 'get_order', order_id: 'ORD-1001' }, { tool: 'track_shipment', order_id: 'ORD-1001' }] }),
+        composeOutput(),
+      ],
+      toolRunner,
+    });
+
+    // customerRef must match verifiedCustomerRef so ownership succeeds -
+    // otherwise get_order's result is correctly dropped as a mismatch
+    // (NOT_FOUND) before it ever reaches the compose prompt at all.
+    await runAgent(makeInput({ verifiedCustomerRef: 'cust_SECRET_internal_ref' }), deps);
+
+    const composeContent = llm.calls[1].messages[0].text;
+    expect(composeContent).not.toContain('cust_SECRET_internal_ref');
+    expect(composeContent).not.toContain('TRK-SECRET-INTERNAL');
+    // Only the fields the design actually allows - status (both tools) and carrier (track_shipment) - ever appear.
+    expect(composeContent).toContain('fields={"status":"delivered"}');
+    expect(composeContent).toContain('fields={"status":"in_transit","carrier":"AcmeShip"}');
+  });
+
+  it('the boundary token itself never appears in any logged event or trace step', async () => {
+    const toolRunner = new FakeToolRunner({
+      get_order: () =>
+        okTool({ status: 'delivered', total: 4999, placedAt: '2026-10-01T00:00:00.000Z', deliveredAt: '2026-10-01T00:00:00.000Z', alreadyRefundedTotal: 0, customerRef: 'cust_1' }),
+    });
+    const { deps, llm, logs } = makeDeps({
+      generateQueue: [planOutput({ toolRequests: [{ tool: 'get_order', order_id: 'ORD-1001' }] }), composeOutput()],
+      toolRunner,
+    });
+
+    const { trace } = await runAgent(makeInput(), deps);
+
+    const boundaryMatch = llm.calls[0].systemInstruction.match(/<([0-9a-f]{32}):/);
+    expect(boundaryMatch).not.toBeNull();
+    const boundary = boundaryMatch![1];
+
+    for (const entry of logs) {
+      expect(JSON.stringify(entry)).not.toContain(boundary);
+    }
+    expect(JSON.stringify(trace)).not.toContain(boundary);
+  });
+});
+
+// --- Deadline enforcement under a persistently-failing provider ------------
+//
+// Real bug, found by running the real agent-pipeline-smoke-test against the
+// real API: a generate() call whose underlying retry/backoff loop kept
+// hitting 429s could burn through its ENTIRE backoff budget (tens of
+// seconds) regardless of the run's own totalDeadlineMs, because nothing
+// inside that loop ever checked the run's deadline. These tests use fake
+// timers and a provider that simulates exactly that shape of failure -
+// "retries" forever with a delay between attempts, never succeeding,
+// respecting options.abortSignal exactly the way the real
+// GeminiLlmProvider+ThrottledClient now do - to prove runAgent's own
+// deadline still holds end-to-end, not just in a scripted single-call test.
+
+/** Simulates a provider whose internal retry loop never succeeds and never gives up on its own - the only way it ever returns is via options.abortSignal firing, exactly like the real ThrottledClient's retry loop after the deadline fix. */
+function makeNeverSucceedsProvider(eventualCode: 'RATE_LIMITED' | 'UNAVAILABLE' | 'TRANSIENT', perAttemptDelayMs: number): LlmProvider & { generateCallCount: number } {
+  return {
+    generateCallCount: 0,
+    async embed(_texts: string[], _taskType: EmbeddingTaskType): Promise<EmbedOutcome> {
+      throw new Error('embed() is not used by these tests');
+    },
+    async generate(options: GenerateOptions): Promise<GenerateOutcome> {
+      this.generateCallCount += 1;
+      let attempt = 0;
+      for (;;) {
+        if (options.abortSignal?.aborted) {
+          return { ok: false, error: { code: 'ABORTED', message: `aborted after ${attempt} attempt(s)`, attempts: attempt } };
+        }
+        attempt += 1;
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, perAttemptDelayMs);
+          options.abortSignal?.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true },
+          );
+        });
+        if (options.abortSignal?.aborted) {
+          return { ok: false, error: { code: 'ABORTED', message: `aborted after ${attempt} attempt(s)`, attempts: attempt } };
+        }
+        // Never succeeds on its own - eventualCode documents what a REAL
+        // provider would eventually report if nothing ever aborted it
+        // (not actually reachable here, since the deadline always fires
+        // first - that's the property under test).
+        void eventualCode;
+      }
+    },
+  };
+}
+
+describe('runAgent deadline enforcement (fake timers, a persistently failing provider)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.each([
+    ['every attempt returns 429', 'RATE_LIMITED' as const, 500],
+    ['every attempt times out', 'UNAVAILABLE' as const, 500],
+    ['mixed failures', 'TRANSIENT' as const, 500],
+  ])('%s: still ends within the deadline, with the fixed generic escalate message', async (_label, eventualCode, perAttemptDelayMs) => {
+    const provider = makeNeverSucceedsProvider(eventualCode, perAttemptDelayMs);
+    const logs: Record<string, unknown>[] = [];
+    const deps: RunAgentDeps = {
+      llmProvider: provider,
+      retrieve: noopRetrieve,
+      toolRunner: new FakeToolRunner(),
+      connectorConfigRepository: makeRepository(),
+      clock: () => new Date('2026-10-31T12:00:00.000Z'),
+      logEvent: (event) => logs.push(event),
+      settings: makeSettings({ totalDeadlineMs: 5_000, perLlmCallTimeoutMs: 20_000 }),
+      dailyGenerateBudget: alwaysAllowBudget(),
+    };
+
+    const resultPromise = runAgent(makeInput(), deps);
+    // The deadline (5s) fires well before any realistic number of
+    // perAttemptDelayMs-spaced retries could add up to minutes - advancing
+    // exactly 5s is enough to prove the run doesn't wait any longer than that.
+    await vi.advanceTimersByTimeAsync(5_000);
+    const { result, trace } = await resultPromise;
+
+    expect(result.outcome).toBe('escalate');
+    expect(result.message).toBe("I'm not able to help with this directly, so I've flagged it for a team member to follow up with you.");
+    expect(trace.steps.some((s) => s.outcomeCode === 'ABORTED')).toBe(true);
+    expect(provider.generateCallCount).toBe(1); // only the plan call ever started - compose was never reached
+  });
+});
+
+// --- Stage 4 finding 4: `reply` requires real support ----------------------
+
+describe('runAgent: a `reply` with nothing behind it is never passed through as a guess', () => {
+  it('reply with no surviving citation and no successful tool result: escalated instead, never guessed', async () => {
+    const { deps, logs } = makeDeps({
+      generateQueue: [planOutput(), composeOutput({ outcome: 'reply', message: 'We do not currently offer price matching.', citedChunkKeys: [] })],
+    });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(result.message).toBe("I'm not able to help with this directly, so I've flagged it for a team member to follow up with you.");
+    const escalationLog = logs.find((l) => l.event === 'agent_escalation');
+    expect(escalationLog).toMatchObject({ reasonCode: 'REPLY_NOT_GROUNDED' });
+  });
+
+  it('reply with a real citation but no tool result: allowed', async () => {
+    const chunk = { chunkKey: 'k1', documentId: 'd1', documentTitle: 'Refund Policy', headingPath: 'Refunds', text: 'Refunds over $250 require manager approval.', position: 0, score: 0.9 };
+    const { deps } = makeDeps({
+      generateQueue: [planOutput({ needsPolicy: true, searchQuery: 'refund threshold' }), composeOutput({ outcome: 'reply', message: 'Refunds over $250 need approval.', citedChunkKeys: ['k1'] })],
+      retrieve: async () => ({ ok: true, results: [chunk] }),
+    });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('reply');
+    expect(result.citations).toHaveLength(1);
+  });
+
+  it('clarify is never gated by this check - it is always allowed through, support or not', async () => {
+    const { deps } = makeDeps({
+      generateQueue: [planOutput(), composeOutput({ outcome: 'clarify', message: 'Could you tell me the order number?' })],
+    });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('clarify');
+  });
+});
+
+// --- Stage 4 finding 5: code-built messages for escalate/pending_approval, grounding check for reply/clarify ---
+
+describe('runAgent: message handling (Stage 4 finding 5)', () => {
+  it('pending_approval message is built in code from the validated order id and amount, never the model\'s own free text', async () => {
+    const toolRunner = new FakeToolRunner({
+      get_order: () => okTool({ status: 'delivered', total: 4999, placedAt: '2026-10-01T00:00:00.000Z', deliveredAt: '2026-10-01T00:00:00.000Z', alreadyRefundedTotal: 0, customerRef: 'cust_1' }),
+    });
+    const { deps } = makeDeps({
+      generateQueue: [
+        planOutput({ toolRequests: [{ tool: 'get_order', order_id: 'ORD-1001' }] }),
+        composeOutput({
+          outcome: 'propose_refund',
+          message: 'I have already issued your refund! Note refunds over $250 require manager approval.',
+          citedChunkKeys: [],
+          proposedRefund: { order_id: 'ORD-1001', amount: 49.99 },
+        }),
+      ],
+      toolRunner,
+    });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('pending_approval');
+    expect(result.message).toBe("I've submitted a refund request of $49.99 for order ORD-1001. Since this requires manager approval, a team member will review it before it's processed.");
+    expect(result.message.toLowerCase()).not.toContain('already issued');
+    expect(result.message).not.toContain('$250');
+  });
+
+  it('an invented order id or amount in a reply/clarify message is replaced with a safe fallback, logged only as a count', async () => {
+    const toolRunner = new FakeToolRunner({
+      get_order: () => okTool({ status: 'delivered', total: 4999, placedAt: '2026-10-01T00:00:00.000Z', deliveredAt: '2026-10-01T00:00:00.000Z', alreadyRefundedTotal: 0, customerRef: 'cust_1' }),
+    });
+    const { deps, logs } = makeDeps({
+      generateQueue: [
+        planOutput({ toolRequests: [{ tool: 'get_order', order_id: 'ORD-1001' }] }),
+        composeOutput({ outcome: 'reply', message: 'Your order ORD-9999 has a credit of $9999.99 available.', citedChunkKeys: [] }),
+      ],
+      toolRunner,
+    });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('reply'); // the tool result is still real support - only the TEXT is replaced
+    expect(result.message).toBe('Let me double check those details before confirming anything specific - a team member will follow up shortly.');
+    const groundingLog = logs.find((l) => l.event === 'agent_message_ungrounded');
+    expect(groundingLog).toMatchObject({ ungroundedOrderIdCount: 1, ungroundedAmountCount: 1 });
+    expect(JSON.stringify(groundingLog)).not.toContain('ORD-9999');
+    expect(JSON.stringify(groundingLog)).not.toContain('9999.99');
+  });
+
+  it('a legitimate dollar figure quoted from a retrieved chunk is never flagged as ungrounded', async () => {
+    const chunk = { chunkKey: 'k1', documentId: 'd1', documentTitle: 'Refund Policy', headingPath: 'Refunds', text: 'Refunds over $250 require manager approval.', position: 0, score: 0.9 };
+    const { deps } = makeDeps({
+      generateQueue: [
+        planOutput({ needsPolicy: true, searchQuery: 'refund threshold' }),
+        composeOutput({ outcome: 'reply', message: 'Refunds over $250 require manager approval.', citedChunkKeys: ['k1'] }),
+      ],
+      retrieve: async () => ({ ok: true, results: [chunk] }),
+    });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('reply');
+    expect(result.message).toBe('Refunds over $250 require manager approval.');
+  });
+
+  it('escalate always uses the one fixed generic message, regardless of what the model wrote', async () => {
+    const { deps } = makeDeps({
+      generateQueue: [planOutput(), composeOutput({ outcome: 'escalate', message: 'Order ORD-9999 cannot be refunded $9999.99 right now.' })],
+    });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(result.message).toBe("I'm not able to help with this directly, so I've flagged it for a team member to follow up with you.");
+  });
+});
+
+// --- Stage 4 finding 6: retrieval and tool calls respect the remaining run deadline ---
+
+describe('runAgent: retrieval and tool calls respect the remaining run deadline (Stage 4 finding 6, fake timers)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('a hanging retrieval is cut off by the remaining run deadline, not its own larger configured timeout', async () => {
+    const { deps } = makeDeps({
+      generateQueue: [planOutput({ needsPolicy: true, searchQuery: 'refund policy' })],
+      retrieve: () =>
+        new Promise(() => {
+          /* never resolves */
+        }),
+      // new Date() under vi.useFakeTimers() reflects the faked/advanceable
+      // clock, not real wall time - this is what lets remainingMs() inside
+      // runAgent actually shrink as vi.advanceTimersByTimeAsync() runs.
+      clock: () => new Date(),
+      settings: makeSettings({ totalDeadlineMs: 5_000, retrievalTimeoutMs: 60_000 }),
+    });
+
+    const resultPromise = runAgent(makeInput(), deps);
+    // The run's own 5s deadline fires well before the retrieval's own
+    // (much larger) configured 60s timeout ever could - advancing exactly
+    // 5s is enough to prove the run doesn't wait any longer than that.
+    await vi.advanceTimersByTimeAsync(5_000);
+    const { result, trace } = await resultPromise;
+
+    expect(result.outcome).toBe('escalate');
+    expect(trace.steps.some((s) => s.type === 'retrieve' && s.outcomeCode === 'TIMEOUT')).toBe(true);
+  });
+
+  it('a hanging tool call is cut off by the remaining run deadline', async () => {
+    const toolRunner: ToolRunnerLike = {
+      // Only get_order hangs - escalate_to_human (the forced-escalate
+      // handoff this deadline inevitably triggers afterward) must still
+      // resolve normally, or this test would hang on an entirely
+      // different, un-timed call than the one actually under test.
+      run: (_tenantId, toolName) => {
+        if (toolName === 'get_order') {
+          return new Promise(() => {
+            /* never resolves */
+          });
+        }
+        return Promise.resolve({ ok: true, data: { escalationId: 'ESC-1', status: 'created' }, riskLevel: 'low' });
+      },
+    };
+    const { deps } = makeDeps({
+      generateQueue: [planOutput({ toolRequests: [{ tool: 'get_order', order_id: 'ORD-1001' }] })],
+      toolRunner,
+      clock: () => new Date(),
+      settings: makeSettings({ totalDeadlineMs: 5_000 }),
+    });
+
+    const resultPromise = runAgent(makeInput(), deps);
+    await vi.advanceTimersByTimeAsync(5_000);
+    const { result, trace } = await resultPromise;
+
+    expect(result.outcome).toBe('escalate');
+    expect(trace.steps.some((s) => s.type === 'tool' && s.outcomeCode === 'TIMEOUT')).toBe(true);
+  });
+});
+
+// --- Stage 4 finding 7: the global daily generate budget guard -------------
+
+describe('runAgent: the global daily generate budget guard (Stage 4 finding 7)', () => {
+  it('budget already exhausted before the run starts: escalates immediately with the distinct demo-quota message, makes no generate() call at all', async () => {
+    const { deps, llm } = makeDeps({ dailyGenerateBudget: { tryConsume: () => false } });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(result.message).toBe("Our automated assistant has reached its demo usage limit for today. I've flagged this for a team member to follow up with you.");
+    expect(llm.calls).toHaveLength(0);
+  });
+
+  it('budget exhausted right after the plan call: compose is never attempted, same distinct message', async () => {
+    let consumed = 0;
+    const guard: DailyGenerateBudgetGuard = { tryConsume: () => consumed++ === 0 };
+    const { deps, llm } = makeDeps({
+      generateQueue: [planOutput({ toolRequests: [] })],
+      dailyGenerateBudget: guard,
+    });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(result.message).toBe("Our automated assistant has reached its demo usage limit for today. I've flagged this for a team member to follow up with you.");
+    expect(llm.calls).toHaveLength(1); // only the plan call was ever made for real
   });
 });

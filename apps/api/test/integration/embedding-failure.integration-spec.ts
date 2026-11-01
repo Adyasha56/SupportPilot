@@ -21,7 +21,7 @@ import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AppModule } from '../../src/app.module';
 import { LLM_PROVIDER } from '../../src/llm/llm.module';
-import { EmbedOutcome, EmbeddingTaskType, LlmProvider } from '../../src/llm/llm-provider.interface';
+import { EmbedOutcome, EmbeddingTaskType, GenerateOptions, GenerateOutcome, LlmProvider } from '../../src/llm/llm-provider.interface';
 import { FakeLlmProvider } from '../../src/llm/test-utils/fake-llm-provider';
 import { cleanupTenant, createTenantFixture, disconnectFixtureConnection } from './tenant-fixture';
 import { getTestMongoUri, integrationTestsEnabled } from './test-env';
@@ -36,6 +36,10 @@ class FailsOnSecondCallLlmProvider implements LlmProvider {
       return { ok: false, error: { code: 'TRANSIENT', message: 'simulated mid-pipeline failure' } };
     }
     return this.inner.embed(texts, taskType);
+  }
+
+  async generate(options: GenerateOptions): Promise<GenerateOutcome> {
+    return this.inner.generate(options);
   }
 }
 

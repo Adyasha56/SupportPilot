@@ -3,13 +3,13 @@
   "version": "0.0.0",
   "private": true,
   "files": [
-    "dist",
-    "src/connectors/fixtures"
+    "dist"
   ],
   "scripts": {
     "build": "nest build",
     "start": "node --env-file-if-exists=.env dist/main.js",
     "dev": "nest start --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\"",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.mts",
@@ -19,7 +19,9 @@
     "check-transactions": "node --env-file-if-exists=.env dist/scripts/check-transactions.js",
     "retrieval-smoke-test": "node --env-file-if-exists=.env dist/scripts/retrieval-smoke-test.js",
     "retrieval-quality-check": "node --env-file-if-exists=.env dist/scripts/retrieval-quality-check.js",
-    "generate-schema-check": "node --env-file-if-exists=.env dist/scripts/generate-schema-check.js"
+    "generate-schema-check": "node --env-file-if-exists=.env dist/scripts/generate-schema-check.js",
+    "agent-pipeline-smoke-test": "node --env-file-if-exists=.env dist/scripts/agent-pipeline-smoke-test.js",
+    "delete-scratch-tenant": "node --env-file-if-exists=.env dist/scripts/delete-scratch-tenant.js"
   },
   "dependencies": {
     "@google/genai": "2.31.0",
