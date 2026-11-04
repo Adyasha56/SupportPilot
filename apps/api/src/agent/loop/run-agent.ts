@@ -56,8 +56,12 @@ export interface RunAgentSettings {
   totalDeadlineMs: number;
   /** runAgent's own timeout around the retrieval call - PolicyRetrievalService.retrieve() has no timeout of its own. Actually applied as min(this, time remaining until the run deadline) - see Stage 4 finding 6. */
   retrievalTimeoutMs: number;
+  /** How many times a per-call TIMEOUT (not ABORTED) may be retried - see run-agent.settings.ts and the TIMEOUT/ABORTED split in llm-provider.interface.ts's GenerateErrorCode doc comment (Stage 4 finding B). */
+  timeoutMaxRetries: number;
   generateMaxOutputTokens: number;
   generateTemperature: number;
+  /** Omitted means "let the model use its own default" - see LlmSettings.generateThinkingLevel's doc comment (Stage 4 finding C). */
+  generateThinkingLevel?: 'minimal' | 'low' | 'medium' | 'high';
   retrievalTopK?: number;
 }
 
@@ -102,6 +106,8 @@ export interface RunAgentResult {
 const GENERIC_ESCALATE_MESSAGE = "I'm not able to help with this directly, so I've flagged it for a team member to follow up with you.";
 /** Stage 4 finding 7 - distinct from the generic escalate message above, so this cause stays distinguishable to anyone reading the chat, not just the trace/logs. */
 const DAILY_BUDGET_MESSAGE = "Our automated assistant has reached its demo usage limit for today. I've flagged this for a team member to follow up with you.";
+/** Stage 4 finding 3 - distinct from both messages above: the circuit breaker, not the daily budget, decided no real call should be attempted right now. runAgent must still reach this message in well under a second, since beforeCall()'s rejection never touches the network. */
+const CIRCUIT_OPEN_MESSAGE = "Our automated assistant is temporarily unavailable. I've flagged this for a team member to follow up with you shortly.";
 /**
  * Stage 4 finding 5 - the safe fallback for a reply/clarify message that
  * named an order id or dollar amount nothing in the run actually supports
@@ -122,7 +128,9 @@ export type EscalationReasonCode =
   /** Stage 4 finding 4 - compose said `reply` with no citation and no successful tool result behind it: an assertion with nothing supporting it, never passed through as-is. */
   | 'REPLY_NOT_GROUNDED'
   /** Stage 4 finding 7 - the daily generate budget guard denied this attempt before any real Gemini call was made. */
-  | 'DAILY_BUDGET_EXCEEDED';
+  | 'DAILY_BUDGET_EXCEEDED'
+  /** Stage 4 finding 3 - the provider's circuit breaker rejected this attempt before any real Gemini call was made. */
+  | 'CIRCUIT_OPEN';
 
 /** GenerateErrorCode plus one purely local code for a request callStructured's own attempt() never sent to the real provider at all - see Stage 4 finding 7. */
 type AttemptErrorCode = GenerateErrorCode | 'DAILY_BUDGET_EXCEEDED';
@@ -265,31 +273,68 @@ export async function runAgent(input: RunAgentInput, deps: RunAgentDeps): Promis
   async function callStructured<T>(schema: z.ZodType<T>, systemInstruction: string, userContent: string, stepType: 'plan' | 'compose'): Promise<StructuredOutcome<T>> {
     const responseSchema = toGeminiResponseJsonSchema(schema);
 
+    /**
+     * Stage 4 finding B - TIMEOUT (this call's own perLlmCallTimeoutMs
+     * elapsed) and ABORTED (the run's own deadline fired) are now handled
+     * differently: a TIMEOUT is retried, up to timeoutMaxRetries, as long
+     * as the run still has deadline budget left when the retry is about
+     * to start - a single slow call should get another chance, not end
+     * the whole run. ABORTED is never retried - the run itself is out of
+     * time. durationMs accumulates across every real attempt this call
+     * made, so the trace reports the true total elapsed time, never just
+     * the last attempt's.
+     */
     async function attempt(sysInstr: string) {
-      const attemptStartedAt = deps.clock().getTime();
+      let totalDurationMs = 0;
+      for (let timeoutRetry = 0; ; timeoutRetry++) {
+        if (pastDeadline()) {
+          return {
+            outcome: { ok: false as const, error: { code: 'ABORTED' as const, message: 'Run deadline reached before this attempt could run.', attempts: undefined as number | undefined } },
+            durationMs: totalDurationMs,
+          };
+        }
 
-      if (!deps.dailyGenerateBudget.tryConsume()) {
-        // Stage 4 finding 7 - the budget is exhausted BEFORE any real
-        // provider call is made; llmCallCount is deliberately not
-        // incremented, since no real Gemini call happened.
-        return {
-          outcome: { ok: false as const, error: { code: 'DAILY_BUDGET_EXCEEDED' as const, message: 'Daily generate budget exhausted.', attempts: 0 } },
-          durationMs: deps.clock().getTime() - attemptStartedAt,
-        };
+        if (!deps.dailyGenerateBudget.tryConsume()) {
+          // Stage 4 finding 7 - the budget is exhausted BEFORE any real
+          // provider call is made; llmCallCount is deliberately not
+          // incremented, since no real Gemini call happened.
+          return {
+            outcome: { ok: false as const, error: { code: 'DAILY_BUDGET_EXCEEDED' as const, message: 'Daily generate budget exhausted.', attempts: undefined as number | undefined } },
+            durationMs: totalDurationMs,
+          };
+        }
+
+        llmCallCount += 1;
+        const attemptStartedAt = deps.clock().getTime();
+        const outcome = await deps.llmProvider.generate({
+          systemInstruction: sysInstr,
+          messages: [{ role: 'user', text: userContent }],
+          responseSchema,
+          maxOutputTokens: deps.settings.generateMaxOutputTokens,
+          temperature: deps.settings.generateTemperature,
+          thinkingLevel: deps.settings.generateThinkingLevel,
+          timeoutMs: deps.settings.perLlmCallTimeoutMs,
+          abortSignal: deadlineController.signal,
+        });
+        totalDurationMs += deps.clock().getTime() - attemptStartedAt;
+
+        if (!outcome.ok && outcome.error.code === 'CIRCUIT_OPEN') {
+          // Stage 4 finding 3 - no real Gemini call happened at all, so the
+          // ticket this attempt pre-consumed and the llmCallCount increment
+          // above both get undone here, and this is never retried (there
+          // is nothing to retry - the breaker rejected before any network
+          // call). Falls straight through to forcedEscalate below via the
+          // normal llm_error path.
+          deps.dailyGenerateBudget.release();
+          llmCallCount -= 1;
+          return { outcome, durationMs: totalDurationMs };
+        }
+
+        if (!outcome.ok && outcome.error.code === 'TIMEOUT' && timeoutRetry < deps.settings.timeoutMaxRetries) {
+          continue;
+        }
+        return { outcome, durationMs: totalDurationMs };
       }
-
-      llmCallCount += 1;
-      const outcome = await deps.llmProvider.generate({
-        systemInstruction: sysInstr,
-        messages: [{ role: 'user', text: userContent }],
-        responseSchema,
-        maxOutputTokens: deps.settings.generateMaxOutputTokens,
-        temperature: deps.settings.generateTemperature,
-        timeoutMs: deps.settings.perLlmCallTimeoutMs,
-        abortSignal: deadlineController.signal,
-      });
-      const durationMs = deps.clock().getTime() - attemptStartedAt;
-      return { outcome, durationMs };
     }
 
     const first = await attempt(systemInstruction);
@@ -332,6 +377,9 @@ export async function runAgent(input: RunAgentInput, deps: RunAgentDeps): Promis
   async function escalateForLlmError(code: AttemptErrorCode, llmErrorReasonCode: EscalationReasonCode): Promise<RunAgentResult> {
     if (code === 'DAILY_BUDGET_EXCEEDED') {
       return await forcedEscalate('DAILY_BUDGET_EXCEEDED', undefined, DAILY_BUDGET_MESSAGE);
+    }
+    if (code === 'CIRCUIT_OPEN') {
+      return await forcedEscalate('CIRCUIT_OPEN', undefined, CIRCUIT_OPEN_MESSAGE);
     }
     return await forcedEscalate(llmErrorReasonCode, undefined);
   }

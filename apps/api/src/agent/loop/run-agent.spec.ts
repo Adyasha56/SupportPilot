@@ -92,6 +92,7 @@ function makeSettings(overrides: Partial<RunAgentSettings> = {}): RunAgentSettin
     perLlmCallTimeoutMs: 8000,
     totalDeadlineMs: 25000,
     retrievalTimeoutMs: 5000,
+    timeoutMaxRetries: 2,
     generateMaxOutputTokens: 1024,
     generateTemperature: 0,
     ...overrides,
@@ -114,7 +115,7 @@ interface TestDepsOverrides {
 
 /** Always allows - most tests don't care about the budget at all; see the dedicated describe block below for tests that do. */
 function alwaysAllowBudget(): DailyGenerateBudgetGuard {
-  return { tryConsume: () => true };
+  return { tryConsume: () => true, release: () => {} };
 }
 
 function makeDeps(overrides: TestDepsOverrides = {}): { deps: RunAgentDeps; llm: RecordingLlmProvider; logs: Record<string, unknown>[] } {
@@ -809,11 +810,96 @@ describe('runAgent: retrieval and tool calls respect the remaining run deadline 
   });
 });
 
+// --- Stage 4 finding B: TIMEOUT vs ABORTED retry semantics -----------------
+
+describe('runAgent: TIMEOUT is retried within the remaining deadline, ABORTED never is (Stage 4 finding B)', () => {
+  it('a TIMEOUT is retried (within timeoutMaxRetries) and the run can still succeed', async () => {
+    const { deps, llm } = makeDeps({
+      generateQueue: [{ ok: false, error: { code: 'TIMEOUT', message: 'slow' } }, planOutput(), composeOutput({ outcome: 'clarify', message: 'ok' })],
+      settings: makeSettings({ timeoutMaxRetries: 2 }),
+    });
+
+    const { result, trace } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('clarify');
+    expect(llm.calls).toHaveLength(3); // failed TIMEOUT attempt, the retried plan call, then compose
+    expect(trace.llmCallCount).toBe(3);
+  });
+
+  it('TIMEOUT retries are capped at timeoutMaxRetries, then the run escalates - never a 4th attempt', async () => {
+    const { deps, llm } = makeDeps({
+      generateQueue: [
+        { ok: false, error: { code: 'TIMEOUT', message: 'slow' } },
+        { ok: false, error: { code: 'TIMEOUT', message: 'slow' } },
+        { ok: false, error: { code: 'TIMEOUT', message: 'slow' } },
+      ],
+      settings: makeSettings({ timeoutMaxRetries: 2 }),
+    });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(llm.calls).toHaveLength(3); // initial attempt + 2 retries, then gives up
+  });
+
+  it('ABORTED (the run deadline itself) is never retried, regardless of how many timeoutMaxRetries allows', async () => {
+    const { deps, llm } = makeDeps({
+      generateQueue: [{ ok: false, error: { code: 'ABORTED', message: 'deadline reached' } }],
+      settings: makeSettings({ timeoutMaxRetries: 5 }),
+    });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(llm.calls).toHaveLength(1); // never retried
+  });
+
+  it('skips a TIMEOUT retry once the run deadline has actually passed by the time the retry would start', async () => {
+    let now = new Date('2026-10-31T12:00:00.000Z').getTime();
+    const clock = () => new Date(now);
+    const { deps, llm } = makeDeps({
+      generateQueue: [{ ok: false, error: { code: 'TIMEOUT', message: 'slow' } }],
+      clock,
+      settings: makeSettings({ totalDeadlineMs: 1000, timeoutMaxRetries: 5 }),
+    });
+    const realGenerate = deps.llmProvider.generate.bind(deps.llmProvider);
+    deps.llmProvider.generate = async (options) => {
+      const outcome = await realGenerate(options);
+      now += 5000; // pushes well past the 1000ms deadline after this one attempt
+      return outcome;
+    };
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(llm.calls).toHaveLength(1); // the retry was skipped - the deadline had already passed
+  });
+});
+
+describe('runAgent: generateThinkingLevel is forwarded from settings (Stage 4 finding C)', () => {
+  it('passes settings.generateThinkingLevel through to every generate() call', async () => {
+    const { deps, llm } = makeDeps({ settings: makeSettings({ generateThinkingLevel: 'minimal' }) });
+
+    await runAgent(makeInput(), deps);
+
+    expect(llm.calls[0].thinkingLevel).toBe('minimal');
+    expect(llm.calls[1].thinkingLevel).toBe('minimal');
+  });
+
+  it('omits thinkingLevel entirely when settings do not set one', async () => {
+    const { deps, llm } = makeDeps();
+
+    await runAgent(makeInput(), deps);
+
+    expect(llm.calls[0].thinkingLevel).toBeUndefined();
+  });
+});
+
 // --- Stage 4 finding 7: the global daily generate budget guard -------------
 
 describe('runAgent: the global daily generate budget guard (Stage 4 finding 7)', () => {
   it('budget already exhausted before the run starts: escalates immediately with the distinct demo-quota message, makes no generate() call at all', async () => {
-    const { deps, llm } = makeDeps({ dailyGenerateBudget: { tryConsume: () => false } });
+    const { deps, llm } = makeDeps({ dailyGenerateBudget: { tryConsume: () => false, release: () => {} } });
 
     const { result } = await runAgent(makeInput(), deps);
 
@@ -824,7 +910,7 @@ describe('runAgent: the global daily generate budget guard (Stage 4 finding 7)',
 
   it('budget exhausted right after the plan call: compose is never attempted, same distinct message', async () => {
     let consumed = 0;
-    const guard: DailyGenerateBudgetGuard = { tryConsume: () => consumed++ === 0 };
+    const guard: DailyGenerateBudgetGuard = { tryConsume: () => consumed++ === 0, release: () => {} };
     const { deps, llm } = makeDeps({
       generateQueue: [planOutput({ toolRequests: [] })],
       dailyGenerateBudget: guard,
@@ -835,5 +921,70 @@ describe('runAgent: the global daily generate budget guard (Stage 4 finding 7)',
     expect(result.outcome).toBe('escalate');
     expect(result.message).toBe("Our automated assistant has reached its demo usage limit for today. I've flagged this for a team member to follow up with you.");
     expect(llm.calls).toHaveLength(1); // only the plan call was ever made for real
+  });
+});
+
+// --- Stage 4 finding 3: the provider's circuit breaker ---------------------
+
+describe('runAgent: CIRCUIT_OPEN from the provider (Stage 4 finding 3)', () => {
+  it('maps CIRCUIT_OPEN on the plan call to the fixed circuit-open escalate message, never retried', async () => {
+    const { deps } = makeDeps({ generateQueue: [{ ok: false, error: { code: 'CIRCUIT_OPEN', message: 'breaker open' } }] });
+
+    const { result, trace } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(result.message).toBe("Our automated assistant is temporarily unavailable. I've flagged this for a team member to follow up with you shortly.");
+    // Exactly one attempt was made - CIRCUIT_OPEN is never retried, there is nothing to retry.
+    expect(trace.steps.filter((s) => s.type === 'plan')).toHaveLength(1);
+  });
+
+  it('CIRCUIT_OPEN releases the budget ticket it pre-consumed, so the net ticket cost is zero', async () => {
+    let consumed = 0;
+    let released = 0;
+    const guard: DailyGenerateBudgetGuard = {
+      tryConsume: () => {
+        consumed += 1;
+        return true;
+      },
+      release: () => {
+        released += 1;
+      },
+    };
+    const { deps } = makeDeps({
+      generateQueue: [{ ok: false, error: { code: 'CIRCUIT_OPEN', message: 'breaker open' } }],
+      dailyGenerateBudget: guard,
+    });
+
+    await runAgent(makeInput(), deps);
+
+    expect(consumed).toBe(1);
+    expect(released).toBe(1);
+  });
+
+  it('CIRCUIT_OPEN does not count toward llmCallCount, since no real call was made', async () => {
+    const { deps } = makeDeps({ generateQueue: [{ ok: false, error: { code: 'CIRCUIT_OPEN', message: 'breaker open' } }] });
+
+    const { trace } = await runAgent(makeInput(), deps);
+
+    expect(trace.llmCallCount).toBe(0);
+  });
+
+  it('a run that hits CIRCUIT_OPEN finishes quickly - no retry/backoff delay is ever introduced', async () => {
+    const { deps } = makeDeps({ generateQueue: [{ ok: false, error: { code: 'CIRCUIT_OPEN', message: 'breaker open' } }] });
+
+    const startedAt = Date.now();
+    await runAgent(makeInput(), deps);
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  it('CIRCUIT_OPEN on the compose call also maps to the fixed circuit-open message', async () => {
+    const { deps } = makeDeps({ generateQueue: [planOutput({ toolRequests: [] }), { ok: false, error: { code: 'CIRCUIT_OPEN', message: 'breaker open' } }] });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(result.message).toBe("Our automated assistant is temporarily unavailable. I've flagged this for a team member to follow up with you shortly.");
   });
 });

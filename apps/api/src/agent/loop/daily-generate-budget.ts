@@ -1,6 +1,14 @@
 export interface DailyGenerateBudgetGuard {
   /** Returns true and consumes one ticket if the budget allows it this call; returns false (consumes nothing) otherwise. */
   tryConsume(): boolean;
+  /**
+   * Stage 4 finding 3 - refunds one previously-consumed ticket. Used only
+   * when a ticket was consumed but generate() then returned CIRCUIT_OPEN
+   * (no real Gemini call happened, so nothing was really spent) - never
+   * used for any other error code, since every other failure DID reach the
+   * real API and genuinely counts against the day's budget.
+   */
+  release(): void;
 }
 
 /**
@@ -37,5 +45,11 @@ export class InMemoryDailyGenerateBudgetGuard implements DailyGenerateBudgetGuar
     }
     this.count += 1;
     return true;
+  }
+
+  release(): void {
+    if (this.count > 0) {
+      this.count -= 1;
+    }
   }
 }

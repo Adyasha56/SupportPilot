@@ -36,4 +36,23 @@ describe('InMemoryDailyGenerateBudgetGuard', () => {
     now += windowMs - 1;
     expect(guard.tryConsume()).toBe(false);
   });
+
+  it('release() refunds one ticket, allowing another consume at the same count', () => {
+    const guard = new InMemoryDailyGenerateBudgetGuard(1, () => new Date('2026-11-02T00:00:00.000Z'));
+
+    expect(guard.tryConsume()).toBe(true);
+    expect(guard.tryConsume()).toBe(false);
+    guard.release();
+    expect(guard.tryConsume()).toBe(true);
+    expect(guard.tryConsume()).toBe(false);
+  });
+
+  it('release() never goes negative when called with nothing consumed', () => {
+    const guard = new InMemoryDailyGenerateBudgetGuard(1, () => new Date('2026-11-02T00:00:00.000Z'));
+
+    guard.release();
+    guard.release();
+    expect(guard.tryConsume()).toBe(true);
+    expect(guard.tryConsume()).toBe(false);
+  });
 });
