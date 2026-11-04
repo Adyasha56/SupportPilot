@@ -68,6 +68,16 @@ export interface GenerateOptions {
   temperature: number;
   timeoutMs: number;
   /**
+   * Optional - omitted means "let the model use its own default" (see
+   * LlmSettings.generateThinkingLevel's doc comment for why that's
+   * already "minimal" for this project's default model, gemini-3.5-flash-lite,
+   * making this a no-op today but a real lever if the configured model
+   * ever changes). Maps to the SDK's thinkingConfig.thinkingLevel -
+   * confirmed supported against the installed @google/genai@2.31.0
+   * SDK's own ThinkingLevel enum (Stage 4 finding C).
+   */
+  thinkingLevel?: 'minimal' | 'low' | 'medium' | 'high';
+  /**
    * Optional - when provided, generate() aborts (ABORTED, never a hang)
    * the instant this fires, including mid-retry/mid-backoff, not just for
    * the underlying network call. Callers with their own run-level
@@ -87,8 +97,29 @@ export type GenerateErrorCode =
   | 'UNAVAILABLE'
   /** The SDK returned a response, but its text wasn't valid JSON at all - distinct from the caller's OWN Zod schema rejecting a validly-shaped-but-wrong JSON value, which generate() has no way to know about (it only knows the raw JSON Schema object it was given, not the Zod type it came from). */
   | 'INVALID_OUTPUT'
-  /** options.abortSignal fired before a usable response came back - distinct from TRANSIENT, which means a network-level hiccup, not a caller-imposed deadline. */
-  | 'ABORTED';
+  /**
+   * This call's OWN timeoutMs elapsed before a usable response came back -
+   * distinct from ABORTED below. Retryable by the caller (run-agent.ts),
+   * bounded by its own configured max retries AND by the run's remaining
+   * deadline - a single slow call should get another chance if there's
+   * still budget left, rather than giving up on the whole run immediately.
+   * See docs/learning-notes.md, Stage 4 finding B, for the real run that
+   * showed these two causes need different handling.
+   */
+  | 'TIMEOUT'
+  /** options.abortSignal fired (the caller's own run-level deadline, never this call's own timeoutMs) before a usable response came back - distinct from TRANSIENT (a network-level hiccup) and from TIMEOUT above. Never retried - the run itself is out of time. */
+  | 'ABORTED'
+  /**
+   * The circuit breaker (circuit-breaker.ts) is open - NO network call was
+   * attempted at all for this request. Stage 4 finding 3: after K
+   * consecutive TIMEOUT/UNAVAILABLE outcomes, generate() short-circuits
+   * immediately for a cooldown period rather than letting every caller
+   * independently rediscover the same stall. Never retried by run-agent.ts
+   * (there is nothing to retry - no call was made); the caller is expected
+   * to release any budget ticket it pre-consumed for this attempt, since
+   * none was actually spent.
+   */
+  | 'CIRCUIT_OPEN';
 
 export interface GenerateError {
   code: GenerateErrorCode;
@@ -105,6 +136,8 @@ export interface GenerateUsage {
 export interface GenerateResult {
   text: string;
   usage: GenerateUsage;
+  /** Diagnostics only (e.g. "STOP", "MAX_TOKENS") - used by the manual latency probe, never read by production logic. */
+  finishReason?: string;
 }
 
 export type GenerateOutcome = { ok: true; result: GenerateResult } | { ok: false; error: GenerateError };

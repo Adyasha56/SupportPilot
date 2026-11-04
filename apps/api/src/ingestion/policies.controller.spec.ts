@@ -54,7 +54,10 @@ function llmSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
     generateTimeoutMs: 5000,
     generateMaxOutputTokens: 1024,
     generateTemperature: 0,
+    generateThinkingLevel: 'minimal',
     dailyGenerateBudget: 300,
+    circuitBreakerFailureThreshold: 3,
+    circuitBreakerCooldownMs: 60_000,
     ...overrides,
   };
 }

@@ -44,12 +44,16 @@ export interface GenerateContentRequest {
     responseJsonSchema: unknown;
     maxOutputTokens: number;
     temperature: number;
+    /** Plain string, not the SDK's own enum type - GeminiLlmProvider is what maps this to the real @google/genai ThinkingLevel enum, same reasoning as every other field here. */
+    thinkingLevel?: 'minimal' | 'low' | 'medium' | 'high';
     abortSignal?: AbortSignal;
   };
 }
 
 export interface GenerateContentResult {
   text?: string;
+  /** Why the model stopped generating (e.g. "STOP", "MAX_TOKENS") - diagnostics only, used by the latency probe (dev-scripts/latency-probe.ts), never by production logic. */
+  finishReason?: string;
   usageMetadata?: {
     promptTokenCount?: number;
     candidatesTokenCount?: number;
