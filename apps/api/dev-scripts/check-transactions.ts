@@ -15,15 +15,13 @@
  * against a database name starting with "test_" unless --allow-test-db is
  * passed, same guard as every other script here.
  *
- * Run compiled JS, not the .ts source directly, same reasoning as every
- * other script (Node's native TypeScript stripping doesn't support
- * decorators/constructor parameter properties - this script doesn't use
- * either, but stays consistent with the others' execution mechanism).
+ * Lives in apps/api/dev-scripts/, compiled by tsconfig.dev-scripts.json
+ * into the gitignored dist-dev/ - see docs/learning-notes.md for why.
  *
  *   pnpm run check-transactions
  */
 import mongoose from 'mongoose';
-import { assertNotTestDatabase, getDatabaseNameFromUri } from '../db/database-name';
+import { assertNotTestDatabase, getDatabaseNameFromUri } from '../src/db/database-name';
 
 const SCRATCH_COLLECTION = '_transaction_probe';
 

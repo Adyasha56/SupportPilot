@@ -10,29 +10,31 @@
  * Refuses to run against a database name starting with "test_" unless
  * --allow-test-db is passed, same guard as every other script here.
  *
- * Compiled to dist/scripts and run as plain JS, same reasoning as every
- * other script (Node's native TypeScript stripping doesn't support
- * decorators/constructor parameter properties - none of the classes this
- * script constructs are instantiated through Nest's DI container, so
- * their @Inject()/@Optional()/@InjectModel() decorators are inert here;
- * this just calls `new SomeService(...)` directly with real dependencies).
+ * Lives in apps/api/dev-scripts/, compiled by tsconfig.dev-scripts.json
+ * into the gitignored dist-dev/ - see docs/learning-notes.md for why. Run
+ * as plain JS, same reasoning as every other script (Node's native
+ * TypeScript stripping doesn't support decorators/constructor parameter
+ * properties - none of the classes this script constructs are
+ * instantiated through Nest's DI container, so their
+ * @Inject()/@Optional()/@InjectModel() decorators are inert here; this
+ * just calls `new SomeService(...)` directly with real dependencies).
  *
  *   pnpm run retrieval-smoke-test
  */
 import { randomBytes } from 'node:crypto';
 import mongoose from 'mongoose';
-import { assertNotTestDatabase, getDatabaseNameFromUri } from '../db/database-name';
-import { MongoosePolicyChunkRepository, PolicyChunkRepository } from '../db/policy-chunk.repository';
-import { MongoosePolicyDocumentRepository, PolicyDocumentRepository } from '../db/policy-document.repository';
-import { MongooseTransactionRunner } from '../db/transaction-runner';
-import { ApiKeySchema } from '../db/schemas/api-key.schema';
-import { PolicyChunkDocument, PolicyChunkSchema } from '../db/schemas/policy-chunk.schema';
-import { PolicyDocumentDocument, PolicyDocumentSchema } from '../db/schemas/policy-document.schema';
-import { TenantSchema } from '../db/schemas/tenant.schema';
-import { PolicyIngestionService } from '../ingestion/policy-ingestion.service';
-import { TenantIngestionLock } from '../ingestion/tenant-ingestion-lock';
-import { FakeLlmProvider } from '../llm/test-utils/fake-llm-provider';
-import { PolicyRetrievalService } from '../retrieval/policy-retrieval.service';
+import { assertNotTestDatabase, getDatabaseNameFromUri } from '../src/db/database-name';
+import { MongoosePolicyChunkRepository, PolicyChunkRepository } from '../src/db/policy-chunk.repository';
+import { MongoosePolicyDocumentRepository, PolicyDocumentRepository } from '../src/db/policy-document.repository';
+import { MongooseTransactionRunner } from '../src/db/transaction-runner';
+import { ApiKeySchema } from '../src/db/schemas/api-key.schema';
+import { PolicyChunkDocument, PolicyChunkSchema } from '../src/db/schemas/policy-chunk.schema';
+import { PolicyDocumentDocument, PolicyDocumentSchema } from '../src/db/schemas/policy-document.schema';
+import { TenantSchema } from '../src/db/schemas/tenant.schema';
+import { PolicyIngestionService } from '../src/ingestion/policy-ingestion.service';
+import { TenantIngestionLock } from '../src/ingestion/tenant-ingestion-lock';
+import { FakeLlmProvider } from '../src/llm/test-utils/fake-llm-provider';
+import { PolicyRetrievalService } from '../src/retrieval/policy-retrieval.service';
 
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 60_000;
@@ -147,7 +149,10 @@ async function main(): Promise<void> {
     generateTimeoutMs: 5000,
     generateMaxOutputTokens: 1024,
     generateTemperature: 0,
+    generateThinkingLevel: 'minimal' as const,
     dailyGenerateBudget: 300,
+    circuitBreakerFailureThreshold: 3,
+    circuitBreakerCooldownMs: 60_000,
   };
   const ingestionSettings = {
     maxFileBytes: 1_000_000,

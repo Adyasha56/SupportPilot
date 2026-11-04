@@ -1,9 +1,11 @@
 /**
- * For embedding-smoke-test.ts ONLY - never imported by any app module, and
- * never by db:ensure-indexes or create-api-key. Persists embeddings across
- * separate runs of the smoke script (a fresh process each time, so the
- * provider's own in-memory LRU cache never helps), to avoid burning Gemini
- * free-tier quota on the same three fixed sentences every run.
+ * For embedding-smoke-test.ts, retrieval-quality-check.ts, and
+ * agent-pipeline-smoke-test.ts ONLY - never imported by any app module,
+ * and never by db:ensure-indexes, create-api-key, or delete-scratch-tenant.
+ * Persists embeddings across separate runs of a manual script (a fresh
+ * process each time, so the provider's own in-memory LRU cache never
+ * helps), to avoid burning Gemini free-tier quota on the same fixed
+ * sentences/questions every run.
  */
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';

@@ -3,10 +3,17 @@
  * real free-tier quota. Never run in CI, never run automatically. Fictional
  * data only - a throwaway scratch tenant, a fictional company policy
  * fixture, and a fictional second document deliberately containing a
- * prompt-injection attempt. Run it yourself (after building):
+ * prompt-injection attempt. Run it yourself (after building the dev
+ * scripts - see package.json's build:dev-scripts):
  *
  *   pnpm run agent-pipeline-smoke-test
  *   pnpm run agent-pipeline-smoke-test -- --show-messages
+ *
+ * Lives in apps/api/dev-scripts/, compiled by tsconfig.dev-scripts.json
+ * into the gitignored dist-dev/ - never tsconfig.build.json/nest build,
+ * so this (and its @supportpilot/mock-store dependency) never needs to
+ * compile as part of the production Docker image. See
+ * docs/learning-notes.md for the real CI failure that prompted this split.
  *
  * Everything in this process, in-process, no HTTP server of our own:
  * - A scratch tenant id, used for policy ingestion/retrieval only.
@@ -55,25 +62,27 @@ import { join } from 'node:path';
 import mongoose from 'mongoose';
 import { createApp } from '@supportpilot/mock-store';
 import { ChatOutcome, ConnectorConfig, ConnectorConfigSchema, EMBEDDING_DIMENSION, EMBEDDING_MODEL } from '@supportpilot/shared';
-import { ConnectorConfigRepository } from '../connectors/connector-config.repository';
-import { InMemoryDailyGenerateBudgetGuard } from '../agent/loop/daily-generate-budget';
-import { ReadOnlyToolRunner } from '../agent/loop/read-only-tool-runner';
-import { runAgent, RunAgentDeps, RunAgentInput, RunAgentSettings } from '../agent/loop/run-agent';
-import { signCustomerToken, verifyCustomerToken } from '../agent/identity/customer-token';
-import { assertNotTestDatabase, getDatabaseNameFromUri } from '../db/database-name';
-import { MongoosePolicyChunkRepository, PolicyChunkRepository } from '../db/policy-chunk.repository';
-import { MongoosePolicyDocumentRepository, PolicyDocumentRepository } from '../db/policy-document.repository';
-import { MongooseTransactionRunner } from '../db/transaction-runner';
-import { ApiKeySchema } from '../db/schemas/api-key.schema';
-import { PolicyChunkDocument, PolicyChunkSchema } from '../db/schemas/policy-chunk.schema';
-import { PolicyDocumentDocument, PolicyDocumentSchema } from '../db/schemas/policy-document.schema';
-import { TenantSchema } from '../db/schemas/tenant.schema';
-import { PolicyIngestionService } from '../ingestion/policy-ingestion.service';
-import { TenantIngestionLock } from '../ingestion/tenant-ingestion-lock';
-import { GeminiLlmProvider } from '../llm/gemini-llm-provider';
-import { EmbedOutcome, EmbeddingTaskType, GenerateOptions, GenerateOutcome, LlmProvider } from '../llm/llm-provider.interface';
-import { loadLlmSettingsFromEnv } from '../llm/llm.settings';
-import { PolicyRetrievalService } from '../retrieval/policy-retrieval.service';
+import { ConnectorConfigRepository } from '../src/connectors/connector-config.repository';
+import { InMemoryDailyGenerateBudgetGuard } from '../src/agent/loop/daily-generate-budget';
+import { ReadOnlyToolRunner } from '../src/agent/loop/read-only-tool-runner';
+import { runAgent, RunAgentDeps, RunAgentInput, RunAgentSettings } from '../src/agent/loop/run-agent';
+import { loadRunAgentDeadlineSettingsFromEnv } from '../src/agent/loop/run-agent.settings';
+import { formatThinkingLevel } from '../src/llm/thinking-level';
+import { signCustomerToken, verifyCustomerToken } from '../src/agent/identity/customer-token';
+import { assertNotTestDatabase, getDatabaseNameFromUri } from '../src/db/database-name';
+import { MongoosePolicyChunkRepository, PolicyChunkRepository } from '../src/db/policy-chunk.repository';
+import { MongoosePolicyDocumentRepository, PolicyDocumentRepository } from '../src/db/policy-document.repository';
+import { MongooseTransactionRunner } from '../src/db/transaction-runner';
+import { ApiKeySchema } from '../src/db/schemas/api-key.schema';
+import { PolicyChunkDocument, PolicyChunkSchema } from '../src/db/schemas/policy-chunk.schema';
+import { PolicyDocumentDocument, PolicyDocumentSchema } from '../src/db/schemas/policy-document.schema';
+import { TenantSchema } from '../src/db/schemas/tenant.schema';
+import { PolicyIngestionService } from '../src/ingestion/policy-ingestion.service';
+import { TenantIngestionLock } from '../src/ingestion/tenant-ingestion-lock';
+import { GeminiLlmProvider } from '../src/llm/gemini-llm-provider';
+import { EmbedOutcome, EmbeddingTaskType, GenerateOptions, GenerateOutcome, LlmProvider } from '../src/llm/llm-provider.interface';
+import { loadLlmSettingsFromEnv } from '../src/llm/llm.settings';
+import { PolicyRetrievalService } from '../src/retrieval/policy-retrieval.service';
 import { EmbeddingFileCache } from './embedding-file-cache';
 
 const SHOW_MESSAGES = process.argv.includes('--show-messages');
@@ -95,15 +104,17 @@ const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 60_000;
 const TEST_TOKEN = 'smoke-test-token';
 /**
- * This script runs COMPILED, from dist/scripts/agent-pipeline-smoke-test.js
- * - so __dirname is apps/api/dist/scripts, two levels below apps/api
- * itself. The SOURCE fixtures directory (apps/api/src/connectors/fixtures)
- * is read directly here, by design - connector config fixtures are never
- * copied into dist/ (no Nest build "assets" entry) and never shipped in
- * the production Docker image (apps/api/package.json's "files" field no
- * longer lists them) - this script and the integration tests are the only
- * two places that explicitly point at the SOURCE path, exactly as a local
- * dev/test tool is expected to.
+ * This script runs COMPILED, from dist-dev/dev-scripts/agent-pipeline-smoke-test.js
+ * - so __dirname is apps/api/dist-dev/dev-scripts, two levels below apps/api
+ * itself (same depth as the old dist/scripts/ location - see
+ * docs/learning-notes.md for why this script moved). The SOURCE fixtures
+ * directory (apps/api/src/connectors/fixtures) is read directly here, by
+ * design - connector config fixtures are never copied into dist/ (no Nest
+ * build "assets" entry) and never shipped in the production Docker image
+ * (apps/api/package.json's "files" field no longer lists them) - this
+ * script and the integration tests are the only two places that
+ * explicitly point at the SOURCE path, exactly as a local dev/test tool
+ * is expected to.
  */
 const ACME_FIXTURES_DIR = join(__dirname, '..', '..', 'src', 'connectors', 'fixtures', 'acme');
 
@@ -394,6 +405,19 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
+  // Stage 4 finding B - no hard-coded deadline values here: this script
+  // was previously the ONE place that didn't respect GEMINI_GENERATE_TIMEOUT_MS
+  // at all (it hardcoded 20s regardless of what .env said), which is
+  // exactly how a 10s-configured timeout quietly ran for 20s before
+  // aborting in a real run. Printed below so a mismatch is visible at a glance.
+  let deadlineSettings;
+  try {
+    deadlineSettings = loadRunAgentDeadlineSettingsFromEnv(process.env);
+  } catch (err) {
+    console.error((err as Error).message);
+    process.exitCode = 1;
+    return;
+  }
   const allScenarios = buildScenarios();
   const scenariosToRun = scenarioFilter ? allScenarios.filter((s) => s.name.startsWith(`${scenarioFilter}.`)) : allScenarios;
   if (scenariosToRun.length === 0) {
@@ -406,7 +430,13 @@ async function main(): Promise<void> {
   }
 
   console.log(`Target database: "${getDatabaseNameFromUri(uri)}"`);
-  console.log(`Generate model: "${llmSettings.generateModel}", configured RPM: ${llmSettings.generateRequestsPerMinute}, max retries: ${llmSettings.generateMaxRetries}`);
+  console.log(
+    `Generate model: "${llmSettings.generateModel}", configured RPM: ${llmSettings.generateRequestsPerMinute}, max retries: ${llmSettings.generateMaxRetries}, thinking level: "${formatThinkingLevel(llmSettings.generateThinkingLevel)}"`,
+  );
+  console.log(
+    `Agent deadlines: perCallTimeoutMs=${deadlineSettings.perCallTimeoutMs}, totalDeadlineMs=${deadlineSettings.totalDeadlineMs}, ` +
+      `retrievalTimeoutMs=${deadlineSettings.retrievalTimeoutMs}, timeoutMaxRetries=${deadlineSettings.timeoutMaxRetries}`,
+  );
 
   const scratchTenantId = randomScratchTenantId();
   console.log(`Scratch tenant: "${scratchTenantId}"`);
@@ -524,11 +554,13 @@ async function main(): Promise<void> {
     const wallClock = (): Date => new Date();
 
     const runAgentSettings: RunAgentSettings = {
-      perLlmCallTimeoutMs: 20_000,
-      totalDeadlineMs: 60_000,
-      retrievalTimeoutMs: 10_000,
+      perLlmCallTimeoutMs: deadlineSettings.perCallTimeoutMs,
+      totalDeadlineMs: deadlineSettings.totalDeadlineMs,
+      retrievalTimeoutMs: deadlineSettings.retrievalTimeoutMs,
+      timeoutMaxRetries: deadlineSettings.timeoutMaxRetries,
       generateMaxOutputTokens: llmSettings.generateMaxOutputTokens,
       generateTemperature: 0,
+      generateThinkingLevel: llmSettings.generateThinkingLevel,
       retrievalTopK: 5,
     };
     // Shared across every scenario this one process runs - a real,

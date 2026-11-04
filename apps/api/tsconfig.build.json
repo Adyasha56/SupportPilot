@@ -4,5 +4,10 @@
     "rootDir": "./src"
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["test", "**/*.spec.ts", "dist", "node_modules"]
+  // "dev-scripts" and "dist-dev" are already outside "src/**/*.ts"'s include
+  // scope (dev-scripts/ lives at apps/api/, a sibling of src/ - see
+  // docs/learning-notes.md for why they were moved out) - listed here
+  // explicitly anyway so the production build's exclusion is self-evident,
+  // not something a future reader has to re-derive from the include path.
+  "exclude": ["test", "**/*.spec.ts", "dist", "dev-scripts", "dist-dev", "node_modules"]
 }

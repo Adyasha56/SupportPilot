@@ -5,7 +5,7 @@
  * never a partially-committed one. The commit-failure path itself (a
  * transaction aborting after embedding succeeds) is already covered by a
  * unit test with a throwing fake (policy-ingestion.service.spec.ts) and by
- * the real-cluster transaction proof in src/scripts/check-transactions.ts
+ * the real-cluster transaction proof in dev-scripts/check-transactions.ts
  * (see docs/learning-notes.md) - not re-derived here to avoid claiming a
  * second, separate proof of the same fact.
  *
