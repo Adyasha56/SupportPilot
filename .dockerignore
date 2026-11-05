@@ -11,4 +11,5 @@
 # context itself smaller. See docs/learning-notes.md for why these moved
 # out of src/scripts/ in the first place.
 **/dev-scripts
-mock-store
+mock-store/*
+!mock-store/package.json
