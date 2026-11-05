@@ -11,10 +11,34 @@
  * example each. The ONLY things printed are whether each response parsed
  * and, if it did, the parsed value itself (a small, fixed, non-sensitive
  * JSON object): never a raw prompt, never a secret.
+ *
+ * Lives in apps/api/dev-scripts/, compiled by tsconfig.dev-scripts.json
+ * into the gitignored dist-dev/ - see docs/learning-notes.md for why.
  */
 import { ComposeOutputSchema, PlannerOutputSchema, toGeminiResponseJsonSchema } from '@supportpilot/shared';
-import { GeminiLlmProvider } from '../llm/gemini-llm-provider';
-import { loadLlmSettingsFromEnv } from '../llm/llm.settings';
+import { GeminiLlmProvider } from '../src/llm/gemini-llm-provider';
+import { GenerateErrorCode } from '../src/llm/llm-provider.interface';
+import { loadLlmSettingsFromEnv } from '../src/llm/llm.settings';
+import { formatThinkingLevel } from '../src/llm/thinking-level';
+
+/**
+ * Stage 4 finding 5 - a real generate() call that never produced a model
+ * decision at all (quota, timeout, transient network/server issue) is NOT
+ * the same thing as the model producing bad output. Lumping both under one
+ * "FAIL" hides which one actually happened - see agent-pipeline-smoke-test.ts's
+ * NOT_RUN verdict for the same distinction, applied here too.
+ */
+const INFRASTRUCTURE_FAILURE_CODES: ReadonlySet<GenerateErrorCode> = new Set([
+  'NOT_CONFIGURED',
+  'RATE_LIMITED',
+  'UNAUTHORIZED',
+  'TRANSIENT',
+  'UNAVAILABLE',
+  'TIMEOUT',
+  'ABORTED',
+]);
+
+type Verdict = 'OK' | 'SCHEMA_MISMATCH' | 'NOT_RUN';
 
 async function checkSchema(
   provider: GeminiLlmProvider,
@@ -24,7 +48,7 @@ async function checkSchema(
   schema: typeof PlannerOutputSchema | typeof ComposeOutputSchema,
   timeoutMs: number,
   maxOutputTokens: number,
-): Promise<boolean> {
+): Promise<Verdict> {
   const responseSchema = toGeminiResponseJsonSchema(schema);
 
   const result = await provider.generate({
@@ -37,19 +61,23 @@ async function checkSchema(
   });
 
   if (!result.ok) {
+    if (INFRASTRUCTURE_FAILURE_CODES.has(result.error.code)) {
+      console.log(`${label}: NOT_RUN - the call itself never produced a model decision ([${result.error.code}] ${result.error.message})`);
+      return 'NOT_RUN';
+    }
     console.log(`${label}: FAIL - generate() returned [${result.error.code}] ${result.error.message}`);
-    return false;
+    return 'SCHEMA_MISMATCH';
   }
 
   const parsed = schema.safeParse(JSON.parse(result.result.text));
   if (!parsed.success) {
     console.log(`${label}: FAIL - response was valid JSON but didn't match the schema: ${parsed.error.message}`);
-    return false;
+    return 'SCHEMA_MISMATCH';
   }
 
   console.log(`${label}: OK`);
   console.log(JSON.stringify(parsed.data));
-  return true;
+  return 'OK';
 }
 
 async function main(): Promise<void> {
@@ -60,9 +88,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  console.log(`Generate model: "${settings.generateModel}", thinking level: "${formatThinkingLevel(settings.generateThinkingLevel)}"`);
+
   const provider = new GeminiLlmProvider(settings);
 
-  const plannerOk = await checkSchema(
+  const plannerVerdict = await checkSchema(
     provider,
     'PlannerOutputSchema',
     'You are a fictional test fixture for a support agent. A customer named Jamie Fictional asked: ' +
@@ -74,7 +104,7 @@ async function main(): Promise<void> {
     settings.generateMaxOutputTokens,
   );
 
-  const composeOk = await checkSchema(
+  const composeVerdict = await checkSchema(
     provider,
     'ComposeOutputSchema',
     'You are a fictional test fixture for a support agent composing a final reply. The fictional order ORD-0001 ' +
@@ -86,7 +116,13 @@ async function main(): Promise<void> {
     settings.generateMaxOutputTokens,
   );
 
-  if (!plannerOk || !composeOk) {
+  const verdicts = [plannerVerdict, composeVerdict];
+  const notRunCount = verdicts.filter((v) => v === 'NOT_RUN').length;
+  const failCount = verdicts.filter((v) => v === 'SCHEMA_MISMATCH').length;
+  if (notRunCount > 0) {
+    console.log(`\n${notRunCount} of ${verdicts.length} check(s) NOT_RUN (infrastructure failure, not a schema result) - rerun to get a real answer.`);
+  }
+  if (failCount > 0 || notRunCount > 0) {
     process.exitCode = 1;
   }
 }

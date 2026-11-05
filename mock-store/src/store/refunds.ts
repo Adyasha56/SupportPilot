@@ -27,6 +27,11 @@ export class RefundStore {
     }
   }
 
+  /** Read-only lookup used by the orders route to report how much (if anything) has already been refunded - the orders route never duplicates this onto the Order record itself, RefundStore stays the one source of truth. */
+  getByOrder(orderId: string): Refund | undefined {
+    return this.refundsByOrder.get(orderId);
+  }
+
   issue(
     orderId: string,
     amount: number,

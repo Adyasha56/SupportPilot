@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { GeminiLlmProvider } from './gemini-llm-provider';
 import { GenerateOptions } from './llm-provider.interface';
 import { LlmSettings } from './llm.settings';
-import { EmbedContentRequest, GeminiEmbedClient, GeminiGenerateClient, GenerateContentRequest } from './throttled-gemini-client';
+import { EmbedContentRequest, GeminiEmbedClient, GeminiGenerateClient, GenerateContentRequest, GenerateContentResult } from './throttled-gemini-client';
 
 function makeGenerateOptions(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
   return {
@@ -33,6 +33,10 @@ function makeSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
     generateTimeoutMs: 5000,
     generateMaxOutputTokens: 1024,
     generateTemperature: 0,
+    generateThinkingLevel: 'minimal',
+    dailyGenerateBudget: 300,
+    circuitBreakerFailureThreshold: 3,
+    circuitBreakerCooldownMs: 60_000,
     ...overrides,
   };
 }
@@ -73,7 +77,7 @@ describe('GeminiLlmProvider', () => {
   it('sends every text as one batch request and maps each embedding back to its input, in order', async () => {
     const receivedRequests: EmbedContentRequest[] = [];
     const fakeClient: GeminiEmbedClient = {
-      embedContent: vi.fn(async (request) => {
+      embedContent: vi.fn(async (request: EmbedContentRequest) => {
         receivedRequests.push(request);
         // Mirrors the real SDK's documented contract: one ContentEmbedding
         // per input content, in the same order as the request's `contents`.
@@ -81,7 +85,7 @@ describe('GeminiLlmProvider', () => {
         // different inputs to the same direction (a plain scalar multiple,
         // e.g. [1,0,0] vs [2,0,0], would normalize to the same vector).
         return {
-          embeddings: request.contents.map((_, i) => ({
+          embeddings: request.contents.map((_: string, i: number) => ({
             values: [0, 1, 2].map((position) => (position === i ? 1 : 0)),
           })),
         };
@@ -216,6 +220,23 @@ describe('GeminiLlmProvider', () => {
       expect(result).toEqual({ ok: true, result: { text: '{"ok":true}', usage: { inputTokens: 12, outputTokens: 3 } } });
     });
 
+    it('forwards options.thinkingLevel through to the request, and omits it entirely when not set (Stage 4 finding C)', async () => {
+      const receivedRequests: GenerateContentRequest[] = [];
+      const fakeClient: GeminiGenerateClient = {
+        generateContent: vi.fn(async (request) => {
+          receivedRequests.push(request);
+          return { text: '{}' };
+        }),
+      };
+      const provider = new GeminiLlmProvider(makeSettings(), undefined, fakeClient);
+
+      await provider.generate(makeGenerateOptions({ thinkingLevel: 'minimal' }));
+      await provider.generate(makeGenerateOptions());
+
+      expect(receivedRequests[0].config.thinkingLevel).toBe('minimal');
+      expect(receivedRequests[1].config.thinkingLevel).toBeUndefined();
+    });
+
     it('returns INVALID_OUTPUT when the response has no text at all', async () => {
       const fakeClient: GeminiGenerateClient = { generateContent: vi.fn(async () => ({})) };
       const provider = new GeminiLlmProvider(makeSettings(), undefined, fakeClient);
@@ -278,6 +299,52 @@ describe('GeminiLlmProvider', () => {
       }
     });
 
+    describe('TIMEOUT vs ABORTED classification (Stage 4 finding B)', () => {
+      /** A fake SDK client that never resolves on its own - the only way it ever settles is via the abort signal it's given, exactly like a real fetch-backed SDK call. */
+      function hangingClient(): GeminiGenerateClient {
+        return {
+          generateContent: vi.fn(
+            (request): Promise<GenerateContentResult> =>
+              new Promise((_resolve, reject) => {
+                request.config.abortSignal?.addEventListener(
+                  'abort',
+                  () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+                  { once: true },
+                );
+              }),
+          ),
+        };
+      }
+
+      it('classifies a per-call timeout (no external run-deadline signal involved) as TIMEOUT, never ABORTED', async () => {
+        const provider = new GeminiLlmProvider(makeSettings(), undefined, hangingClient());
+
+        const result = await provider.generate(makeGenerateOptions({ timeoutMs: 20 }));
+
+        expect(result).toMatchObject({ ok: false, error: { code: 'TIMEOUT' } });
+      });
+
+      it('classifies the caller\'s own run-level abortSignal firing as ABORTED, never TIMEOUT - even with a much larger per-call timeout', async () => {
+        const provider = new GeminiLlmProvider(makeSettings(), undefined, hangingClient());
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(), 20);
+
+        const result = await provider.generate(makeGenerateOptions({ timeoutMs: 60_000, abortSignal: controller.signal }));
+
+        expect(result).toMatchObject({ ok: false, error: { code: 'ABORTED' } });
+      });
+
+      it('a call that succeeds well before either signal fires is unaffected by either', async () => {
+        const fakeClient: GeminiGenerateClient = { generateContent: vi.fn(async () => ({ text: '{"ok":true}' })) };
+        const provider = new GeminiLlmProvider(makeSettings(), undefined, fakeClient);
+        const controller = new AbortController();
+
+        const result = await provider.generate(makeGenerateOptions({ timeoutMs: 20_000, abortSignal: controller.signal }));
+
+        expect(result.ok).toBe(true);
+      });
+    });
+
     it('uses its own throttle, independent of the embed client', async () => {
       const embedContent = vi.fn(async () => ({ embeddings: [{ values: [1] }] }));
       const generateContent = vi.fn(async () => ({ text: '{}' }));
@@ -288,6 +355,100 @@ describe('GeminiLlmProvider', () => {
 
       expect(generateContent).toHaveBeenCalledTimes(1);
       expect(embedContent).toHaveBeenCalledTimes(1);
+    });
+
+    describe('circuit breaker (Stage 4 finding 3)', () => {
+      function hangingClient(): GeminiGenerateClient {
+        return {
+          generateContent: vi.fn(
+            (request): Promise<GenerateContentResult> =>
+              new Promise((_resolve, reject) => {
+                request.config.abortSignal?.addEventListener(
+                  'abort',
+                  () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+                  { once: true },
+                );
+              }),
+          ),
+        };
+      }
+
+      it('opens after K consecutive TIMEOUTs, then returns CIRCUIT_OPEN with zero further network calls', async () => {
+        const client = hangingClient();
+        const provider = new GeminiLlmProvider(makeSettings({ circuitBreakerFailureThreshold: 2 }), undefined, client, () => new Date(0));
+
+        const first = await provider.generate(makeGenerateOptions({ timeoutMs: 10 }));
+        expect(first).toMatchObject({ ok: false, error: { code: 'TIMEOUT' } });
+        const second = await provider.generate(makeGenerateOptions({ timeoutMs: 10 }));
+        expect(second).toMatchObject({ ok: false, error: { code: 'TIMEOUT' } });
+        expect(client.generateContent).toHaveBeenCalledTimes(2);
+
+        const third = await provider.generate(makeGenerateOptions({ timeoutMs: 10 }));
+        expect(third).toMatchObject({ ok: false, error: { code: 'CIRCUIT_OPEN' } });
+        // Still exactly 2 - the breaker rejected before any real network call.
+        expect(client.generateContent).toHaveBeenCalledTimes(2);
+      });
+
+      /** A client whose behavior can be swapped between calls, without reaching into the provider's own internals - a plain delegate seam. */
+      function switchableClient(initial: GeminiGenerateClient['generateContent']): { client: GeminiGenerateClient; setBehavior: (fn: GeminiGenerateClient['generateContent']) => void } {
+        let behavior = initial;
+        return {
+          client: { generateContent: (request) => behavior(request) },
+          setBehavior: (fn) => {
+            behavior = fn;
+          },
+        };
+      }
+
+      it('a successful call resets the consecutive failure count, so the breaker never opens', async () => {
+        const hanging = hangingClient();
+        const { client, setBehavior } = switchableClient(hanging.generateContent);
+        const generateContent = vi.fn(client.generateContent);
+        const provider = new GeminiLlmProvider(makeSettings({ circuitBreakerFailureThreshold: 2 }), undefined, { generateContent }, () => new Date(0));
+
+        // One TIMEOUT, then a real success, then one more TIMEOUT - never 2 consecutive, so it never opens.
+        const first = await provider.generate(makeGenerateOptions({ timeoutMs: 10 }));
+        expect(first).toMatchObject({ ok: false, error: { code: 'TIMEOUT' } });
+
+        setBehavior(async () => ({ text: '{"ok":true}' }));
+        const second = await provider.generate(makeGenerateOptions({ timeoutMs: 10 }));
+        expect(second.ok).toBe(true);
+
+        setBehavior(hanging.generateContent);
+        const third = await provider.generate(makeGenerateOptions({ timeoutMs: 10 }));
+        expect(third).toMatchObject({ ok: false, error: { code: 'TIMEOUT' } });
+        expect(generateContent).toHaveBeenCalledTimes(3); // the breaker never rejected one of these outright
+      });
+
+      it('after the cooldown elapses, allows exactly one half-open trial; success closes the breaker again', async () => {
+        let now = 0;
+        const hanging = hangingClient();
+        const { client, setBehavior } = switchableClient(hanging.generateContent);
+        const generateContent = vi.fn(client.generateContent);
+        const provider = new GeminiLlmProvider(
+          makeSettings({ circuitBreakerFailureThreshold: 1, circuitBreakerCooldownMs: 1000 }),
+          undefined,
+          { generateContent },
+          () => new Date(now),
+        );
+
+        const opening = await provider.generate(makeGenerateOptions({ timeoutMs: 10 }));
+        expect(opening).toMatchObject({ ok: false, error: { code: 'TIMEOUT' } });
+
+        const stillOpen = await provider.generate(makeGenerateOptions({ timeoutMs: 10 }));
+        expect(stillOpen).toMatchObject({ ok: false, error: { code: 'CIRCUIT_OPEN' } });
+        expect(generateContent).toHaveBeenCalledTimes(1); // the second call never reached the network
+
+        now += 1000;
+        setBehavior(async () => ({ text: '{"ok":true}' }));
+
+        const trial = await provider.generate(makeGenerateOptions({ timeoutMs: 10 }));
+        expect(trial.ok).toBe(true);
+
+        const afterwards = await provider.generate(makeGenerateOptions({ timeoutMs: 10 }));
+        expect(afterwards.ok).toBe(true);
+        expect(generateContent).toHaveBeenCalledTimes(3); // trial + one more, both real calls now that it's closed
+      });
     });
   });
 });

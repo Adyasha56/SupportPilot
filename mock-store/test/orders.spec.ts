@@ -37,4 +37,32 @@ describe('GET /orders/:id', () => {
     expect(res.status).toBe(404);
     expect(res.body).toEqual({ error: 'Order not found' });
   });
+
+  it('reports alreadyRefundedTotal as 0 for an order that has never been refunded', async () => {
+    const res = await request(createTestApp())
+      .get('/orders/ORD-1001')
+      .set('Authorization', authHeader());
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ alreadyRefundedTotal: 0 });
+  });
+
+  it('reports alreadyRefundedTotal joined from the refund record, for a pre-seeded already-refunded order', async () => {
+    const res = await request(createTestApp())
+      .get('/orders/ORD-1005')
+      .set('Authorization', authHeader());
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: 'refunded', total: 120.0, alreadyRefundedTotal: 120.0 });
+  });
+
+  it('reports alreadyRefundedTotal reflecting a refund issued during this test run', async () => {
+    const app = createTestApp();
+    await request(app)
+      .post('/refunds')
+      .set('Authorization', authHeader())
+      .send({ orderId: 'ORD-1002', amount: 50 });
+
+    const res = await request(app).get('/orders/ORD-1002').set('Authorization', authHeader());
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ alreadyRefundedTotal: 50 });
+  });
 });

@@ -25,9 +25,9 @@ describe('createValidatingLookup', () => {
     });
 
     const result = await new Promise<[string, number]>((resolve, reject) => {
-      lookup('api.acme.example', {}, (err, address, family) => {
+      lookup('api.acme.example', {}, (err: NodeJS.ErrnoException | null, address: string, family: number) => {
         if (err) reject(err);
-        else resolve([address as string, family as number]);
+        else resolve([address, family]);
       });
     });
 
@@ -42,9 +42,9 @@ describe('createValidatingLookup', () => {
 
     const addresses = await new Promise<Array<{ address: string; family: number }>>(
       (resolve, reject) => {
-        lookup('api.acme.example', { all: true }, (err, result) => {
+        lookup('api.acme.example', { all: true }, (err: NodeJS.ErrnoException | null, result: Array<{ address: string; family: number }>) => {
           if (err) reject(err);
-          else resolve(result as Array<{ address: string; family: number }>);
+          else resolve(result);
         });
       },
     );
@@ -62,9 +62,9 @@ describe('createValidatingLookup', () => {
     });
 
     const address = await new Promise<string>((resolve, reject) => {
-      lookup('api.acme.example', (err, addr) => {
+      lookup('api.acme.example', (err: NodeJS.ErrnoException | null, addr: string) => {
         if (err) reject(err);
-        else resolve(addr as string);
+        else resolve(addr);
       });
     });
 
@@ -78,7 +78,7 @@ describe('createValidatingLookup', () => {
     });
 
     const err = await new Promise<NodeJS.ErrnoException | null>((resolve) => {
-      lookup('api.acme.example', {}, (callbackErr) => resolve(callbackErr));
+      lookup('api.acme.example', {}, (callbackErr: NodeJS.ErrnoException | null) => resolve(callbackErr));
     });
 
     expect(err).toBeInstanceOf(SafeLookupError);
@@ -91,9 +91,9 @@ describe('createValidatingLookup', () => {
     const lookup = createValidatingLookup({ settings: makeSettings(), resolveDns });
 
     const address = await new Promise<string>((resolve, reject) => {
-      lookup('8.8.8.8', {}, (err, addr) => {
+      lookup('8.8.8.8', {}, (err: NodeJS.ErrnoException | null, addr: string) => {
         if (err) reject(err);
-        else resolve(addr as string);
+        else resolve(addr);
       });
     });
 
@@ -108,9 +108,9 @@ describe('createValidatingLookup', () => {
     });
 
     const address = await new Promise<string>((resolve, reject) => {
-      lookup('api.acme.example', {}, (err, addr) => {
+      lookup('api.acme.example', {}, (err: NodeJS.ErrnoException | null, addr: string) => {
         if (err) reject(err);
-        else resolve(addr as string);
+        else resolve(addr);
       });
     });
 

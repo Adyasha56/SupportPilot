@@ -5,7 +5,7 @@
  * never a partially-committed one. The commit-failure path itself (a
  * transaction aborting after embedding succeeds) is already covered by a
  * unit test with a throwing fake (policy-ingestion.service.spec.ts) and by
- * the real-cluster transaction proof in src/scripts/check-transactions.ts
+ * the real-cluster transaction proof in dev-scripts/check-transactions.ts
  * (see docs/learning-notes.md) - not re-derived here to avoid claiming a
  * second, separate proof of the same fact.
  *
@@ -21,7 +21,7 @@ import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AppModule } from '../../src/app.module';
 import { LLM_PROVIDER } from '../../src/llm/llm.module';
-import { EmbedOutcome, EmbeddingTaskType, LlmProvider } from '../../src/llm/llm-provider.interface';
+import { EmbedOutcome, EmbeddingTaskType, GenerateOptions, GenerateOutcome, LlmProvider } from '../../src/llm/llm-provider.interface';
 import { FakeLlmProvider } from '../../src/llm/test-utils/fake-llm-provider';
 import { cleanupTenant, createTenantFixture, disconnectFixtureConnection } from './tenant-fixture';
 import { getTestMongoUri, integrationTestsEnabled } from './test-env';
@@ -36,6 +36,10 @@ class FailsOnSecondCallLlmProvider implements LlmProvider {
       return { ok: false, error: { code: 'TRANSIENT', message: 'simulated mid-pipeline failure' } };
     }
     return this.inner.embed(texts, taskType);
+  }
+
+  async generate(options: GenerateOptions): Promise<GenerateOutcome> {
+    return this.inner.generate(options);
   }
 }
 

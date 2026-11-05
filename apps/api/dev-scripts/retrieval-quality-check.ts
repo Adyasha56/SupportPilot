@@ -36,32 +36,34 @@
  * (authored for this fixture, not policy content) are printed since the
  * report is meaningless without them.
  *
- * Compiled to dist/scripts and run as plain JS, same reasoning as every
- * other script here (decorators/constructor parameter properties aren't
- * supported by Node's native TypeScript stripping) - none of the classes
- * this script constructs go through Nest's DI container.
+ * Lives in apps/api/dev-scripts/, compiled by tsconfig.dev-scripts.json
+ * into the gitignored dist-dev/ - see docs/learning-notes.md for why. Run
+ * as plain JS, same reasoning as every other script here (decorators/
+ * constructor parameter properties aren't supported by Node's native
+ * TypeScript stripping) - none of the classes this script constructs go
+ * through Nest's DI container.
  */
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import mongoose from 'mongoose';
 import { EMBEDDING_DIMENSION, EMBEDDING_MODEL } from '@supportpilot/shared';
-import { assertNotTestDatabase, getDatabaseNameFromUri } from '../db/database-name';
-import { MongoosePolicyChunkRepository, PolicyChunkRepository } from '../db/policy-chunk.repository';
-import { MongoosePolicyDocumentRepository, PolicyDocumentRepository } from '../db/policy-document.repository';
-import { MongooseTransactionRunner } from '../db/transaction-runner';
-import { ApiKeySchema } from '../db/schemas/api-key.schema';
-import { PolicyChunkDocument, PolicyChunkSchema } from '../db/schemas/policy-chunk.schema';
-import { PolicyDocumentDocument, PolicyDocumentSchema } from '../db/schemas/policy-document.schema';
-import { TenantSchema } from '../db/schemas/tenant.schema';
-import { chunkMarkdown } from '../ingestion/chunking/markdown-chunker';
-import { Chunk } from '../ingestion/chunking/markdown-chunker.types';
-import { PolicyIngestionService } from '../ingestion/policy-ingestion.service';
-import { TenantIngestionLock } from '../ingestion/tenant-ingestion-lock';
-import { GeminiLlmProvider } from '../llm/gemini-llm-provider';
-import { EmbedOutcome, EmbeddingTaskType, GenerateOptions, GenerateOutcome, LlmProvider } from '../llm/llm-provider.interface';
-import { loadLlmSettingsFromEnv } from '../llm/llm.settings';
-import { PolicyRetrievalService } from '../retrieval/policy-retrieval.service';
+import { assertNotTestDatabase, getDatabaseNameFromUri } from '../src/db/database-name';
+import { MongoosePolicyChunkRepository, PolicyChunkRepository } from '../src/db/policy-chunk.repository';
+import { MongoosePolicyDocumentRepository, PolicyDocumentRepository } from '../src/db/policy-document.repository';
+import { MongooseTransactionRunner } from '../src/db/transaction-runner';
+import { ApiKeySchema } from '../src/db/schemas/api-key.schema';
+import { PolicyChunkDocument, PolicyChunkSchema } from '../src/db/schemas/policy-chunk.schema';
+import { PolicyDocumentDocument, PolicyDocumentSchema } from '../src/db/schemas/policy-document.schema';
+import { TenantSchema } from '../src/db/schemas/tenant.schema';
+import { chunkMarkdown } from '../src/ingestion/chunking/markdown-chunker';
+import { Chunk } from '../src/ingestion/chunking/markdown-chunker.types';
+import { PolicyIngestionService } from '../src/ingestion/policy-ingestion.service';
+import { TenantIngestionLock } from '../src/ingestion/tenant-ingestion-lock';
+import { GeminiLlmProvider } from '../src/llm/gemini-llm-provider';
+import { EmbedOutcome, EmbeddingTaskType, GenerateOptions, GenerateOutcome, LlmProvider } from '../src/llm/llm-provider.interface';
+import { loadLlmSettingsFromEnv } from '../src/llm/llm.settings';
+import { PolicyRetrievalService } from '../src/retrieval/policy-retrieval.service';
 import { EmbeddingFileCache } from './embedding-file-cache';
 
 const POLL_INTERVAL_MS = 2000;

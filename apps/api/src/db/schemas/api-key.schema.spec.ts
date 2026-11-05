@@ -17,13 +17,13 @@ describe('ApiKeySchema', () => {
 
   it('rejects a scope outside public/secret', async () => {
     const doc = new ApiKeyModel(validKeyData({ scopes: ['admin'] }));
-    const err = await doc.validate().catch((e: mongoose.Error.ValidationError) => e);
+    const err = (await doc.validate().catch((e: mongoose.Error.ValidationError) => e)) as mongoose.Error.ValidationError;
     expect(err.errors['scopes.0']).toBeDefined();
   });
 
   it('requires keyPrefix', async () => {
     const doc = new ApiKeyModel(validKeyData({ keyPrefix: undefined }));
-    const err = await doc.validate().catch((e: mongoose.Error.ValidationError) => e);
+    const err = (await doc.validate().catch((e: mongoose.Error.ValidationError) => e)) as mongoose.Error.ValidationError;
     expect(err.errors.keyPrefix).toBeDefined();
   });
 

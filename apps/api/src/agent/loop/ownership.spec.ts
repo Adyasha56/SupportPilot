@@ -7,7 +7,14 @@ function makeState(overrides: Partial<OwnershipState> = {}): OwnershipState {
 }
 
 function makeOutput(overrides: Partial<GetOrderOutput> = {}): GetOrderOutput {
-  return { status: 'delivered', total: 49.99, placedAt: '2026-10-01T00:00:00.000Z', customerRef: 'cust_1', ...overrides };
+  return {
+    status: 'delivered',
+    total: 4999,
+    placedAt: '2026-10-01T00:00:00.000Z',
+    alreadyRefundedTotal: 0,
+    customerRef: 'cust_1',
+    ...overrides,
+  };
 }
 
 describe('acceptOrderResult', () => {

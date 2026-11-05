@@ -59,23 +59,22 @@ describe('daysPastEstimate', () => {
 });
 
 describe('remainingRefundable', () => {
-  it('returns the full total in cents when nothing has been refunded', () => {
-    expect(remainingRefundable(49.99, 0)).toBe(4999);
+  // Both inputs are already integer cents (as GetOrderOutputSchema's
+  // total/alreadyRefundedTotal now emit) - this function does no unit
+  // conversion of its own, just integer subtraction.
+  it('returns the full total when nothing has been refunded', () => {
+    expect(remainingRefundable(4999, 0)).toBe(4999);
   });
 
   it('returns 0 when the order has already been fully refunded', () => {
-    expect(remainingRefundable(49.99, 49.99)).toBe(0);
+    expect(remainingRefundable(4999, 4999)).toBe(0);
   });
 
   it('subtracts a partial refund correctly', () => {
-    expect(remainingRefundable(100, 25)).toBe(7500);
+    expect(remainingRefundable(10000, 2500)).toBe(7500);
   });
 
-  it('never goes negative, even if alreadyRefunded exceeds the total (bad data)', () => {
-    expect(remainingRefundable(50, 75)).toBe(0);
-  });
-
-  it('is not fooled by classic floating-point representation error (0.1 + 0.2 style inputs)', () => {
-    expect(remainingRefundable(0.3, 0.1)).toBe(20);
+  it('never goes negative, even if alreadyRefundedCents exceeds orderTotalCents (bad data)', () => {
+    expect(remainingRefundable(5000, 7500)).toBe(0);
   });
 });

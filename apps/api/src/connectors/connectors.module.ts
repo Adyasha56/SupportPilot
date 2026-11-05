@@ -1,8 +1,8 @@
 import { Module } from '@nestjs/common';
-import { connectorConfigRepositoryProvider } from './connector-config-repository.provider';
+import { connectorConfigRepositoryProvider, connectorConfigSettingsProvider } from './connector-config-repository.provider';
 
 @Module({
-  providers: [connectorConfigRepositoryProvider],
-  exports: [connectorConfigRepositoryProvider],
+  providers: [connectorConfigSettingsProvider, connectorConfigRepositoryProvider],
+  exports: [connectorConfigRepositoryProvider, connectorConfigSettingsProvider],
 })
 export class ConnectorsModule {}

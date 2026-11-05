@@ -34,7 +34,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
   const app = express();
   app.use(express.json({ limit: '100kb' }));
   app.use(createAuthMiddleware(token));
-  app.use('/orders', createOrdersRouter(orders));
+  app.use('/orders', createOrdersRouter(orders, refunds));
   app.use('/shipments', createShipmentsRouter(shipments));
   app.use('/refunds', createRefundsRouter(orders, refunds, clock));
   app.use('/escalations', createEscalationsRouter(escalations, clock));

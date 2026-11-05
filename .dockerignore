@@ -1,6 +1,15 @@
 **/node_modules
 **/dist
+**/dist-dev
 **/*.tsbuildinfo
 .git
 .env
 *.md
+# Dev-only diagnostic scripts (apps/api/dev-scripts/) and their mock-store
+# dependency never need to be in the Docker build context at all - they're
+# excluded from tsconfig.build.json already, this just keeps the build
+# context itself smaller. See docs/learning-notes.md for why these moved
+# out of src/scripts/ in the first place.
+**/dev-scripts
+mock-store/*
+!mock-store/package.json

@@ -14,7 +14,7 @@ export const TRANSACTION_RUNNER = Symbol('TRANSACTION_RUNNER');
  * the whole callback automatically on a TransientTransactionError and
  * retries just the commit on an UnknownTransactionCommitResult - confirmed
  * working empirically against the project's real Atlas M0 cluster via
- * apps/api/src/scripts/check-transactions.ts (see docs/learning-notes.md).
+ * apps/api/dev-scripts/check-transactions.ts (see docs/learning-notes.md).
  *
  * The session MUST come from the same Connection the repositories' models
  * are registered on. @nestjs/mongoose's MongooseModule.forRoot() calls

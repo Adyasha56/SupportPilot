@@ -6,7 +6,11 @@ import { RetrievalSettings } from './retrieval.settings';
 import { NewPolicyChunk, PolicyChunkRepository, VectorSearchParams, VectorSearchResultItem } from '../db/policy-chunk.repository';
 import { InMemoryPolicyChunkRepository } from '../db/test-utils/in-memory-policy-chunk.repository';
 import { FakeLlmProvider } from '../llm/test-utils/fake-llm-provider';
-import { EmbedOutcome, EmbeddingTaskType, LlmProvider } from '../llm/llm-provider.interface';
+import { EmbedOutcome, EmbeddingTaskType, GenerateOutcome, LlmProvider } from '../llm/llm-provider.interface';
+
+async function unusedGenerate(): Promise<GenerateOutcome> {
+  return { ok: false, error: { code: 'NOT_CONFIGURED', message: 'generate() is not used by this test' } };
+}
 import { LlmSettings } from '../llm/llm.settings';
 
 function settings(overrides: Partial<RetrievalSettings> = {}): RetrievalSettings {
@@ -30,6 +34,10 @@ function llmSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
     generateTimeoutMs: 5000,
     generateMaxOutputTokens: 1024,
     generateTemperature: 0,
+    generateThinkingLevel: 'minimal',
+    dailyGenerateBudget: 300,
+    circuitBreakerFailureThreshold: 3,
+    circuitBreakerCooldownMs: 60_000,
     ...overrides,
   };
 }
@@ -160,6 +168,7 @@ describe('PolicyRetrievalService.retrieve', () => {
       async embed(): Promise<EmbedOutcome> {
         return { ok: false, error: { code: 'TRANSIENT', message: 'boom' } };
       },
+      generate: unusedGenerate,
     };
     const { service } = makeService({ llmProvider: failingProvider });
     const result = await service.retrieve('acme', 'query');
@@ -188,6 +197,7 @@ describe('PolicyRetrievalService.retrieve', () => {
       async embed(texts: string[]) {
         return { ok: true, result: { vectors: texts.map((text) => ({ text, values: [1, 0, 0] })), model: 'fixed', dimension: 3 } };
       },
+      generate: unusedGenerate,
     };
     const { service, chunkRepository } = makeService({ llmProvider: fixedVectorProvider });
     await chunkRepository.insertMany([
@@ -210,7 +220,7 @@ describe('PolicyRetrievalService.retrieve', () => {
       expect(taskType).toBe('RETRIEVAL_QUERY');
       return new FakeLlmProvider().embed(texts, taskType);
     });
-    const { service } = makeService({ llmProvider: { embed } });
+    const { service } = makeService({ llmProvider: { embed, generate: unusedGenerate } });
 
     await service.retrieve('acme', 'what is the refund window');
 

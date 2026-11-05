@@ -9,13 +9,17 @@
  * similarities - never the raw key, never a full vector, matching RULES.md
  * section 5's rule against logging secrets.
  *
- * Compiled to dist/scripts and run as plain JS, same reasoning as every
- * other script here (decorators/constructor parameter properties aren't
- * supported by Node's native TypeScript type stripping).
+ * Lives in apps/api/dev-scripts/, compiled by tsconfig.dev-scripts.json
+ * into the gitignored dist-dev/ (never tsconfig.build.json/nest build, so
+ * this never needs to compile as part of the production Docker image -
+ * see docs/learning-notes.md for why these scripts were split out). Run
+ * as plain JS, same reasoning as every other script here (decorators/
+ * constructor parameter properties aren't supported by Node's native
+ * TypeScript type stripping).
  */
 import { EMBEDDING_DIMENSION, EMBEDDING_MODEL } from '@supportpilot/shared';
-import { GeminiLlmProvider } from '../llm/gemini-llm-provider';
-import { loadLlmSettingsFromEnv } from '../llm/llm.settings';
+import { GeminiLlmProvider } from '../src/llm/gemini-llm-provider';
+import { loadLlmSettingsFromEnv } from '../src/llm/llm.settings';
 import { EmbeddingFileCache } from './embedding-file-cache';
 
 const SENTENCES = [

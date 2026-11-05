@@ -83,19 +83,54 @@ describe('runTool against the real mock-store', () => {
   });
 
   describe('get_order', () => {
+    // total is integer cents (GetOrderOutputSchema converts money to cents
+    // at the tool-output boundary - Milestone 3, Stage 2 follow-up), not
+    // the mock store's own decimal-dollar wire value.
     it.each([
-      ['ORD-1001', 'delivered', 49.99],
-      ['ORD-1002', 'in_transit', 89.5],
-      ['ORD-1003', 'delayed', 32.0],
-      ['ORD-1004', 'delivered', 75.25],
-      ['ORD-1005', 'refunded', 120.0],
-      ['ORD-1006', 'delivered', 1249.0],
-      ['ORD-1007', 'cancelled', 60.0],
-    ])('fetches %s (%s, %d)', async (orderId, status, total) => {
+      ['ORD-1001', 'delivered', 4999],
+      ['ORD-1002', 'in_transit', 8950],
+      ['ORD-1003', 'delayed', 3200],
+      ['ORD-1004', 'delivered', 7525],
+      ['ORD-1005', 'refunded', 12000],
+      ['ORD-1006', 'delivered', 124900],
+      ['ORD-1007', 'cancelled', 6000],
+    ])('fetches %s (%s, %d cents)', async (orderId, status, total) => {
       const result = await run('get_order', { order_id: orderId });
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.data).toMatchObject({ status, total });
+      }
+    });
+
+    it('ORD-1005 (pre-seeded as already refunded) reports alreadyRefundedTotal in cents, joined from the refund record', async () => {
+      const result = await run('get_order', { order_id: 'ORD-1005' });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.data).toMatchObject({ alreadyRefundedTotal: 12000 });
+      }
+    });
+
+    it('an order with no refund reports alreadyRefundedTotal as 0', async () => {
+      const result = await run('get_order', { order_id: 'ORD-1001' });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.data).toMatchObject({ alreadyRefundedTotal: 0 });
+      }
+    });
+
+    it('exposes deliveredAt for a delivered order', async () => {
+      const result = await run('get_order', { order_id: 'ORD-1001' });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.data).toMatchObject({ deliveredAt: expect.any(String) });
+      }
+    });
+
+    it('omits deliveredAt for an order not yet delivered', async () => {
+      const result = await run('get_order', { order_id: 'ORD-1002' });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect((result.data as Record<string, unknown>).deliveredAt).toBeUndefined();
       }
     });
 
@@ -106,7 +141,7 @@ describe('runTool against the real mock-store', () => {
       const result = await run('get_order', { order_id: 'ORD-1008' });
       expect(result.ok).toBe(true);
       if (result.ok) {
-        expect(result.data).toMatchObject({ status: 'delivered', total: 44.0, customerRef: 'cust_5' });
+        expect(result.data).toMatchObject({ status: 'delivered', total: 4400, customerRef: 'cust_5' });
       }
     });
 

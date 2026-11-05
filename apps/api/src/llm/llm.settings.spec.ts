@@ -15,6 +15,50 @@ describe('loadLlmSettingsFromEnv', () => {
     expect(settings.generateMaxConcurrency).toBeGreaterThan(0);
     expect(settings.generateTimeoutMs).toBeGreaterThan(0);
     expect(settings.generateMaxOutputTokens).toBeGreaterThan(0);
+    expect(settings.dailyGenerateBudget).toBeGreaterThan(0);
+  });
+
+  it('defaults GEMINI_DAILY_GENERATE_BUDGET to 300 when unset', () => {
+    const settings = loadLlmSettingsFromEnv({});
+    expect(settings.dailyGenerateBudget).toBe(300);
+  });
+
+  it('picks up GEMINI_DAILY_GENERATE_BUDGET from env', () => {
+    const settings = loadLlmSettingsFromEnv({ GEMINI_DAILY_GENERATE_BUDGET: '50' });
+    expect(settings.dailyGenerateBudget).toBe(50);
+  });
+
+  it('defaults generateTimeoutMs to 10s and generateMaxRetries to 2 (Stage 4 finding 8/B - the code fallback must match .env.example, not just its own suggested starting value)', () => {
+    const settings = loadLlmSettingsFromEnv({});
+    expect(settings.generateTimeoutMs).toBe(10_000);
+    expect(settings.generateMaxRetries).toBe(2);
+  });
+
+  it('leaves generateThinkingLevel unset by default - never a project-wide assumed value (Stage 4 finding 1)', () => {
+    const settings = loadLlmSettingsFromEnv({});
+    expect(settings.generateThinkingLevel).toBeUndefined();
+  });
+
+  it('picks up GEMINI_THINKING_LEVEL from env when it is valid for the configured model', () => {
+    const settings = loadLlmSettingsFromEnv({ GEMINI_THINKING_LEVEL: 'high' });
+    expect(settings.generateThinkingLevel).toBe('high');
+  });
+
+  it('throws a clear configuration error when the configured level is not supported by the configured model, rather than letting it reach the API as a runtime failure', () => {
+    expect(() =>
+      loadLlmSettingsFromEnv({ GEMINI_GENERATE_MODEL: 'gemini-3.8-flash', GEMINI_THINKING_LEVEL: 'minimal' }),
+    ).toThrow(/not supported by GEMINI_GENERATE_MODEL="gemini-3\.8-flash"/);
+  });
+
+  it('allows a level that IS supported by the configured model', () => {
+    const settings = loadLlmSettingsFromEnv({ GEMINI_GENERATE_MODEL: 'gemini-3.8-flash', GEMINI_THINKING_LEVEL: 'low' });
+    expect(settings.generateThinkingLevel).toBe('low');
+  });
+
+  it('never validates against an unknown model - no false "incompatible" claim for a model not in our table', () => {
+    expect(() =>
+      loadLlmSettingsFromEnv({ GEMINI_GENERATE_MODEL: 'some-future-model-not-yet-in-our-table', GEMINI_THINKING_LEVEL: 'minimal' }),
+    ).not.toThrow();
   });
 
   it('picks up every overridable embed value from env', () => {
@@ -77,5 +121,9 @@ describe('loadLlmSettingsFromEnv', () => {
 
   it('throws a clear error on an invalid generate value rather than silently coercing it', () => {
     expect(() => loadLlmSettingsFromEnv({ GEMINI_GENERATE_RPM: 'not-a-number' })).toThrow(/Invalid LlmSettings/);
+  });
+
+  it('throws a clear error on an invalid GEMINI_THINKING_LEVEL rather than silently accepting an unsupported value', () => {
+    expect(() => loadLlmSettingsFromEnv({ GEMINI_THINKING_LEVEL: 'bogus' })).toThrow(/Invalid LlmSettings/);
   });
 });

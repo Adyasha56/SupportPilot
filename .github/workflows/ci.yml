@@ -27,6 +27,20 @@ jobs:
       - name: Build
         run: pnpm -r run build
 
+      # apps/api/dev-scripts/ (manual-only diagnostics: smoke tests,
+      # retrieval-quality-check, generate-schema-check, check-transactions,
+      # the latency probe) are excluded from the production build entirely
+      # (tsconfig.build.json) so they never need to compile as part of the
+      # Docker image - see docs/learning-notes.md for the real CI failure
+      # that caused this split. Built here, separately, so they can never
+      # silently rot: a broken import or type error in one of these still
+      # fails CI, just without touching the production build at all.
+      - name: Build dev scripts
+        run: pnpm --filter @supportpilot/api run build:dev-scripts
+
+      - name: Typecheck
+        run: pnpm -r run typecheck
+
       - name: Lint
         run: pnpm -r run lint
 

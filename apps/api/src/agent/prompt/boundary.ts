@@ -3,8 +3,8 @@ import { randomBytes } from 'node:crypto';
 /** A block can never dominate an entire prompt's token budget - this is the default per-block cap, callers may pass a smaller one. */
 export const MAX_UNTRUSTED_BLOCK_LENGTH = 4000;
 
-/** The ONLY block labels this project ever wraps untrusted content in - kept here as the single source of truth both buildUntrustedBlock and the tag-neutralizer below read from. */
-export const BLOCK_LABELS = ['customer_message', 'policy_chunk', 'tool_result'] as const;
+/** The ONLY block labels this project ever wraps untrusted content in - kept here as the single source of truth both buildUntrustedBlock and the tag-neutralizer below read from. `history_turn` wraps a prior agent OR customer turn from conversation history - treated as data exactly like a fresh customer message (PROJECT.md: "Prior agent turns in history are also treated as data"). */
+export const BLOCK_LABELS = ['customer_message', 'policy_chunk', 'tool_result', 'history_turn'] as const;
 export type BlockLabel = (typeof BLOCK_LABELS)[number];
 
 /**

@@ -15,19 +15,19 @@ describe('PolicyDocumentSchema', () => {
 
   it('rejects a status outside the enum', async () => {
     const doc = new PolicyDocumentModel({ tenantId: 'acme', title: 'x', contentHash: 'abc123', status: 'archived' });
-    const err = await doc.validate().catch((e: mongoose.Error.ValidationError) => e);
+    const err = (await doc.validate().catch((e: mongoose.Error.ValidationError) => e)) as mongoose.Error.ValidationError;
     expect(err.errors.status).toBeDefined();
   });
 
   it('rejects a failureCode outside the known set', async () => {
     const doc = new PolicyDocumentModel({ tenantId: 'acme', title: 'x', contentHash: 'abc123', failureCode: 'SOMETHING_MADE_UP' });
-    const err = await doc.validate().catch((e: mongoose.Error.ValidationError) => e);
+    const err = (await doc.validate().catch((e: mongoose.Error.ValidationError) => e)) as mongoose.Error.ValidationError;
     expect(err.errors.failureCode).toBeDefined();
   });
 
   it('requires tenantId, title, and contentHash', async () => {
     const doc = new PolicyDocumentModel({});
-    const err = await doc.validate().catch((e: mongoose.Error.ValidationError) => e);
+    const err = (await doc.validate().catch((e: mongoose.Error.ValidationError) => e)) as mongoose.Error.ValidationError;
     expect(err.errors.tenantId).toBeDefined();
     expect(err.errors.title).toBeDefined();
     expect(err.errors.contentHash).toBeDefined();

@@ -14,9 +14,16 @@ export type ValidateProposedRefundOutcome = { ok: true; action: ProposedAction }
 export interface ValidateProposedRefundState {
   runId: string;
   verifiedOrderIds: ReadonlySet<string>;
-  /** The verified order's total and whatever has already been refunded against it, decimal dollars - taken from the SAME get_order result that put the order in verifiedOrderIds, never re-fetched or trusted from the model's own claim. */
-  orderTotal: number;
-  alreadyRefunded: number;
+  /**
+   * The verified order's total and whatever has already been refunded
+   * against it, in integer CENTS - straight from the SAME get_order
+   * result that put the order in verifiedOrderIds (GetOrderOutputSchema
+   * already converts both to cents at the tool-output boundary), never
+   * re-fetched, never re-converted, and never trusted from the model's
+   * own claim.
+   */
+  orderTotalCents: number;
+  alreadyRefundedCents: number;
   /** citedChunkKeys from compose, already re-checked against the actually-retrieved set by citation-guard.ts BEFORE this function is ever called. */
   reasonCitations: string[];
 }
@@ -69,7 +76,7 @@ export function validateProposedRefund(
     return { ok: false, reason: 'INVALID_AMOUNT' };
   }
 
-  const remainingCents = remainingRefundable(state.orderTotal, state.alreadyRefunded);
+  const remainingCents = remainingRefundable(state.orderTotalCents, state.alreadyRefundedCents);
   const amountCents = toCents(proposal.amount);
   if (amountCents > remainingCents) {
     return { ok: false, reason: 'AMOUNT_EXCEEDS_REMAINING_REFUNDABLE' };

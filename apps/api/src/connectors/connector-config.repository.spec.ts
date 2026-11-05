@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   ConnectorConfigNotFoundError,
+  DisabledConnectorConfigRepository,
   FileConnectorConfigRepository,
   InvalidConnectorConfigError,
   TenantMismatchError,
@@ -192,5 +193,17 @@ describe('FileConnectorConfigRepository against a scratch fixture tree', () => {
     writeTenantConfig('acme', 'ok.json', JSON.stringify(postConfig));
     const repo = new FileConnectorConfigRepository(scratchRoot);
     expect(repo.findAllForTenant('acme')).toHaveLength(1);
+  });
+});
+
+describe('DisabledConnectorConfigRepository', () => {
+  it('returns an empty list from findAllForTenant - never throws, never boots the app into a bad state', () => {
+    const repo = new DisabledConnectorConfigRepository();
+    expect(repo.findAllForTenant('acme')).toEqual([]);
+  });
+
+  it('throws ConnectorConfigNotFoundError from findByTool - the same typed error runTool() already converts to CONFIG_ERROR', () => {
+    const repo = new DisabledConnectorConfigRepository();
+    expect(() => repo.findByTool('acme', 'get_order')).toThrow(ConnectorConfigNotFoundError);
   });
 });

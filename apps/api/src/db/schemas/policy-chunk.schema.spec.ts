@@ -55,7 +55,7 @@ describe('PolicyChunkSchema', () => {
     const doc = new PolicyChunkModel(
       validChunkData({ embeddingModel: undefined, embeddingDimension: undefined, contentHash: undefined }),
     );
-    const err = await doc.validate().catch((e: mongoose.Error.ValidationError) => e);
+    const err = (await doc.validate().catch((e: mongoose.Error.ValidationError) => e)) as mongoose.Error.ValidationError;
     expect(err.errors.embeddingModel).toBeDefined();
     expect(err.errors.embeddingDimension).toBeDefined();
     expect(err.errors.contentHash).toBeDefined();
@@ -63,13 +63,13 @@ describe('PolicyChunkSchema', () => {
 
   it('rejects a missing embedding', async () => {
     const doc = new PolicyChunkModel(validChunkData({ embedding: undefined }));
-    const err = await doc.validate().catch((e: mongoose.Error.ValidationError) => e);
+    const err = (await doc.validate().catch((e: mongoose.Error.ValidationError) => e)) as mongoose.Error.ValidationError;
     expect(err.errors.embedding).toBeDefined();
   });
 
   it('rejects an empty embedding array (required:true alone does not catch this on an array field)', async () => {
     const doc = new PolicyChunkModel(validChunkData({ embedding: [] }));
-    const err = await doc.validate().catch((e: mongoose.Error.ValidationError) => e);
+    const err = (await doc.validate().catch((e: mongoose.Error.ValidationError) => e)) as mongoose.Error.ValidationError;
     expect(err.errors.embedding).toBeDefined();
     expect(err.errors.embedding.message).toMatch(/must not be empty/);
   });
