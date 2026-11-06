@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
+import { DegradedReason } from '@supportpilot/shared';
 import { Model } from 'mongoose';
 import { AgentProposedActionSubdocument, AgentRunDocument, AgentStepSubdocument } from './schemas/agent-run.schema';
 
@@ -10,7 +11,7 @@ export interface NewAgentRun {
   tenantId: string;
   conversationId: string;
   outcome: 'reply' | 'clarify' | 'escalate' | 'pending_approval';
-  degraded?: 'DAILY_BUDGET_EXCEEDED' | 'TENANT_BUDGET_EXCEEDED' | 'CIRCUIT_OPEN';
+  degraded?: DegradedReason;
   stepCount: number;
   llmCallCount: number;
   tokensIn: number;
@@ -22,7 +23,7 @@ export interface NewAgentRun {
 
 export interface AgentRunRecord extends Omit<NewAgentRun, 'degraded' | 'proposedAction'> {
   id: string;
-  degraded: 'DAILY_BUDGET_EXCEEDED' | 'TENANT_BUDGET_EXCEEDED' | 'CIRCUIT_OPEN' | null;
+  degraded: DegradedReason | null;
   proposedAction: NewAgentRunProposedAction | null;
   createdAt: Date;
 }
