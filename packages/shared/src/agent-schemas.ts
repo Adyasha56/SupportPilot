@@ -180,6 +180,20 @@ export const ChatRequestSchema = z.object({
 });
 export type ChatRequest = z.infer<typeof ChatRequestSchema>;
 
+/**
+ * Stage 4 amendment D / item 3 - present only when `outcome` is `escalate`
+ * for one of these specific causes, so a widget can tell "a usage cap was
+ * hit" (DAILY_BUDGET_EXCEEDED, the shared cross-tenant pool;
+ * TENANT_BUDGET_EXCEEDED, this one tenant's own allowance),
+ * "the circuit breaker is open" (CIRCUIT_OPEN), or "the model itself is
+ * having trouble" (LLM_UNAVAILABLE - timeout, rate-limited, invalid output
+ * surviving one repair attempt, unauthorized, not configured) apart from an
+ * ordinary business-reason escalation, which carries no `degraded` field at
+ * all.
+ */
+export const DegradedReasonSchema = z.enum(['DAILY_BUDGET_EXCEEDED', 'TENANT_BUDGET_EXCEEDED', 'CIRCUIT_OPEN', 'LLM_UNAVAILABLE']);
+export type DegradedReason = z.infer<typeof DegradedReasonSchema>;
+
 export const ChatResultSchema = z.object({
   conversationId: z.string(),
   runId: z.string(),
@@ -187,5 +201,6 @@ export const ChatResultSchema = z.object({
   message: z.string(),
   citations: z.array(CitationSchema),
   proposedAction: ProposedActionSchema.optional(),
+  degraded: DegradedReasonSchema.optional(),
 });
 export type ChatResult = z.infer<typeof ChatResultSchema>;

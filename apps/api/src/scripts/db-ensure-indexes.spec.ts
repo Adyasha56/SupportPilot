@@ -1,16 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  CollectionIndexDeps,
   definitionsMatch,
   EnsureIndexDeps,
   ensureCollectionExists,
+  ensureCollectionIndexes,
   ensureIndexes,
-  ensureRegularIndexes,
-  ensureTtlIndexes,
+  ExistingIndexInfo,
   ExistingSearchIndex,
-  ExistingTtlIndex,
-  RegularIndexModel,
-  TtlIndexDeps,
-  TtlIndexSpec,
+  findSingleFieldTtlIndex,
+  RegularIndexSpec,
 } from './db-ensure-indexes';
 import { POLICY_CHUNK_VECTOR_INDEX_DEFINITION, POLICY_CHUNK_VECTOR_INDEX_NAME } from '../db/schemas/policy-chunk.schema';
 
@@ -80,44 +79,18 @@ describe('definitionsMatch', () => {
   });
 });
 
-function makeRegularModel(name: string, diff: { toDrop: string[]; toCreate: string[] }): RegularIndexModel {
-  return {
-    name,
-    diffIndexes: vi.fn(async () => diff),
-    syncIndexes: vi.fn(async () => diff.toDrop),
-  };
-}
-
-describe('ensureRegularIndexes', () => {
-  it('syncs every model and logs "already in sync" when nothing changed', async () => {
-    const models = [makeRegularModel('Tenant', { toDrop: [], toCreate: [] }), makeRegularModel('ApiKey', { toDrop: [], toCreate: [] })];
-    const logs: string[] = [];
-    await ensureRegularIndexes(models, (m) => logs.push(m));
-
-    for (const model of models) {
-      expect(model.syncIndexes).not.toHaveBeenCalled(); // nothing to do, so syncIndexes is skipped entirely
-    }
-    expect(logs.filter((l) => l.includes('already in sync'))).toHaveLength(2);
+describe('findSingleFieldTtlIndex', () => {
+  it('matches only a single-field index on the given field that carries expireAfterSeconds', () => {
+    const indexes: ExistingIndexInfo[] = [
+      { name: '_id_', key: { _id: 1 } },
+      { name: 'tenantId_1_createdAt_1', key: { tenantId: 1, createdAt: 1 } }, // compound, no expireAfterSeconds
+      { name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 2_592_000 },
+    ];
+    expect(findSingleFieldTtlIndex(indexes, 'createdAt')?.name).toBe('createdAt_1');
   });
 
-  it('explicitly logs every index name to be created and dropped, then syncs', async () => {
-    const model = makeRegularModel('ApiKey', { toDrop: ['old_index_1'], toCreate: ['hash_1'] });
-    const logs: string[] = [];
-    await ensureRegularIndexes([model], (m) => logs.push(m));
-
-    expect(logs.some((l) => l.includes('creating') && l.includes('hash_1'))).toBe(true);
-    expect(logs.some((l) => l.includes('dropping') && l.includes('old_index_1'))).toBe(true);
-    expect(model.syncIndexes).toHaveBeenCalledTimes(1);
-  });
-
-  it('--dry-run reports the plan but never calls syncIndexes', async () => {
-    const model = makeRegularModel('ApiKey', { toDrop: ['old_index_1'], toCreate: ['hash_1'] });
-    const logs: string[] = [];
-    await ensureRegularIndexes([model], (m) => logs.push(m), { dryRun: true });
-
-    expect(logs.some((l) => l.includes('[dry-run]') && l.includes('would create') && l.includes('hash_1'))).toBe(true);
-    expect(logs.some((l) => l.includes('[dry-run]') && l.includes('would drop') && l.includes('old_index_1'))).toBe(true);
-    expect(model.syncIndexes).not.toHaveBeenCalled();
+  it('returns undefined when no TTL index exists on that field', () => {
+    expect(findSingleFieldTtlIndex([{ name: '_id_', key: { _id: 1 } }], 'createdAt')).toBeUndefined();
   });
 });
 
@@ -210,74 +183,227 @@ describe('ensureIndexes', () => {
   });
 });
 
-describe('ensureTtlIndexes (Stage 4 amendment E)', () => {
-  function makeTtlDeps(overrides: Partial<TtlIndexDeps> = {}): TtlIndexDeps {
+describe('ensureCollectionIndexes', () => {
+  interface FakeState {
+    exists: boolean;
+    /** Secondary indexes only - the fake never models the implicit _id_ index. */
+    indexes: ExistingIndexInfo[];
+  }
+
+  function sameKeys(a: Record<string, number>, b: Record<string, number>): boolean {
+    const aKeys = Object.keys(a);
+    const bKeys = Object.keys(b);
+    return aKeys.length === bKeys.length && aKeys.every((k) => a[k] === b[k]);
+  }
+
+  /**
+   * A fake that mimics just enough of mongoose's own diffIndexes()
+   * semantics (schema index not present in the collection -> toCreate;
+   * collection index not declared on the schema -> toDrop) to reproduce the
+   * real Stage 4 bug: a TTL index created out of band looks exactly like a
+   * stray to this diff, the same way it does to the real mongoose method
+   * (see the module's own doc comment on `ensureCollectionIndexes`). The
+   * fix under test is that `ensureCollectionIndexes` must never let that
+   * diff drop the TTL index.
+   */
+  function makeFakeDeps(
+    label: string,
+    collectionName: string,
+    schemaIndexes: RegularIndexSpec[],
+    state: FakeState,
+    ttl?: { field: string; expireAfterSeconds: number },
+  ): CollectionIndexDeps & { calls: { created: string[]; dropped: string[]; ttlCreated: number; ttlCollMod: number } } {
+    const calls = { created: [] as string[], dropped: [] as string[], ttlCreated: 0, ttlCollMod: 0 };
     return {
-      listIndexes: vi.fn(async () => []),
-      createTtlIndex: vi.fn(async () => undefined),
-      updateTtlIndexExpiry: vi.fn(async () => undefined),
-      ...overrides,
+      label,
+      collectionName,
+      listCollectionNames: async () => (state.exists ? [collectionName] : []),
+      createCollection: async () => {
+        state.exists = true;
+      },
+      listIndexes: async () => state.indexes,
+      diffSchemaIndexes: async () => {
+        const toDrop = state.indexes.filter((idx) => !schemaIndexes.some(([keys]) => sameKeys(keys, idx.key))).map((idx) => idx.name);
+        const toCreate = schemaIndexes.filter(([keys]) => !state.indexes.some((idx) => sameKeys(idx.key, keys)));
+        return { toDrop, toCreate };
+      },
+      dropIndexes: async (names) => {
+        calls.dropped.push(...names);
+        state.indexes = state.indexes.filter((idx) => !names.includes(idx.name));
+      },
+      createSchemaIndexes: async (toCreate) => {
+        for (const [keys, options] of toCreate) {
+          const name =
+            typeof options.name === 'string'
+              ? options.name
+              : Object.entries(keys)
+                  .map(([f, d]) => `${f}_${d}`)
+                  .join('_');
+          calls.created.push(name);
+          state.indexes.push({ name, key: keys, unique: Boolean(options.unique) });
+        }
+      },
+      ttl: ttl
+        ? {
+            field: ttl.field,
+            expireAfterSeconds: ttl.expireAfterSeconds,
+            createIndex: async () => {
+              calls.ttlCreated += 1;
+              state.indexes.push({ name: `${ttl.field}_1`, key: { [ttl.field]: 1 }, expireAfterSeconds: ttl.expireAfterSeconds });
+            },
+            updateExpiry: async () => {
+              calls.ttlCollMod += 1;
+              const idx = findSingleFieldTtlIndex(state.indexes, ttl.field);
+              if (idx) idx.expireAfterSeconds = ttl.expireAfterSeconds;
+            },
+          }
+        : undefined,
+      calls,
     };
   }
 
-  const spec: TtlIndexSpec = { label: 'Message', collectionName: 'messages', field: 'createdAt', expireAfterSeconds: 2_592_000 };
+  const messageSchemaIndexes: RegularIndexSpec[] = [[{ tenantId: 1, conversationId: 1, createdAt: 1 }, {}]];
 
-  it('creates a TTL index when none exists on that field', async () => {
-    const deps = makeTtlDeps();
-    await ensureTtlIndexes([spec], deps, () => undefined);
-    expect(deps.createTtlIndex).toHaveBeenCalledWith('messages', 'createdAt', 2_592_000);
-    expect(deps.updateTtlIndexExpiry).not.toHaveBeenCalled();
-  });
+  it('(d) a second run on an unchanged database is a true no-op - the Stage 4 bug reproduced and fixed', async () => {
+    const state: FakeState = { exists: true, indexes: [] };
+    const deps = makeFakeDeps('Message', 'messages', messageSchemaIndexes, state, {
+      field: 'createdAt',
+      expireAfterSeconds: 2_592_000,
+    });
 
-  it('does nothing when a matching TTL index already exists', async () => {
-    const existing: ExistingTtlIndex[] = [{ name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 2_592_000 }];
-    const deps = makeTtlDeps({ listIndexes: vi.fn(async () => existing) });
+    // First run: creates the compound schema index and the TTL index.
+    await ensureCollectionIndexes(deps, () => undefined);
+    expect(deps.calls.created).toEqual(['tenantId_1_conversationId_1_createdAt_1']);
+    expect(deps.calls.ttlCreated).toBe(1);
+    expect(deps.calls.dropped).toEqual([]);
 
-    await ensureTtlIndexes([spec], deps, () => undefined);
-
-    expect(deps.createTtlIndex).not.toHaveBeenCalled();
-    expect(deps.updateTtlIndexExpiry).not.toHaveBeenCalled();
-  });
-
-  it('updates (via collMod) an existing TTL index whose expiry differs from the configured setting, never dropping it', async () => {
-    const existing: ExistingTtlIndex[] = [{ name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 86_400 }];
-    const deps = makeTtlDeps({ listIndexes: vi.fn(async () => existing) });
-
-    await ensureTtlIndexes([spec], deps, () => undefined);
-
-    expect(deps.updateTtlIndexExpiry).toHaveBeenCalledWith('messages', 'createdAt', 2_592_000);
-    expect(deps.createTtlIndex).not.toHaveBeenCalled();
-  });
-
-  it('never confuses a compound index on the same field (no expireAfterSeconds) for a TTL index', async () => {
-    const existing: ExistingTtlIndex[] = [{ name: 'tenantId_1_createdAt_1', key: { tenantId: 1, createdAt: 1 } }];
-    const deps = makeTtlDeps({ listIndexes: vi.fn(async () => existing) });
-
-    await ensureTtlIndexes([spec], deps, () => undefined);
-
-    expect(deps.createTtlIndex).toHaveBeenCalledWith('messages', 'createdAt', 2_592_000);
-  });
-
-  it('--dry-run reports what it would do without calling create or update', async () => {
-    const deps = makeTtlDeps();
+    // Second run against the now-populated state: the TTL index
+    // ("createdAt_1") does not match the compound schema index, so a
+    // blind diff (the old bug) would call it a stray and drop it. It must
+    // not be dropped, and nothing else should happen either.
     const logs: string[] = [];
-    await ensureTtlIndexes([spec], deps, (m) => logs.push(m), true);
+    await ensureCollectionIndexes(deps, (m) => logs.push(m));
 
-    expect(deps.createTtlIndex).not.toHaveBeenCalled();
-    expect(deps.updateTtlIndexExpiry).not.toHaveBeenCalled();
-    expect(logs.some((l) => l.includes('[dry-run]') && l.includes('would create'))).toBe(true);
+    expect(deps.calls.dropped).toEqual([]); // still empty - the TTL index was never dropped
+    expect(deps.calls.created).toHaveLength(1); // unchanged from the first run
+    expect(deps.calls.ttlCreated).toBe(1); // unchanged - not recreated
+    expect(deps.calls.ttlCollMod).toBe(0);
+    expect(logs.some((l) => l.includes('Message: already in sync.'))).toBe(true);
   });
 
-  it('processes multiple specs independently', async () => {
-    const deps = makeTtlDeps();
-    const specs: TtlIndexSpec[] = [
-      spec,
-      { label: 'Conversation', collectionName: 'conversations', field: 'updatedAt', expireAfterSeconds: 2_592_000 },
-    ];
+  it('(b) a changed expireAfterSeconds is applied with collMod only - the TTL index is never dropped or recreated', async () => {
+    const state: FakeState = {
+      exists: true,
+      indexes: [
+        { name: 'tenantId_1_conversationId_1_createdAt_1', key: { tenantId: 1, conversationId: 1, createdAt: 1 } },
+        { name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 86_400 },
+      ],
+    };
+    const deps = makeFakeDeps('Message', 'messages', messageSchemaIndexes, state, {
+      field: 'createdAt',
+      expireAfterSeconds: 2_592_000,
+    });
 
-    await ensureTtlIndexes(specs, deps, () => undefined);
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m));
 
-    expect(deps.createTtlIndex).toHaveBeenCalledWith('messages', 'createdAt', 2_592_000);
-    expect(deps.createTtlIndex).toHaveBeenCalledWith('conversations', 'updatedAt', 2_592_000);
+    expect(deps.calls.dropped).toEqual([]); // never dropped
+    expect(deps.calls.ttlCreated).toBe(0); // never recreated
+    expect(deps.calls.ttlCollMod).toBe(1); // only collMod
+    expect(state.indexes.find((i) => i.name === 'createdAt_1')?.expireAfterSeconds).toBe(2_592_000);
+    expect(logs.some((l) => l.includes('updating the TTL index') && l.includes('collMod'))).toBe(true);
+  });
+
+  it('(d) an unexpected stray index is still reported and dropped, but only in real mode', async () => {
+    const state: FakeState = {
+      exists: true,
+      indexes: [
+        { name: 'tenantId_1_conversationId_1_createdAt_1', key: { tenantId: 1, conversationId: 1, createdAt: 1 } },
+        { name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 2_592_000 },
+        { name: 'old_stray_1', key: { oldField: 1 } },
+      ],
+    };
+    const deps = makeFakeDeps('Message', 'messages', messageSchemaIndexes, state, {
+      field: 'createdAt',
+      expireAfterSeconds: 2_592_000,
+    });
+
+    const dryRunLogs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => dryRunLogs.push(m), true);
+    expect(deps.calls.dropped).toEqual([]);
+    expect(dryRunLogs.some((l) => l.includes('[dry-run] would drop') && l.includes('old_stray_1'))).toBe(true);
+    expect(state.indexes.some((i) => i.name === 'old_stray_1')).toBe(true); // unchanged
+
+    const realLogs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => realLogs.push(m));
+    expect(deps.calls.dropped).toEqual(['old_stray_1']); // dropped, and TTL/schema indexes left alone
+    expect(realLogs.some((l) => l.includes('dropping') && l.includes('old_stray_1'))).toBe(true);
+    expect(state.indexes.some((i) => i.name === 'old_stray_1')).toBe(false);
+    expect(state.indexes.some((i) => i.name === 'createdAt_1')).toBe(true);
+  });
+
+  it('(c) a collection that does not exist yet is reported as such, not "already in sync"', async () => {
+    // Mirrors Tenant: no secondary schema indexes declared at all, so a
+    // blind toCreate/toDrop-only check would be empty even though the
+    // collection itself is missing - this is the exact confusion the old
+    // script had for Tenant.
+    const state: FakeState = { exists: false, indexes: [] };
+    const deps = makeFakeDeps('Tenant', 'tenants', [], state);
+
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m), true);
+
+    expect(logs.some((l) => l.includes('Tenant: collection "tenants" does not exist yet.'))).toBe(true);
+    expect(logs.some((l) => l.includes('[dry-run] would create the collection'))).toBe(true);
+    expect(logs.some((l) => l.includes('already in sync'))).toBe(false);
+  });
+
+  it('(c) reports existing index names and creates the collection in real mode when missing', async () => {
+    const state: FakeState = { exists: false, indexes: [] };
+    const deps = makeFakeDeps('Tenant', 'tenants', [], state);
+
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m));
+
+    expect(state.exists).toBe(true); // createCollection() was actually called
+    expect(logs.some((l) => l.includes('does not exist yet - creating it'))).toBe(true);
+  });
+
+  it('reports "already in sync" (and makes zero calls) for a collection with no TTL and nothing to change', async () => {
+    const state: FakeState = { exists: true, indexes: [{ name: 'hash_1', key: { hash: 1 }, unique: true }] };
+    const deps = makeFakeDeps('ApiKey', 'apiKeys', [[{ hash: 1 }, { unique: true }]], state);
+
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m));
+
+    expect(deps.calls.created).toEqual([]);
+    expect(deps.calls.dropped).toEqual([]);
+    expect(logs.some((l) => l.includes('ApiKey: already in sync.'))).toBe(true);
+  });
+
+  it('--dry-run never mutates state, even with a create, a drop, and a TTL collMod all pending at once', async () => {
+    const state: FakeState = {
+      exists: true,
+      indexes: [
+        { name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 86_400 },
+        { name: 'old_stray_1', key: { oldField: 1 } },
+      ],
+    };
+    const before = JSON.parse(JSON.stringify(state));
+    const deps = makeFakeDeps('Message', 'messages', messageSchemaIndexes, state, {
+      field: 'createdAt',
+      expireAfterSeconds: 2_592_000,
+    });
+
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m), true);
+
+    expect(state).toEqual(before);
+    expect(deps.calls).toEqual({ created: [], dropped: [], ttlCreated: 0, ttlCollMod: 0 });
+    expect(logs.some((l) => l.includes('[dry-run] would create') && l.includes('tenantId_1_conversationId_1_createdAt_1'))).toBe(
+      true,
+    );
+    expect(logs.some((l) => l.includes('[dry-run] would drop') && l.includes('old_stray_1'))).toBe(true);
+    expect(logs.some((l) => l.includes('[dry-run] would update the TTL index') && l.includes('collMod'))).toBe(true);
   });
 });

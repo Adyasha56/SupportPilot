@@ -16,4 +16,10 @@ export class InMemoryTenantRepository implements TenantRepository {
     this.tenants.set(tenantId, tenant);
     return tenant;
   }
+
+  /** Test-only convenience - a real admin console (Milestone 5) would be the only other writer of this field. */
+  setAllowedOrigins(tenantId: string, allowedOrigins: string[]): void {
+    const existing = this.tenants.get(tenantId);
+    this.tenants.set(tenantId, { id: tenantId, name: existing?.name ?? tenantId, allowedOrigins });
+  }
 }

@@ -13,6 +13,8 @@ export interface TenantDocument {
     refundCap?: number;
     approvalThreshold?: number;
     tone?: string;
+    /** Stage 3 - see Tenant.allowedOrigins's own doc comment (db/tenant.repository.ts) for what this is and isn't used for. */
+    allowedOrigins?: string[];
   };
   createdAt: Date;
 }
@@ -25,6 +27,7 @@ export const TenantSchema = new Schema<TenantDocument>(
       refundCap: { type: Number },
       approvalThreshold: { type: Number },
       tone: { type: String },
+      allowedOrigins: { type: [String] },
     },
   },
   { collection: 'tenants', timestamps: { createdAt: true, updatedAt: false } },
