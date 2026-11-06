@@ -5,8 +5,12 @@ import {
   ensureCollectionExists,
   ensureIndexes,
   ensureRegularIndexes,
+  ensureTtlIndexes,
   ExistingSearchIndex,
+  ExistingTtlIndex,
   RegularIndexModel,
+  TtlIndexDeps,
+  TtlIndexSpec,
 } from './db-ensure-indexes';
 import { POLICY_CHUNK_VECTOR_INDEX_DEFINITION, POLICY_CHUNK_VECTOR_INDEX_NAME } from '../db/schemas/policy-chunk.schema';
 
@@ -203,5 +207,77 @@ describe('ensureIndexes', () => {
     });
 
     await expect(ensureIndexes(deps, () => undefined, true)).rejects.toThrow(/does not match/);
+  });
+});
+
+describe('ensureTtlIndexes (Stage 4 amendment E)', () => {
+  function makeTtlDeps(overrides: Partial<TtlIndexDeps> = {}): TtlIndexDeps {
+    return {
+      listIndexes: vi.fn(async () => []),
+      createTtlIndex: vi.fn(async () => undefined),
+      updateTtlIndexExpiry: vi.fn(async () => undefined),
+      ...overrides,
+    };
+  }
+
+  const spec: TtlIndexSpec = { label: 'Message', collectionName: 'messages', field: 'createdAt', expireAfterSeconds: 2_592_000 };
+
+  it('creates a TTL index when none exists on that field', async () => {
+    const deps = makeTtlDeps();
+    await ensureTtlIndexes([spec], deps, () => undefined);
+    expect(deps.createTtlIndex).toHaveBeenCalledWith('messages', 'createdAt', 2_592_000);
+    expect(deps.updateTtlIndexExpiry).not.toHaveBeenCalled();
+  });
+
+  it('does nothing when a matching TTL index already exists', async () => {
+    const existing: ExistingTtlIndex[] = [{ name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 2_592_000 }];
+    const deps = makeTtlDeps({ listIndexes: vi.fn(async () => existing) });
+
+    await ensureTtlIndexes([spec], deps, () => undefined);
+
+    expect(deps.createTtlIndex).not.toHaveBeenCalled();
+    expect(deps.updateTtlIndexExpiry).not.toHaveBeenCalled();
+  });
+
+  it('updates (via collMod) an existing TTL index whose expiry differs from the configured setting, never dropping it', async () => {
+    const existing: ExistingTtlIndex[] = [{ name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 86_400 }];
+    const deps = makeTtlDeps({ listIndexes: vi.fn(async () => existing) });
+
+    await ensureTtlIndexes([spec], deps, () => undefined);
+
+    expect(deps.updateTtlIndexExpiry).toHaveBeenCalledWith('messages', 'createdAt', 2_592_000);
+    expect(deps.createTtlIndex).not.toHaveBeenCalled();
+  });
+
+  it('never confuses a compound index on the same field (no expireAfterSeconds) for a TTL index', async () => {
+    const existing: ExistingTtlIndex[] = [{ name: 'tenantId_1_createdAt_1', key: { tenantId: 1, createdAt: 1 } }];
+    const deps = makeTtlDeps({ listIndexes: vi.fn(async () => existing) });
+
+    await ensureTtlIndexes([spec], deps, () => undefined);
+
+    expect(deps.createTtlIndex).toHaveBeenCalledWith('messages', 'createdAt', 2_592_000);
+  });
+
+  it('--dry-run reports what it would do without calling create or update', async () => {
+    const deps = makeTtlDeps();
+    const logs: string[] = [];
+    await ensureTtlIndexes([spec], deps, (m) => logs.push(m), true);
+
+    expect(deps.createTtlIndex).not.toHaveBeenCalled();
+    expect(deps.updateTtlIndexExpiry).not.toHaveBeenCalled();
+    expect(logs.some((l) => l.includes('[dry-run]') && l.includes('would create'))).toBe(true);
+  });
+
+  it('processes multiple specs independently', async () => {
+    const deps = makeTtlDeps();
+    const specs: TtlIndexSpec[] = [
+      spec,
+      { label: 'Conversation', collectionName: 'conversations', field: 'updatedAt', expireAfterSeconds: 2_592_000 },
+    ];
+
+    await ensureTtlIndexes(specs, deps, () => undefined);
+
+    expect(deps.createTtlIndex).toHaveBeenCalledWith('messages', 'createdAt', 2_592_000);
+    expect(deps.createTtlIndex).toHaveBeenCalledWith('conversations', 'updatedAt', 2_592_000);
   });
 });
