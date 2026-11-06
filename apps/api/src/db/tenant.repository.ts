@@ -6,6 +6,15 @@ import { TenantDocument } from './schemas/tenant.schema';
 export interface Tenant {
   id: string;
   name: string;
+  /**
+   * Stage 3 - the Origin "speed bump" allowlist for this tenant's PUBLIC
+   * (widget) key only (ApiKeyGuard.checkOriginSpeedBump). Undefined or
+   * empty means "not configured" - the check is skipped entirely, never
+   * treated as "nothing is allowed." Never a security boundary (see that
+   * method's own doc comment) - a real admin console (Milestone 5) lets a
+   * tenant admin set this.
+   */
+  allowedOrigins?: string[];
 }
 
 /**
@@ -49,7 +58,14 @@ export class MongooseTenantRepository implements TenantRepository {
 
   async findById(tenantId: string): Promise<Tenant | null> {
     const doc = await this.model.findById(tenantId).lean();
-    return doc ? { id: doc._id, name: doc.name } : null;
+    if (!doc) {
+      return null;
+    }
+    return {
+      id: doc._id,
+      name: doc.name,
+      ...(doc.settings?.allowedOrigins ? { allowedOrigins: doc.settings.allowedOrigins } : {}),
+    };
   }
 
   async upsert(tenantId: string, name: string): Promise<Tenant> {
