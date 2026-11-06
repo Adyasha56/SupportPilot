@@ -90,6 +90,13 @@ export interface RunAgentDeps {
    * single boolean from a combined guard couldn't carry that distinction.
    */
   tenantGenerateBudget?: DailyGenerateBudgetGuard;
+  /**
+   * Stage 5 - an external deadline (chat.service.ts's httpDeadlineMs
+   * backstop) that aborts this run the same way the internal
+   * totalDeadlineMs timer does. Optional so every existing caller/test
+   * that has no outer deadline of its own is unaffected.
+   */
+  abortSignal?: AbortSignal;
 }
 
 export type AgentStepType = 'plan' | 'retrieve' | 'tool' | 'compose' | 'repair' | 'escalation_tool';
@@ -256,6 +263,24 @@ export async function runAgent(input: RunAgentInput, deps: RunAgentDeps): Promis
 
   const deadlineController = new AbortController();
   const deadlineTimer = setTimeout(() => deadlineController.abort(), deps.settings.totalDeadlineMs);
+
+  // Stage 5 - an external signal (chat.service.ts's own httpDeadlineMs
+  // backstop, always configured ABOVE totalDeadlineMs) can abort this run
+  // too, so an abandoned HTTP request actually stops the in-flight
+  // generate() call rather than merely orphaning the promise while it
+  // keeps running unseen. Listener removal matters here, not just
+  // clearTimeout: an AbortSignal with no listeners left attached is safe
+  // to garbage-collect once this run returns - leaving one attached would
+  // keep this whole closure (and deadlineController) alive for as long as
+  // the caller's AbortController outlives this function, for every run.
+  const onExternalAbort = () => deadlineController.abort();
+  if (deps.abortSignal) {
+    if (deps.abortSignal.aborted) {
+      deadlineController.abort();
+    } else {
+      deps.abortSignal.addEventListener('abort', onExternalAbort);
+    }
+  }
 
   const boundary = newBoundary();
   const identityVerified = input.verifiedCustomerRef !== undefined;
@@ -689,6 +714,7 @@ export async function runAgent(input: RunAgentInput, deps: RunAgentDeps): Promis
     return { result: buildResult('escalate', GENERIC_ESCALATE_MESSAGE, guarded.citations, undefined), trace: { steps, llmCallCount } };
   } finally {
     clearTimeout(deadlineTimer);
+    deps.abortSignal?.removeEventListener('abort', onExternalAbort);
   }
 }
 
