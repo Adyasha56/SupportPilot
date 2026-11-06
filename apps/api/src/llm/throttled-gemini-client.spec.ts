@@ -201,27 +201,42 @@ describe('ThrottledClient', () => {
     });
 
     it('aborts mid-backoff instead of sleeping out the full exponential delay - every attempt returns 429', async () => {
-      const innerCall = vi.fn(async (): Promise<EmbedContentResult> => {
-        throw statusError(429);
-      });
-      const client = new ThrottledClient(innerCall, makeSettings({ maxRetries: 10 }));
-      const controller = new AbortController();
+      // backoffDelayMs uses full jitter (Math.random() * cap) by design -
+      // the real, reproduced cause of this test's flake under full-suite
+      // runs. With an unpinned Math.random(), the first backoff (cap=500ms)
+      // has a real ~20% chance of landing at or under the 100ms advance
+      // below, letting a second attempt start before abort() ever runs.
+      // Pinning Math.random() here makes the backoff delay deterministic
+      // (500ms * 0.9 = 450ms, well past the 100ms advance) regardless of
+      // run order or parallelism - the random-jitter BEHAVIOR itself is
+      // exercised by the other tests in this file that use tolerant
+      // assertions (toBeLessThan/toBeGreaterThan) instead of an exact count.
+      const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.9);
+      try {
+        const innerCall = vi.fn(async (): Promise<EmbedContentResult> => {
+          throw statusError(429);
+        });
+        const client = new ThrottledClient(innerCall, makeSettings({ maxRetries: 10 }));
+        const controller = new AbortController();
 
-      const resultPromise = client.call(request, controller.signal);
-      let caught: unknown;
-      resultPromise.catch((err) => {
-        caught = err;
-      });
+        const resultPromise = client.call(request, controller.signal);
+        let caught: unknown;
+        resultPromise.catch((err) => {
+          caught = err;
+        });
 
-      // One real attempt happens, then backoff starts - abort during it,
-      // long before 10 retries' worth of exponential backoff could ever
-      // elapse (which would be tens of seconds).
-      await vi.advanceTimersByTimeAsync(100);
-      controller.abort();
-      await vi.waitFor(() => expect(caught).toBeInstanceOf(ThrottledClientError));
+        // One real attempt happens, then backoff starts - abort during it,
+        // long before 10 retries' worth of exponential backoff could ever
+        // elapse (which would be tens of seconds).
+        await vi.advanceTimersByTimeAsync(100);
+        controller.abort();
+        await vi.waitFor(() => expect(caught).toBeInstanceOf(ThrottledClientError));
 
-      expect((caught as ThrottledClientError).code).toBe('ABORTED');
-      expect(innerCall).toHaveBeenCalledTimes(1); // never reached a 2nd attempt
+        expect((caught as ThrottledClientError).code).toBe('ABORTED');
+        expect(innerCall).toHaveBeenCalledTimes(1); // never reached a 2nd attempt
+      } finally {
+        randomSpy.mockRestore();
+      }
     });
 
     it('aborts while waiting for a rate-limit slot - every attempt would otherwise time out waiting', async () => {
