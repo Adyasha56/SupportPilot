@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  buildIndexPlans,
   CollectionIndexDeps,
   definitionsMatch,
   EnsureIndexDeps,
@@ -405,5 +406,77 @@ describe('ensureCollectionIndexes', () => {
     );
     expect(logs.some((l) => l.includes('[dry-run] would drop') && l.includes('old_stray_1'))).toBe(true);
     expect(logs.some((l) => l.includes('[dry-run] would update the TTL index') && l.includes('collMod'))).toBe(true);
+  });
+
+  it('(index audit c) the "existing indexes" line annotates unique and TTL flags, not just bare names', async () => {
+    const state: FakeState = {
+      exists: true,
+      indexes: [
+        { name: 'tenantId_1_kid_1', key: { tenantId: 1, kid: 1 }, unique: true },
+        { name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 2_592_000 },
+        { name: 'tenantId_1_status_1', key: { tenantId: 1, status: 1 } },
+      ],
+    };
+    const deps = makeFakeDeps(
+      'CustomerPublicKey',
+      'customerPublicKeys',
+      [
+        [{ tenantId: 1, kid: 1 }, { unique: true }],
+        [{ tenantId: 1, status: 1 }, {}],
+      ],
+      state,
+    );
+
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m));
+
+    expect(logs.some((l) => l.includes('existing indexes:') && l.includes('tenantId_1_kid_1 (unique)'))).toBe(true);
+    expect(logs.some((l) => l.includes('existing indexes:') && l.includes('createdAt_1 (TTL 2592000s)'))).toBe(true);
+    // A plain compound index with neither flag gets no parenthetical at all.
+    const existingLine = logs.find((l) => l.includes('existing indexes:'))!;
+    expect(existingLine).toContain('tenantId_1_status_1.'); // bare name, no "(...)" suffix - it's the last item before the trailing period
+  });
+
+  it('(index audit e) demonstrates, via dry-run only, what removing a redundant standalone tenantId_1 would drop - the real schema is NOT changed by this test', async () => {
+    // Models today's REAL deployed state for a collection like Conversation:
+    // a standalone tenantId_1 (from the schema's field-level `index: true`)
+    // plus a compound index that already starts with tenantId. If the
+    // field-level `index: true` were removed from the schema (a change this
+    // test does NOT make to any real schema file), tenantId_1 would no
+    // longer be schema-declared, and a dry run against this same existing
+    // state would report it as a stray to drop - which is exactly what
+    // this test demonstrates and nothing more.
+    const state: FakeState = {
+      exists: true,
+      indexes: [
+        { name: 'tenantId_1', key: { tenantId: 1 } },
+        { name: 'tenantId_1_customerRef_1', key: { tenantId: 1, customerRef: 1 } },
+      ],
+    };
+    // schemaIndexes deliberately omits a standalone { tenantId: 1 } entry -
+    // this is the proposed schema change, expressed only as fake input here.
+    const proposedSchemaIndexes: RegularIndexSpec[] = [[{ tenantId: 1, customerRef: 1 }, {}]];
+    const deps = makeFakeDeps('Conversation', 'conversations', proposedSchemaIndexes, state);
+
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m), true);
+
+    expect(logs.some((l) => l.includes('[dry-run] would drop') && l.includes('tenantId_1'))).toBe(true);
+    expect(deps.calls.dropped).toEqual([]); // dry-run - nothing was actually dropped
+    expect(state.indexes.some((i) => i.name === 'tenantId_1')).toBe(true); // still present - this test changed nothing real
+  });
+});
+
+describe('buildIndexPlans', () => {
+  it('(index audit d) includes PolicyChunk in the regular-index collection plans, alongside its separate vector-search handling', () => {
+    const { collectionPlans } = buildIndexPlans(2_592_000);
+    const labels = collectionPlans.map((plan) => plan.label);
+
+    expect(labels).toContain('PolicyChunk');
+    expect(labels).toEqual(['Tenant', 'ApiKey', 'PolicyChunk', 'PolicyDocument', 'Conversation', 'Message', 'AgentRun', 'CustomerPublicKey']);
+
+    const policyChunkPlan = collectionPlans.find((plan) => plan.label === 'PolicyChunk')!;
+    expect(policyChunkPlan.collectionName).toBe('policyChunks');
+    expect(policyChunkPlan.ttl).toBeUndefined(); // PolicyChunk has no retention TTL - only its regular field-level indexes are managed here
   });
 });
