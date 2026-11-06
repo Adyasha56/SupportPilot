@@ -306,6 +306,20 @@ function describeIndexToCreate([keys, options]: RegularIndexSpec): string {
   return options.unique ? `${name} (unique)` : name;
 }
 
+/**
+ * Per-index detail for the "existing indexes" log line - unique and TTL
+ * expiry are exactly the two properties that distinguish an index from
+ * its bare name, and both are easy to get silently wrong in a schema
+ * (see learning-notes.md's audit of the redundant tenantId_1 indexes and
+ * the unique-flag check this was written for).
+ */
+function describeExistingIndex(idx: ExistingIndexInfo): string {
+  const flags = [idx.unique ? 'unique' : undefined, idx.expireAfterSeconds !== undefined ? `TTL ${idx.expireAfterSeconds}s` : undefined].filter(
+    (flag): flag is string => flag !== undefined,
+  );
+  return flags.length > 0 ? `${idx.name} (${flags.join(', ')})` : idx.name;
+}
+
 type TtlAction = { kind: 'none' } | { kind: 'create' } | { kind: 'collMod'; fromSeconds: number | undefined };
 
 function planTtlAction(
@@ -385,7 +399,7 @@ export async function ensureCollectionIndexes(
   const existingIndexes = exists ? await deps.listIndexes() : [];
   log(
     existingIndexes.length > 0
-      ? `${deps.label}: existing indexes: ${existingIndexes.map((idx) => idx.name).join(', ')}.`
+      ? `${deps.label}: existing indexes: ${existingIndexes.map(describeExistingIndex).join(', ')}.`
       : `${deps.label}: no indexes exist yet.`,
   );
 
@@ -540,6 +554,14 @@ export function buildIndexPlans(expireAfterSeconds: number): {
   const collectionPlans: CollectionIndexDeps[] = [
     makeCollectionDeps('Tenant', tenantModel, 'tenants', expireAfterSeconds),
     makeCollectionDeps('ApiKey', apiKeyModel, 'apiKeys', expireAfterSeconds),
+    // The vector index itself is handled separately below (vectorSearchDeps/
+    // ensureIndexes) - this entry only manages PolicyChunk's three REGULAR
+    // field-level indexes (tenantId, documentId, active), the same way every
+    // other collection's regular indexes are managed. Runs before
+    // ensureIndexes() in main()'s own loop, so on a fresh database this is
+    // what actually creates the policyChunks collection; ensureIndexes()
+    // then finds it already exists.
+    makeCollectionDeps('PolicyChunk', model, 'policyChunks', expireAfterSeconds),
     makeCollectionDeps('PolicyDocument', policyDocumentModel, 'policyDocuments', expireAfterSeconds),
     // Deliberately updatedAt, not createdAt - see the module doc comment above ensureCollectionIndexes.
     makeCollectionDeps('Conversation', conversationModel, 'conversations', expireAfterSeconds, 'updatedAt'),

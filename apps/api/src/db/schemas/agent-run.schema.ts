@@ -1,4 +1,5 @@
 import { Schema, Types } from 'mongoose';
+import { DegradedReasonSchema } from '@supportpilot/shared';
 
 /**
  * Mirrors run-agent.ts's own AgentStepType/ChatOutcomeSchema exactly - kept
@@ -11,6 +12,8 @@ import { Schema, Types } from 'mongoose';
  */
 export const AGENT_STEP_TYPES = ['plan', 'retrieve', 'tool', 'compose', 'repair', 'escalation_tool'] as const;
 export const AGENT_RUN_OUTCOMES = ['reply', 'clarify', 'escalate', 'pending_approval'] as const;
+/** The same four values ChatResultSchema.degraded accepts (@supportpilot/shared) - kept as a plain array via DegradedReasonSchema.options rather than hand-duplicated, so this can never silently drift from the one the chat response actually sends. */
+export const AGENT_RUN_DEGRADED_REASONS = DegradedReasonSchema.options;
 
 export interface AgentStepSubdocument {
   type: (typeof AGENT_STEP_TYPES)[number];
@@ -52,8 +55,8 @@ export interface AgentRunDocument {
   /** The Conversation's own _id (an app-generated string, not an ObjectId - see conversation.schema.ts). */
   conversationId: string;
   outcome: (typeof AGENT_RUN_OUTCOMES)[number];
-  /** Present only for a 'escalate' outcome caused by an infrastructure condition (quota/circuit-open), not a model decision - see ChatResultSchema.degraded. */
-  degraded: 'DAILY_BUDGET_EXCEEDED' | 'TENANT_BUDGET_EXCEEDED' | 'CIRCUIT_OPEN' | null;
+  /** Present only for a 'escalate' outcome caused by an infrastructure condition (quota/circuit-open/model-unavailable), not a model decision - see ChatResultSchema.degraded. */
+  degraded: (typeof AGENT_RUN_DEGRADED_REASONS)[number] | null;
   stepCount: number;
   llmCallCount: number;
   tokensIn: number;
@@ -94,7 +97,7 @@ export const AgentRunSchema = new Schema<AgentRunDocument>(
     tenantId: { type: String, required: true, index: true },
     conversationId: { type: String, required: true },
     outcome: { type: String, required: true, enum: AGENT_RUN_OUTCOMES },
-    degraded: { type: String, enum: ['DAILY_BUDGET_EXCEEDED', 'TENANT_BUDGET_EXCEEDED', 'CIRCUIT_OPEN'], default: null },
+    degraded: { type: String, enum: AGENT_RUN_DEGRADED_REASONS, default: null },
     stepCount: { type: Number, required: true },
     llmCallCount: { type: Number, required: true },
     tokensIn: { type: Number, required: true, default: 0 },

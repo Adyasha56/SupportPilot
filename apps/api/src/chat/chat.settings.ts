@@ -53,6 +53,9 @@ export const ChatSettingsSchema = z.object({
   retentionDays: z.number().int().positive(),
 
   maxActiveCustomerKeysPerTenant: z.number().int().positive(),
+
+  /** Stage 4 item 2 - the per-tenant layer of TenantGenerateBudgetGuard; see daily-generate-budget.ts's own doc comment for why this resets on a UTC calendar day, unlike the global guard's rolling window. */
+  tenantDailyGenerateBudget: z.number().int().positive(),
 });
 export type ChatSettings = z.infer<typeof ChatSettingsSchema>;
 
@@ -91,6 +94,8 @@ export function loadChatSettingsFromEnv(env: NodeJS.ProcessEnv): ChatSettings {
     retentionDays: Number(env.CHAT_RETENTION_DAYS ?? 30),
 
     maxActiveCustomerKeysPerTenant: Number(env.CHAT_MAX_ACTIVE_CUSTOMER_KEYS_PER_TENANT ?? 5),
+
+    tenantDailyGenerateBudget: Number(env.CHAT_TENANT_DAILY_GENERATE_BUDGET ?? 50),
   };
 
   const result = ChatSettingsSchema.safeParse(candidate);

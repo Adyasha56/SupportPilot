@@ -878,6 +878,60 @@ describe('runAgent: TIMEOUT is retried within the remaining deadline, ABORTED ne
   });
 });
 
+// --- Stage 5: an external abortSignal aborts the shared deadline controller too ---
+
+describe('runAgent: external abortSignal (Stage 5)', () => {
+  it('a pre-aborted external signal is reflected in the abortSignal passed to generate()', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { deps, llm } = makeDeps();
+
+    await runAgent(makeInput(), { ...deps, abortSignal: controller.signal });
+
+    expect(llm.calls[0]?.abortSignal?.aborted).toBe(true);
+  });
+
+  it('an external signal that fires mid-run aborts the same signal generate() already received', async () => {
+    const controller = new AbortController();
+    const { deps, llm } = makeDeps({
+      generateQueue: [
+        {
+          ok: false,
+          error: { code: 'ABORTED', message: 'aborted externally' },
+        },
+        composeOutput({ outcome: 'clarify', message: 'ok' }),
+      ],
+    });
+    const realGenerate = deps.llmProvider.generate.bind(deps.llmProvider);
+    deps.llmProvider.generate = async (options) => {
+      controller.abort(); // fires once the plan call is actually in flight
+      return realGenerate(options);
+    };
+
+    await runAgent(makeInput(), { ...deps, abortSignal: controller.signal });
+
+    expect(llm.calls[0]?.abortSignal?.aborted).toBe(true);
+  });
+
+  it('firing the external signal after the run already finished is a harmless no-op (listener cleanup)', async () => {
+    const controller = new AbortController();
+    const { deps } = makeDeps();
+
+    await runAgent(makeInput(), { ...deps, abortSignal: controller.signal });
+
+    expect(() => controller.abort()).not.toThrow();
+  });
+
+  it('omitting abortSignal entirely behaves exactly as before (no external deadline at all)', async () => {
+    const { deps, llm } = makeDeps({ generateQueue: [planOutput({ toolRequests: [] }), composeOutput({ outcome: 'clarify', message: 'which order?' })] });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(llm.calls[0]?.abortSignal?.aborted).toBe(false);
+    expect(result.outcome).toBe('clarify');
+  });
+});
+
 describe('runAgent: generateThinkingLevel is forwarded from settings (Stage 4 finding C)', () => {
   it('passes settings.generateThinkingLevel through to every generate() call', async () => {
     const { deps, llm } = makeDeps({ settings: makeSettings({ generateThinkingLevel: 'minimal' }) });

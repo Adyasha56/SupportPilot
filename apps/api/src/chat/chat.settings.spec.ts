@@ -19,6 +19,7 @@ describe('loadChatSettingsFromEnv', () => {
     expect(settings.httpDeadlineMs).toBeGreaterThan(0);
     expect(settings.retentionDays).toBeGreaterThan(0);
     expect(settings.maxActiveCustomerKeysPerTenant).toBeGreaterThan(0);
+    expect(settings.tenantDailyGenerateBudget).toBeGreaterThan(0);
   });
 
   it('the default conversation lock TTL and HTTP deadline both stay above the documented 30s agent run deadline', () => {
@@ -56,6 +57,7 @@ describe('loadChatSettingsFromEnv', () => {
       CHAT_HTTP_DEADLINE_MS: '40000',
       CHAT_RETENTION_DAYS: '14',
       CHAT_MAX_ACTIVE_CUSTOMER_KEYS_PER_TENANT: '3',
+      CHAT_TENANT_DAILY_GENERATE_BUDGET: '25',
     });
 
     expect(settings).toEqual({
@@ -83,6 +85,7 @@ describe('loadChatSettingsFromEnv', () => {
       httpDeadlineMs: 40000,
       retentionDays: 14,
       maxActiveCustomerKeysPerTenant: 3,
+      tenantDailyGenerateBudget: 25,
     });
   });
 
