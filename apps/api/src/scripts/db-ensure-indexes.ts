@@ -36,6 +36,10 @@ import {
 import { ApiKeySchema } from '../db/schemas/api-key.schema';
 import { TenantSchema } from '../db/schemas/tenant.schema';
 import { PolicyDocumentSchema } from '../db/schemas/policy-document.schema';
+import { ConversationSchema } from '../db/schemas/conversation.schema';
+import { MessageSchema } from '../db/schemas/message.schema';
+import { AgentRunSchema } from '../db/schemas/agent-run.schema';
+import { CustomerPublicKeySchema } from '../db/schemas/customer-public-key.schema';
 
 export const COLLECTION_NAME = 'policyChunks';
 export const POLL_INTERVAL_MS = 10_000;
@@ -239,6 +243,91 @@ export async function ensureIndexes(deps: EnsureIndexDeps, log: (message: string
   await waitUntilQueryable(deps, POLICY_CHUNK_VECTOR_INDEX_NAME, QUERYABLE_TIMEOUT_MS, log);
 }
 
+/**
+ * Stage 4 amendment E - retention via TTL indexes on Message, AgentRun, and
+ * Conversation, with a CONFIGURABLE retention period (CHAT_RETENTION_DAYS,
+ * default 30) - this is why TTL indexes are managed here, as their own
+ * category, rather than baked into a schema's own `.index()` call the way
+ * every other regular index in this file is: `expireAfterSeconds` needs to
+ * be a runtime value read from env, not a number compiled into the schema,
+ * and MongoDB lets an EXISTING TTL index's expiry be changed in place via
+ * `collMod` (no drop+recreate needed) specifically so changing the setting
+ * doesn't require a disruptive reindex.
+ *
+ * Message and AgentRun only ever have `createdAt` (no `updatedAt` -
+ * confirmed in their own schemas) - TTL there is the only sensible choice.
+ * Conversation has both; TTL is deliberately on `updatedAt`, not
+ * `createdAt` - a conversation that's still being actively used keeps
+ * bumping `updatedAt` (every incrementMessageCount call), so an active
+ * conversation's retention clock keeps resetting and only a genuinely
+ * abandoned one expires 30 days after its LAST activity, not its first.
+ *
+ * TTL indexes are ordinary MongoDB indexes (created via the same
+ * createIndex/collMod the driver uses for any index), not an Atlas
+ * Search/Vector Search index - they do NOT count against the M0 cluster's
+ * 3-Search-index cap, the same distinction policy-document.schema.ts's own
+ * comment already draws for its own plain (non-Search) indexes.
+ */
+export interface TtlIndexSpec {
+  /** For logging only. */
+  label: string;
+  collectionName: string;
+  field: string;
+  expireAfterSeconds: number;
+}
+
+export interface ExistingTtlIndex {
+  name: string;
+  key: Record<string, number>;
+  expireAfterSeconds?: number;
+}
+
+export interface TtlIndexDeps {
+  listIndexes(collectionName: string): Promise<ExistingTtlIndex[]>;
+  createTtlIndex(collectionName: string, field: string, expireAfterSeconds: number): Promise<void>;
+  /** Changes an EXISTING TTL index's expiry via collMod - never drops/recreates the index. */
+  updateTtlIndexExpiry(collectionName: string, field: string, expireAfterSeconds: number): Promise<void>;
+}
+
+function findSingleFieldTtlIndex(indexes: ExistingTtlIndex[], field: string): ExistingTtlIndex | undefined {
+  return indexes.find(
+    (idx) => idx.expireAfterSeconds !== undefined && Object.keys(idx.key).length === 1 && idx.key[field] === 1,
+  );
+}
+
+export async function ensureTtlIndexes(
+  specs: TtlIndexSpec[],
+  deps: TtlIndexDeps,
+  log: (message: string) => void,
+  dryRun = false,
+): Promise<void> {
+  for (const spec of specs) {
+    const existing = findSingleFieldTtlIndex(await deps.listIndexes(spec.collectionName), spec.field);
+
+    if (!existing) {
+      if (dryRun) {
+        log(`[dry-run] ${spec.label}: would create a TTL index on "${spec.field}" (expireAfterSeconds=${spec.expireAfterSeconds}).`);
+        continue;
+      }
+      log(`${spec.label}: creating a TTL index on "${spec.field}" (expireAfterSeconds=${spec.expireAfterSeconds}).`);
+      await deps.createTtlIndex(spec.collectionName, spec.field, spec.expireAfterSeconds);
+      continue;
+    }
+
+    if (existing.expireAfterSeconds !== spec.expireAfterSeconds) {
+      if (dryRun) {
+        log(`[dry-run] ${spec.label}: would update the TTL index on "${spec.field}" from ${existing.expireAfterSeconds}s to ${spec.expireAfterSeconds}s.`);
+        continue;
+      }
+      log(`${spec.label}: updating the TTL index on "${spec.field}" from ${existing.expireAfterSeconds}s to ${spec.expireAfterSeconds}s.`);
+      await deps.updateTtlIndexExpiry(spec.collectionName, spec.field, spec.expireAfterSeconds);
+      continue;
+    }
+
+    log(`${spec.label}: TTL index on "${spec.field}" already matches (expireAfterSeconds=${spec.expireAfterSeconds}).`);
+  }
+}
+
 async function main(): Promise<void> {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
@@ -268,6 +357,10 @@ async function main(): Promise<void> {
   const tenantModel = mongoose.model('Tenant', TenantSchema);
   const apiKeyModel = mongoose.model('ApiKey', ApiKeySchema);
   const policyDocumentModel = mongoose.model('PolicyDocument', PolicyDocumentSchema);
+  const conversationModel = mongoose.model('Conversation', ConversationSchema);
+  const messageModel = mongoose.model('Message', MessageSchema);
+  const agentRunModel = mongoose.model('AgentRun', AgentRunSchema);
+  const customerPublicKeyModel = mongoose.model('CustomerPublicKey', CustomerPublicKeySchema);
 
   const regularIndexModels: RegularIndexModel[] = [
     { name: 'Tenant', diffIndexes: () => tenantModel.diffIndexes(), syncIndexes: () => tenantModel.syncIndexes() },
@@ -278,6 +371,18 @@ async function main(): Promise<void> {
       syncIndexes: () => policyDocumentModel.syncIndexes(),
     },
     { name: 'PolicyChunk', diffIndexes: () => model.diffIndexes(), syncIndexes: () => model.syncIndexes() },
+    {
+      name: 'Conversation',
+      diffIndexes: () => conversationModel.diffIndexes(),
+      syncIndexes: () => conversationModel.syncIndexes(),
+    },
+    { name: 'Message', diffIndexes: () => messageModel.diffIndexes(), syncIndexes: () => messageModel.syncIndexes() },
+    { name: 'AgentRun', diffIndexes: () => agentRunModel.diffIndexes(), syncIndexes: () => agentRunModel.syncIndexes() },
+    {
+      name: 'CustomerPublicKey',
+      diffIndexes: () => customerPublicKeyModel.diffIndexes(),
+      syncIndexes: () => customerPublicKeyModel.syncIndexes(),
+    },
   ];
 
   const deps: EnsureIndexDeps = {
@@ -293,9 +398,30 @@ async function main(): Promise<void> {
       model.createSearchIndex(description as unknown as Parameters<typeof model.createSearchIndex>[0]),
   };
 
+  const retentionDays = Number(process.env.CHAT_RETENTION_DAYS ?? 30);
+  const expireAfterSeconds = retentionDays * 24 * 60 * 60;
+  const ttlSpecs: TtlIndexSpec[] = [
+    { label: 'Message', collectionName: 'messages', field: 'createdAt', expireAfterSeconds },
+    { label: 'AgentRun', collectionName: 'agentRuns', field: 'createdAt', expireAfterSeconds },
+    // Deliberately updatedAt, not createdAt - see ensureTtlIndexes's own doc comment.
+    { label: 'Conversation', collectionName: 'conversations', field: 'updatedAt', expireAfterSeconds },
+  ];
+  const ttlDeps: TtlIndexDeps = {
+    listIndexes: async (collectionName) =>
+      (await mongoose.connection.db!.collection(collectionName).indexes()) as unknown as ExistingTtlIndex[],
+    createTtlIndex: async (collectionName, field, seconds) => {
+      await mongoose.connection.db!.collection(collectionName).createIndex({ [field]: 1 }, { expireAfterSeconds: seconds });
+    },
+    updateTtlIndexExpiry: async (collectionName, field, seconds) => {
+      await mongoose.connection.db!.command({ collMod: collectionName, index: { keyPattern: { [field]: 1 }, expireAfterSeconds: seconds } });
+    },
+  };
+
   try {
     await ensureRegularIndexes(regularIndexModels, (message) => console.log(message), { dryRun });
     await ensureIndexes(deps, (message) => console.log(message), dryRun);
+    console.log(`Retention: ${retentionDays} day(s) (CHAT_RETENTION_DAYS) - expireAfterSeconds=${expireAfterSeconds}.`);
+    await ensureTtlIndexes(ttlSpecs, ttlDeps, (message) => console.log(message), dryRun);
   } finally {
     await mongoose.disconnect();
   }

@@ -4,11 +4,19 @@ import { TenantSchema } from './schemas/tenant.schema';
 import { PolicyDocumentSchema } from './schemas/policy-document.schema';
 import { PolicyChunkSchema } from './schemas/policy-chunk.schema';
 import { ApiKeySchema } from './schemas/api-key.schema';
+import { ConversationSchema } from './schemas/conversation.schema';
+import { MessageSchema } from './schemas/message.schema';
+import { AgentRunSchema } from './schemas/agent-run.schema';
+import { CustomerPublicKeySchema } from './schemas/customer-public-key.schema';
 import { MongooseTenantRepository, TENANT_REPOSITORY } from './tenant.repository';
 import { MongooseApiKeyRepository, API_KEY_REPOSITORY } from './api-key.repository';
 import { MongoosePolicyDocumentRepository, POLICY_DOCUMENT_REPOSITORY } from './policy-document.repository';
 import { MongoosePolicyChunkRepository, POLICY_CHUNK_REPOSITORY } from './policy-chunk.repository';
 import { MongooseTransactionRunner, TRANSACTION_RUNNER } from './transaction-runner';
+import { MongooseConversationRepository, CONVERSATION_REPOSITORY } from './conversation.repository';
+import { MongooseMessageRepository, MESSAGE_REPOSITORY } from './message.repository';
+import { MongooseAgentRunRepository, AGENT_RUN_REPOSITORY } from './agent-run.repository';
+import { MongooseCustomerPublicKeyRepository, CUSTOMER_PUBLIC_KEY_REPOSITORY } from './customer-public-key.repository';
 
 const repositoryProviders: Provider[] = [
   { provide: TENANT_REPOSITORY, useClass: MongooseTenantRepository },
@@ -16,6 +24,10 @@ const repositoryProviders: Provider[] = [
   { provide: POLICY_DOCUMENT_REPOSITORY, useClass: MongoosePolicyDocumentRepository },
   { provide: POLICY_CHUNK_REPOSITORY, useClass: MongoosePolicyChunkRepository },
   { provide: TRANSACTION_RUNNER, useClass: MongooseTransactionRunner },
+  { provide: CONVERSATION_REPOSITORY, useClass: MongooseConversationRepository },
+  { provide: MESSAGE_REPOSITORY, useClass: MongooseMessageRepository },
+  { provide: AGENT_RUN_REPOSITORY, useClass: MongooseAgentRunRepository },
+  { provide: CUSTOMER_PUBLIC_KEY_REPOSITORY, useClass: MongooseCustomerPublicKeyRepository },
 ];
 
 /**
@@ -49,6 +61,10 @@ const repositoryProviders: Provider[] = [
       { name: 'PolicyDocument', schema: PolicyDocumentSchema },
       { name: 'PolicyChunk', schema: PolicyChunkSchema },
       { name: 'ApiKey', schema: ApiKeySchema },
+      { name: 'Conversation', schema: ConversationSchema },
+      { name: 'Message', schema: MessageSchema },
+      { name: 'AgentRun', schema: AgentRunSchema },
+      { name: 'CustomerPublicKey', schema: CustomerPublicKeySchema },
     ]),
   ],
   providers: repositoryProviders,
@@ -59,6 +75,10 @@ const repositoryProviders: Provider[] = [
     POLICY_DOCUMENT_REPOSITORY,
     POLICY_CHUNK_REPOSITORY,
     TRANSACTION_RUNNER,
+    CONVERSATION_REPOSITORY,
+    MESSAGE_REPOSITORY,
+    AGENT_RUN_REPOSITORY,
+    CUSTOMER_PUBLIC_KEY_REPOSITORY,
   ],
 })
 export class DatabaseModule {}

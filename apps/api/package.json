@@ -16,6 +16,7 @@
     "test:integration": "vitest run --config vitest.integration.config.mts",
     "db:ensure-indexes": "node --env-file-if-exists=.env dist/scripts/db-ensure-indexes.js",
     "create-api-key": "node --env-file-if-exists=.env dist/scripts/create-api-key.js",
+    "register-customer-key": "node --env-file-if-exists=.env dist/scripts/register-customer-key.js",
     "delete-scratch-tenant": "node --env-file-if-exists=.env dist/scripts/delete-scratch-tenant.js",
     "embedding-smoke-test": "node --env-file-if-exists=.env dist-dev/dev-scripts/embedding-smoke-test.js",
     "check-transactions": "node --env-file-if-exists=.env dist-dev/dev-scripts/check-transactions.js",
