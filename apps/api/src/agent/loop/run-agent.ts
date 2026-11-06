@@ -2,6 +2,7 @@ import {
   ChatResult,
   ComposeOutput,
   ComposeOutputSchema,
+  DegradedReason,
   GetOrderOutput,
   MAX_CHAT_MESSAGE_LENGTH,
   PlannerOutput,
@@ -76,6 +77,19 @@ export interface RunAgentDeps {
   settings: RunAgentSettings;
   /** Checked before every real generate() attempt (plan, repair, compose) - see Stage 4 finding 7 and daily-generate-budget.ts's own doc comment. */
   dailyGenerateBudget: DailyGenerateBudgetGuard;
+  /**
+   * Stage 4 item 2 - the per-tenant layer, checked BEFORE dailyGenerateBudget
+   * (the shared, cross-tenant layer) on every real generate() attempt.
+   * Optional so every existing test/caller that only cares about the
+   * global guard keeps working unchanged - omitting it simply means "no
+   * per-tenant limit is enforced," never a denial. Kept as a separate
+   * dependency (rather than folding both layers into one opaque
+   * TenantAndGlobalGenerateBudgetGuard call) specifically so runAgent can
+   * tell which layer denied a call and report a distinct
+   * TENANT_BUDGET_EXCEEDED vs DAILY_BUDGET_EXCEEDED degraded reason - a
+   * single boolean from a combined guard couldn't carry that distinction.
+   */
+  tenantGenerateBudget?: DailyGenerateBudgetGuard;
 }
 
 export type AgentStepType = 'plan' | 'retrieve' | 'tool' | 'compose' | 'repair' | 'escalation_tool';
@@ -106,6 +120,8 @@ export interface RunAgentResult {
 const GENERIC_ESCALATE_MESSAGE = "I'm not able to help with this directly, so I've flagged it for a team member to follow up with you.";
 /** Stage 4 finding 7 - distinct from the generic escalate message above, so this cause stays distinguishable to anyone reading the chat, not just the trace/logs. */
 const DAILY_BUDGET_MESSAGE = "Our automated assistant has reached its demo usage limit for today. I've flagged this for a team member to follow up with you.";
+/** Stage 4 item 2 - distinct from DAILY_BUDGET_MESSAGE above: this tenant's own allowance is spent, not the shared cross-tenant pool. */
+const TENANT_BUDGET_MESSAGE = "Our automated assistant has reached its usage limit for your account today. I've flagged this for a team member to follow up with you.";
 /** Stage 4 finding 3 - distinct from both messages above: the circuit breaker, not the daily budget, decided no real call should be attempted right now. runAgent must still reach this message in well under a second, since beforeCall()'s rejection never touches the network. */
 const CIRCUIT_OPEN_MESSAGE = "Our automated assistant is temporarily unavailable. I've flagged this for a team member to follow up with you shortly.";
 /**
@@ -127,13 +143,40 @@ export type EscalationReasonCode =
   | 'REFUND_PROPOSAL_REJECTED'
   /** Stage 4 finding 4 - compose said `reply` with no citation and no successful tool result behind it: an assertion with nothing supporting it, never passed through as-is. */
   | 'REPLY_NOT_GROUNDED'
-  /** Stage 4 finding 7 - the daily generate budget guard denied this attempt before any real Gemini call was made. */
+  /** Stage 4 finding 7 - the daily generate budget guard (the shared, cross-tenant layer) denied this attempt before any real Gemini call was made. */
   | 'DAILY_BUDGET_EXCEEDED'
+  /** Stage 4 item 2 - this tenant's own per-tenant budget guard denied this attempt before any real Gemini call was made, and before the shared layer was even checked. */
+  | 'TENANT_BUDGET_EXCEEDED'
   /** Stage 4 finding 3 - the provider's circuit breaker rejected this attempt before any real Gemini call was made. */
   | 'CIRCUIT_OPEN';
 
-/** GenerateErrorCode plus one purely local code for a request callStructured's own attempt() never sent to the real provider at all - see Stage 4 finding 7. */
-type AttemptErrorCode = GenerateErrorCode | 'DAILY_BUDGET_EXCEEDED';
+/** GenerateErrorCode plus two purely local codes for a request callStructured's own attempt() never sent to the real provider at all - see Stage 4 findings 7 and item 2. */
+type AttemptErrorCode = GenerateErrorCode | 'DAILY_BUDGET_EXCEEDED' | 'TENANT_BUDGET_EXCEEDED';
+
+/**
+ * Stage 4 item 3 - maps an EscalationReasonCode to the `degraded` value
+ * ChatResultSchema exposes, or undefined for an ordinary business-reason
+ * escalation (no usage/availability cause, nothing to report beyond the
+ * outcome itself). LLM_UNAVAILABLE deliberately covers every other
+ * generate()-related reason (PLAN_LLM_ERROR/COMPOSE_LLM_ERROR's own default
+ * branch - timeout after retries exhausted, rate-limited, unauthorized,
+ * not configured, ABORTED - and INVALID_STRUCTURED_OUTPUT, invalid output
+ * surviving one repair attempt) per PROJECT.md's Stage 4 amendment D.
+ */
+function degradedReasonFor(reasonCode: EscalationReasonCode): DegradedReason | undefined {
+  switch (reasonCode) {
+    case 'DAILY_BUDGET_EXCEEDED':
+    case 'TENANT_BUDGET_EXCEEDED':
+    case 'CIRCUIT_OPEN':
+      return reasonCode;
+    case 'PLAN_LLM_ERROR':
+    case 'COMPOSE_LLM_ERROR':
+    case 'INVALID_STRUCTURED_OUTPUT':
+      return 'LLM_UNAVAILABLE';
+    default:
+      return undefined;
+  }
+}
 
 interface OrderFacts {
   status: string;
@@ -251,7 +294,13 @@ export async function runAgent(input: RunAgentInput, deps: RunAgentDeps): Promis
     // trace/log above, for operator visibility.
   }
 
-  function buildResult(outcome: ChatResult['outcome'], message: string, citations: ChatResult['citations'], proposedAction: ChatResult['proposedAction']): ChatResult {
+  function buildResult(
+    outcome: ChatResult['outcome'],
+    message: string,
+    citations: ChatResult['citations'],
+    proposedAction: ChatResult['proposedAction'],
+    degraded?: DegradedReason,
+  ): ChatResult {
     return {
       conversationId: input.conversationId,
       runId: input.runId,
@@ -259,13 +308,14 @@ export async function runAgent(input: RunAgentInput, deps: RunAgentDeps): Promis
       message,
       citations,
       ...(proposedAction ? { proposedAction } : {}),
+      ...(degraded ? { degraded } : {}),
     };
   }
 
   async function forcedEscalate(reasonCode: EscalationReasonCode, orderId: string | undefined, message: string = GENERIC_ESCALATE_MESSAGE): Promise<RunAgentResult> {
     await callEscalationTool(reasonCode, orderId);
     logFinal('escalate', { reasonCode });
-    return { result: buildResult('escalate', message, [], undefined), trace: { steps, llmCallCount } };
+    return { result: buildResult('escalate', message, [], undefined, degradedReasonFor(reasonCode)), trace: { steps, llmCallCount } };
   }
 
   type StructuredOutcome<T> = { kind: 'ok'; data: T } | { kind: 'llm_error'; code: AttemptErrorCode } | { kind: 'invalid_output' };
@@ -294,10 +344,23 @@ export async function runAgent(input: RunAgentInput, deps: RunAgentDeps): Promis
           };
         }
 
-        if (!deps.dailyGenerateBudget.tryConsume()) {
-          // Stage 4 finding 7 - the budget is exhausted BEFORE any real
-          // provider call is made; llmCallCount is deliberately not
-          // incremented, since no real Gemini call happened.
+        // Stage 4 item 2 - tenant layer checked FIRST, and only when it
+        // allows the call does the (shared, cross-tenant) global layer get
+        // checked at all. Both denials are reported before any real
+        // provider call is made; llmCallCount is deliberately not
+        // incremented for either, since no real Gemini call happened.
+        if (deps.tenantGenerateBudget && !deps.tenantGenerateBudget.tryConsume(input.tenantId)) {
+          return {
+            outcome: { ok: false as const, error: { code: 'TENANT_BUDGET_EXCEEDED' as const, message: 'Tenant daily generate budget exhausted.', attempts: undefined as number | undefined } },
+            durationMs: totalDurationMs,
+          };
+        }
+
+        if (!deps.dailyGenerateBudget.tryConsume(input.tenantId)) {
+          // Stage 4 item 2 - the global layer denied it, so the tenant
+          // ticket this attempt already spent is refunded: the tenant
+          // never actually got to use its allowance this call.
+          deps.tenantGenerateBudget?.release(input.tenantId);
           return {
             outcome: { ok: false as const, error: { code: 'DAILY_BUDGET_EXCEEDED' as const, message: 'Daily generate budget exhausted.', attempts: undefined as number | undefined } },
             durationMs: totalDurationMs,
@@ -324,8 +387,10 @@ export async function runAgent(input: RunAgentInput, deps: RunAgentDeps): Promis
           // above both get undone here, and this is never retried (there
           // is nothing to retry - the breaker rejected before any network
           // call). Falls straight through to forcedEscalate below via the
-          // normal llm_error path.
-          deps.dailyGenerateBudget.release();
+          // normal llm_error path. Both layers are released - both were
+          // genuinely consumed to reach this point.
+          deps.dailyGenerateBudget.release(input.tenantId);
+          deps.tenantGenerateBudget?.release(input.tenantId);
           llmCallCount -= 1;
           return { outcome, durationMs: totalDurationMs };
         }
@@ -375,6 +440,9 @@ export async function runAgent(input: RunAgentInput, deps: RunAgentDeps): Promis
 
   /** Both LLM-error branches (plan and compose) route a budget denial to its own distinct escalate message - everything else keeps its existing reasonCode/message. */
   async function escalateForLlmError(code: AttemptErrorCode, llmErrorReasonCode: EscalationReasonCode): Promise<RunAgentResult> {
+    if (code === 'TENANT_BUDGET_EXCEEDED') {
+      return await forcedEscalate('TENANT_BUDGET_EXCEEDED', undefined, TENANT_BUDGET_MESSAGE);
+    }
     if (code === 'DAILY_BUDGET_EXCEEDED') {
       return await forcedEscalate('DAILY_BUDGET_EXCEEDED', undefined, DAILY_BUDGET_MESSAGE);
     }

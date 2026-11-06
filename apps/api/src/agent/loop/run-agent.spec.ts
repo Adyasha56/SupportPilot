@@ -111,6 +111,7 @@ interface TestDepsOverrides {
   clock?: () => Date;
   settings?: RunAgentSettings;
   dailyGenerateBudget?: DailyGenerateBudgetGuard;
+  tenantGenerateBudget?: DailyGenerateBudgetGuard;
 }
 
 /** Always allows - most tests don't care about the budget at all; see the dedicated describe block below for tests that do. */
@@ -131,6 +132,7 @@ function makeDeps(overrides: TestDepsOverrides = {}): { deps: RunAgentDeps; llm:
     logEvent: (event) => logs.push(event),
     settings: overrides.settings ?? makeSettings(),
     dailyGenerateBudget: overrides.dailyGenerateBudget ?? alwaysAllowBudget(),
+    ...(overrides.tenantGenerateBudget ? { tenantGenerateBudget: overrides.tenantGenerateBudget } : {}),
   };
   return { deps, llm, logs };
 }
@@ -921,6 +923,154 @@ describe('runAgent: the global daily generate budget guard (Stage 4 finding 7)',
     expect(result.outcome).toBe('escalate');
     expect(result.message).toBe("Our automated assistant has reached its demo usage limit for today. I've flagged this for a team member to follow up with you.");
     expect(llm.calls).toHaveLength(1); // only the plan call was ever made for real
+  });
+
+  it('sets degraded: DAILY_BUDGET_EXCEEDED on the result', async () => {
+    const { deps } = makeDeps({ dailyGenerateBudget: { tryConsume: () => false, release: () => {} } });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.degraded).toBe('DAILY_BUDGET_EXCEEDED');
+  });
+});
+
+// --- Stage 4 item 2: the per-tenant daily generate budget guard ------------
+
+describe('runAgent: the per-tenant daily generate budget guard (Stage 4 item 2)', () => {
+  it('is checked BEFORE the global guard, with its own distinct message, when tenantGenerateBudget is provided', async () => {
+    const { deps, llm } = makeDeps({ tenantGenerateBudget: { tryConsume: () => false, release: () => {} } });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(result.message).toBe("Our automated assistant has reached its usage limit for your account today. I've flagged this for a team member to follow up with you.");
+    expect(result.degraded).toBe('TENANT_BUDGET_EXCEEDED');
+    expect(llm.calls).toHaveLength(0);
+  });
+
+  it('a tenant-layer denial never even calls the global guard', async () => {
+    let globalConsumeCalls = 0;
+    const { deps } = makeDeps({
+      tenantGenerateBudget: { tryConsume: () => false, release: () => {} },
+      dailyGenerateBudget: { tryConsume: () => { globalConsumeCalls += 1; return true; }, release: () => {} },
+    });
+
+    await runAgent(makeInput(), deps);
+
+    expect(globalConsumeCalls).toBe(0);
+  });
+
+  it('when the tenant layer allows it but the global layer denies it, the tenant ticket is refunded', async () => {
+    let tenantConsumed = 0;
+    let tenantReleased = 0;
+    const tenantGuard: DailyGenerateBudgetGuard = {
+      tryConsume: () => {
+        tenantConsumed += 1;
+        return true;
+      },
+      release: () => {
+        tenantReleased += 1;
+      },
+    };
+    const { deps } = makeDeps({ tenantGenerateBudget: tenantGuard, dailyGenerateBudget: { tryConsume: () => false, release: () => {} } });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.degraded).toBe('DAILY_BUDGET_EXCEEDED'); // the global layer is what actually denied it
+    expect(tenantConsumed).toBe(1);
+    expect(tenantReleased).toBe(1); // refunded - the tenant never got to use this ticket
+  });
+
+  it('omitting tenantGenerateBudget enforces no per-tenant limit at all - only the global guard applies', async () => {
+    const { deps, llm } = makeDeps({ generateQueue: [planOutput({ toolRequests: [] }), composeOutput({ outcome: 'clarify', message: 'which order?' })] }); // no tenantGenerateBudget override
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('clarify');
+    expect(llm.calls.length).toBeGreaterThan(0);
+  });
+
+  it('CIRCUIT_OPEN releases both the tenant and global tickets it pre-consumed', async () => {
+    let tenantReleased = 0;
+    let globalReleased = 0;
+    const tenantGuard: DailyGenerateBudgetGuard = { tryConsume: () => true, release: () => { tenantReleased += 1; } };
+    const globalGuard: DailyGenerateBudgetGuard = { tryConsume: () => true, release: () => { globalReleased += 1; } };
+    const { deps } = makeDeps({
+      generateQueue: [{ ok: false, error: { code: 'CIRCUIT_OPEN', message: 'breaker open' } }],
+      tenantGenerateBudget: tenantGuard,
+      dailyGenerateBudget: globalGuard,
+    });
+
+    await runAgent(makeInput(), deps);
+
+    expect(tenantReleased).toBe(1);
+    expect(globalReleased).toBe(1);
+  });
+});
+
+// --- Stage 4 item 3: the degraded field ------------------------------------
+
+describe('runAgent: the degraded field on ChatResult (Stage 4 item 3)', () => {
+  it('CIRCUIT_OPEN maps to degraded: CIRCUIT_OPEN', async () => {
+    const { deps } = makeDeps({ generateQueue: [{ ok: false, error: { code: 'CIRCUIT_OPEN', message: 'breaker open' } }] });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.degraded).toBe('CIRCUIT_OPEN');
+  });
+
+  it.each(['RATE_LIMITED', 'UNAUTHORIZED', 'NOT_CONFIGURED', 'TRANSIENT', 'UNAVAILABLE'] as const)(
+    'a generate() failure (%s) that reaches escalate maps to degraded: LLM_UNAVAILABLE',
+    async (code) => {
+      const { deps } = makeDeps({ generateQueue: [{ ok: false, error: { code, message: 'x' } }] });
+
+      const { result } = await runAgent(makeInput(), deps);
+
+      expect(result.outcome).toBe('escalate');
+      expect(result.degraded).toBe('LLM_UNAVAILABLE');
+    },
+  );
+
+  it('a TIMEOUT that exhausts all retries maps to degraded: LLM_UNAVAILABLE', async () => {
+    const { deps } = makeDeps({
+      generateQueue: [
+        { ok: false, error: { code: 'TIMEOUT', message: 'slow' } },
+        { ok: false, error: { code: 'TIMEOUT', message: 'slow' } },
+        { ok: false, error: { code: 'TIMEOUT', message: 'slow' } },
+      ],
+      settings: makeSettings({ timeoutMaxRetries: 2 }),
+    });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(result.degraded).toBe('LLM_UNAVAILABLE');
+  });
+
+  it('invalid structured output surviving one repair attempt maps to degraded: LLM_UNAVAILABLE', async () => {
+    const { deps } = makeDeps({ generateQueue: [{ ok: true, result: { text: 'not json', usage: { inputTokens: 1, outputTokens: 1 } } }, { ok: true, result: { text: 'still not json', usage: { inputTokens: 1, outputTokens: 1 } } }] });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(result.degraded).toBe('LLM_UNAVAILABLE');
+  });
+
+  it('an ordinary business-reason escalation (the model itself requested it) carries no degraded field at all', async () => {
+    const { deps } = makeDeps({ generateQueue: [planOutput({ toolRequests: [] }), composeOutput({ outcome: 'escalate', message: 'handing off' })] });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.outcome).toBe('escalate');
+    expect(result.degraded).toBeUndefined();
+  });
+
+  it('a successful, non-escalate outcome carries no degraded field', async () => {
+    const { deps } = makeDeps({ generateQueue: [planOutput({ toolRequests: [] }), composeOutput({ outcome: 'clarify', message: 'which order?' })] });
+
+    const { result } = await runAgent(makeInput(), deps);
+
+    expect(result.degraded).toBeUndefined();
   });
 });
 
