@@ -369,6 +369,24 @@ describe('ChatService.handle - anonymous callers get no order tools', () => {
   });
 });
 
+describe('ChatService.handle - a customerRef in a public request body is ignored end to end', () => {
+  it('a public-scope request with a customerRef in the body is treated as fully anonymous - the stored conversation has customerRef: null, not the provided value', async () => {
+    const conversationRepository = new InMemoryConversationRepository();
+    const { service } = makeService({ conversationRepository });
+
+    const result = await service.handle({
+      tenantId: 'acme',
+      matchedScope: 'public',
+      rawBody: { message: 'hi', customerRef: 'cust_should_be_ignored' },
+    });
+
+    expect(result.kind).toBe('success');
+    if (result.kind !== 'success') return;
+    const stored = await conversationRepository.findById('acme', result.body.conversationId);
+    expect(stored?.customerRef).toBeNull();
+  });
+});
+
 describe('ChatService.handle - conversation ownership and isolation', () => {
   it('another customer\'s conversation id silently starts a new conversation, never an error', async () => {
     const conversationRepository = new InMemoryConversationRepository();

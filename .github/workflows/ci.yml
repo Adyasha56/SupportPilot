@@ -111,14 +111,17 @@ jobs:
     runs-on: ubuntu-latest
     # Backstop so a genuine hang (e.g. the TENANT_BUSY deadlock this job
     # actually hit once, before being fixed - see docs/learning-notes.md)
-    # cannot silently burn through free CI minutes. 15 minutes is generous
-    # against observed reality: the slowest real run so far finished in
-    # ~4 minutes once everything worked, and the worst-case budget any
-    # single piece of this job can legitimately need is bounded and known
-    # (Atlas Local's own health check loop: 2 min; globalSetup's index wait,
-    # QUERYABLE_TIMEOUT_MS: 2 min; each spec file's own pollUntil ceiling: 1
-    # min) - 15 minutes leaves real margin on top of that sum, not a guess.
-    timeout-minutes: 15
+    # cannot silently burn through free CI minutes. Raised from 15 to 20
+    # minutes for Stage 6 (chat.integration-spec.ts and its three
+    # neighbors, 11 spec files total now, up from 7) - chat-limits.
+    # integration-spec.ts alone boots roughly a dozen separate NestJS
+    # TestingModule instances (one per rate-limit/budget/cap concern, each
+    # needing its own tiny env override - see that file's own doc comment
+    # for why). No real CI run of these four files exists yet to measure
+    # against, so this number is a considered estimate, not observed
+    # reality the way the old 15-minute figure was - revisit once a real
+    # run's actual duration is known (see docs/learning-notes.md).
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
@@ -170,11 +173,15 @@ jobs:
 
       - name: Run integration tests
         # The real risk step - covers globalSetup's index-queryable wait
-        # (up to 2 min) plus all 7 spec files' own work. 10 minutes leaves
-        # real margin over every observed real run so far (slowest was
-        # well under 5 minutes end to end) without being as loose as the
-        # old per-hook 150s timeout this job used before it was tightened.
-        timeout-minutes: 10
+        # (up to 2 min) plus all 11 spec files' own work (7 pre-Stage-6
+        # files, whose slowest observed real run was well under 5 minutes
+        # end to end, plus Stage 6's four chat-*.integration-spec.ts files,
+        # which boot considerably more separate app instances than any
+        # prior file - see chat-limits.integration-spec.ts's own doc
+        # comment). Raised from 10 to 15 minutes as an estimate pending a
+        # real CI run's actual duration (update this comment with the real
+        # number once one exists, per docs/learning-notes.md).
+        timeout-minutes: 15
         env:
           # directConnection=true is required - Atlas Local runs as a
           # single-node replica set, and without it the driver's topology
