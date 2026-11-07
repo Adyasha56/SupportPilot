@@ -13,6 +13,9 @@ build/
 .env
 .env.local
 .env.*.local
+# The real local demo-profile env file - .env.demo.example (committed,
+# placeholders only) is the template to copy it from.
+.env.demo
 
 # Logs
 *.log
@@ -33,6 +36,9 @@ coverage/
 
 # Manual embedding-smoke-test file cache (never used by the app itself)
 .embedding-cache/
+
+# mint-customer-token's local throwaway Ed25519 private keys - never committed
+.customer-keys/
 
 # Local-only project docs (kept in codebase, never pushed)
 /CLAUDE.md

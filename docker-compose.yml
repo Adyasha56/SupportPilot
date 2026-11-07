@@ -1,4 +1,12 @@
 services:
+  # Always active, regardless of --profile - a plain `docker compose up`
+  # must stay exactly as it is today: policy-only, production-mode, zero
+  # exceptions (PROJECT.md's amendment G). Every env var below that the
+  # demo profile needs to CHANGE uses a `${VAR:-safe-default}` substitution
+  # so that with no .env.demo loaded, this service is byte-for-byte the
+  # same as before this file grew a demo profile - confirmed by the CI
+  # step "Docker Compose up" (.github/workflows/ci.yml), which runs this
+  # exact unprofiled command and must keep passing.
   api:
     build:
       context: .
@@ -7,3 +15,50 @@ services:
       - "3000:3000"
     environment:
       - API_PORT=3000
+      # Dockerfile's own runtime stage already sets ENV NODE_ENV=production -
+      # this substitution lets --env-file .env.demo override it to
+      # "development" for the demo profile ONLY; with no such file, it
+      # resolves to the literal string "production", identical to today.
+      - NODE_ENV=${NODE_ENV:-production}
+      - MONGODB_URI=${MONGODB_URI:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - ADMIN_SESSION_SECRET=${ADMIN_SESSION_SECRET:-}
+      # Connectors stay disabled (empty CONNECTOR_CONFIG_DIR, the app's own
+      # documented "no default, deliberately" behavior - .env.example) and
+      # the SSRF guard stays maximally strict (ALLOW_PRIVATE_NETWORKS only
+      # ever takes effect when NODE_ENV is development/test in the first
+      # place - tool-runner.settings.ts - so this is defense in depth, not
+      # the only thing standing between default mode and the exception)
+      # unless .env.demo supplies real values for these four.
+      - CONNECTOR_CONFIG_DIR=${CONNECTOR_CONFIG_DIR:-}
+      - CONNECTOR_HOST_ALLOWLIST=${CONNECTOR_HOST_ALLOWLIST:-}
+      - ALLOW_PRIVATE_NETWORKS=${ALLOW_PRIVATE_NETWORKS:-false}
+      - CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN=${CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN:-}
+    # Read-only, and always mounted (not profile-gated - Compose has no
+    # per-service-per-profile volume override without a second compose
+    # file). Completely inert outside the demo profile: CONNECTOR_CONFIG_DIR
+    # is empty by default, so the app never looks inside /demo-connectors at
+    # all unless .env.demo points it there.
+    volumes:
+      - ./demo/connectors:/demo-connectors:ro
+
+  # LOCAL-ONLY, labeled demo profile (PROJECT.md's amendment G) - proves
+  # order-lookup/refund tool calls actually work end to end against a real
+  # mock store, on your own machine. NEVER the production configuration,
+  # NEVER meant to be exposed publicly - see docs/manual-testing.md and
+  # .env.demo.example. Runs only with --profile demo; a plain
+  # `docker compose up` never starts this container.
+  #
+  # Full command: docker compose --profile demo --env-file .env.demo up
+  # (copy .env.demo.example to .env.demo first and fill in real values -
+  # .env.demo is gitignored, .env.demo.example is the committed template).
+  mock-store:
+    profiles: ["demo"]
+    build:
+      context: .
+      dockerfile: mock-store/Dockerfile
+    ports:
+      - "4100:4100"
+    environment:
+      - MOCK_STORE_PORT=4100
+      - MOCK_STORE_TOKEN=${MOCK_STORE_TOKEN:-change-me-local-demo-token}
