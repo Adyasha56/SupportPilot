@@ -1,3 +1,4 @@
+import * as http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { INestApplication } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
@@ -36,6 +37,7 @@ import { IN_FLIGHT_RUN_LIMITER } from './in-flight-run-limiter.provider';
 import { RateLimiter } from '../auth/rate-limiter';
 import { ConversationLock } from './conversation-lock';
 import { InFlightRunLimiter } from './in-flight-run-limiter';
+import { ChatBodyParserErrorFilter } from './chat-body-parser-error.filter';
 import { ChatController } from './chat.controller';
 import { ChatRetryAfterFilter } from './chat-retry-after.filter';
 import { ChatService } from './chat.service';
@@ -130,6 +132,11 @@ async function buildApp(options: BuildAppOptions = {}) {
   }).compile();
 
   const app: INestApplication = moduleRef.createNestApplication();
+  // Same global registration main.ts does for real - a body that fails to
+  // parse at all (too large, malformed JSON) never reaches ChatController
+  // or any controller-scoped filter at all; see that filter's own doc
+  // comment for the empirical confirmation this is based on.
+  app.useGlobalFilters(new ChatBodyParserErrorFilter(app.getHttpAdapter()));
   await app.init();
 
   async function createKey(tenantId: string, scope: 'public' | 'secret' = 'secret') {
@@ -186,6 +193,110 @@ describe('ChatController (e2e, in-memory repositories, FakeLlmProvider)', () => 
     expect(res.status).toBe(413);
     expect(res.body).toMatchObject({ statusCode: 413, code: 'REQUEST_TOO_LARGE' });
     expect(res.body).not.toHaveProperty('error'); // the default body-parser/Express shape has {statusCode, message, error} - never our "code" field
+  });
+
+  it('a body over Express\'s own global default parser limit (100KB) still gets the project shape, via the global filter, before ChatController\'s own check ever runs', async () => {
+    // Deliberately uses the DEFAULT maxBodyBytes (32000, well under 100KB) -
+    // the point is that a body this large never even reaches ChatController's
+    // own enforceBodySize check (body-parsing fails first, at the Nest/Express
+    // middleware layer), so without ChatBodyParserErrorFilter this would come
+    // back in Express's own {statusCode, message} shape instead.
+    const built = await buildApp();
+    app = built.app;
+    const key = await built.createKey('acme', 'secret');
+
+    const res = await request(app.getHttpServer())
+      .post('/v1/chat')
+      .set('Authorization', `Bearer ${key}`)
+      .send({ message: 'x'.repeat(200_000) });
+
+    expect(res.status).toBe(413);
+    expect(res.body).toEqual({ statusCode: 413, code: 'REQUEST_TOO_LARGE', message: 'Request body exceeds the configured byte limit.' });
+  });
+
+  it('malformed JSON gets the project\'s 400 INVALID_REQUEST shape, not Nest\'s default BadRequestException shape', async () => {
+    const built = await buildApp();
+    app = built.app;
+    const key = await built.createKey('acme', 'secret');
+
+    const res = await request(app.getHttpServer())
+      .post('/v1/chat')
+      .set('Authorization', `Bearer ${key}`)
+      .set('Content-Type', 'application/json')
+      .send('{not valid json');
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ statusCode: 400, code: 'INVALID_REQUEST', message: 'The request body is invalid.' });
+  });
+
+  it('a wrong Content-Type (body never parsed as JSON at all) still gets 400 INVALID_REQUEST via ChatRequestSchema validation', async () => {
+    const built = await buildApp();
+    app = built.app;
+    const key = await built.createKey('acme', 'secret');
+
+    const res = await request(app.getHttpServer())
+      .post('/v1/chat')
+      .set('Authorization', `Bearer ${key}`)
+      .set('Content-Type', 'text/plain')
+      .send('{"message":"hi"}');
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ statusCode: 400, code: 'INVALID_REQUEST' });
+  });
+
+  it('a chunked body with no Content-Length header, exceeding the limit, still gets the project 413 shape', async () => {
+    const built = await buildApp();
+    app = built.app;
+    const key = await built.createKey('acme', 'secret');
+    await app.listen(0);
+    const address = app.getHttpServer().address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+
+    const res = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = http.request(
+        { host: '127.0.0.1', port, path: '/v1/chat', method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' } },
+        (response) => {
+          const chunks: Buffer[] = [];
+          response.on('data', (chunk: Buffer) => chunks.push(chunk));
+          response.on('end', () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+        },
+      );
+      req.on('error', reject);
+      // No Content-Length header is ever set - Node's http module sends
+      // Transfer-Encoding: chunked automatically whenever a request body is
+      // streamed via write()/end() without one.
+      req.write(JSON.stringify({ message: 'x'.repeat(200_000) }));
+      req.end();
+    });
+
+    expect(res.status).toBe(413);
+    expect(JSON.parse(res.body)).toEqual({ statusCode: 413, code: 'REQUEST_TOO_LARGE', message: 'Request body exceeds the configured byte limit.' });
+  });
+
+  it('a chunked body with no Content-Length header, WITHIN the limit, is handled normally', async () => {
+    const built = await buildApp();
+    app = built.app;
+    const key = await built.createKey('acme', 'secret');
+    await app.listen(0);
+    const address = app.getHttpServer().address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+
+    const res = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = http.request(
+        { host: '127.0.0.1', port, path: '/v1/chat', method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' } },
+        (response) => {
+          const chunks: Buffer[] = [];
+          response.on('data', (chunk: Buffer) => chunks.push(chunk));
+          response.on('end', () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+        },
+      );
+      req.on('error', reject);
+      req.write(JSON.stringify({ message: 'hello' }));
+      req.end();
+    });
+
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ outcome: 'clarify' });
   });
 
   it('503 NOT_CONFIGURED when the database is unavailable', async () => {

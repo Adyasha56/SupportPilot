@@ -33,6 +33,27 @@
  * this file can never drift from the script's own wiring the way the
  * earlier ensureRegularIndexes/ensureTtlIndexes split did (see the module
  * doc comment on `ensureCollectionIndexes` for that bug's root cause).
+ *
+ * REAL LEAK, found via a CI run's hanging-process reporter output: this
+ * function's own `mongoose.connect(uri)` was never matched by a
+ * disconnect, on ANY path (success, a thrown error from the index-ensure
+ * work, or `ensureIndexes`'s own internal QUERYABLE_TIMEOUT_MS firing) -
+ * no try/finally existed at all. That connection runs in vitest's ROOT
+ * process (globalSetup, per this file's own doc comment above), a
+ * DIFFERENT process from every worker/spec-file's own connections
+ * (tenant-fixture.ts's `mongoose.connect()`, each worker's own
+ * DatabaseModule) - so this was never visible from inside any individual
+ * spec file's own close()/disconnect() calls, only from the root
+ * process's own open handles after every worker finished. The hanging-
+ * process reporter's dump matched this exactly: MongoDB driver TCPWRAP
+ * sockets plus the topology monitor's heartbeat `setTimeout` (monitor.js)
+ * and the connection pool's `minPoolSizeTimer` (connection_pool.js) - the
+ * standard signature of an established Mongoose connection that was never
+ * closed, not a vague "something's open" guess. Fixed with a try/finally
+ * around the entire connect+index-ensure body, so `mongoose.disconnect()`
+ * runs whether the body succeeds, throws, or times out - the same
+ * generic shape this project already uses elsewhere for guaranteed
+ * cleanup (e.g. ChatService's own `finally { lock.release(); }`).
  */
 import mongoose from 'mongoose';
 import { assertIsTestDatabase } from '../../src/db/database-name';
@@ -45,18 +66,23 @@ export async function ensureTestIndexes(uri: string, log: (message: string) => v
     return;
   }
   assertIsTestDatabase(uri);
-  await mongoose.connect(uri);
 
-  // A short, fixed retention period in tests - exercising the real
-  // TTL-index code path (and the real index it creates) without needing
-  // CHAT_RETENTION_DAYS set; the integration tests only check the index's
-  // existence/shape, never wait out a real 30-day expiry.
-  const testExpireAfterSeconds = 30 * 24 * 60 * 60;
-  const { collectionPlans, vectorSearchDeps } = buildIndexPlans(testExpireAfterSeconds);
+  try {
+    await mongoose.connect(uri);
 
-  for (const plan of collectionPlans) {
-    await ensureCollectionIndexes(plan, log);
+    // A short, fixed retention period in tests - exercising the real
+    // TTL-index code path (and the real index it creates) without needing
+    // CHAT_RETENTION_DAYS set; the integration tests only check the index's
+    // existence/shape, never wait out a real 30-day expiry.
+    const testExpireAfterSeconds = 30 * 24 * 60 * 60;
+    const { collectionPlans, vectorSearchDeps } = buildIndexPlans(testExpireAfterSeconds);
+
+    for (const plan of collectionPlans) {
+      await ensureCollectionIndexes(plan, log);
+    }
+    await ensureIndexes(vectorSearchDeps, log);
+    ensured = true;
+  } finally {
+    await mongoose.disconnect();
   }
-  await ensureIndexes(vectorSearchDeps, log);
-  ensured = true;
 }

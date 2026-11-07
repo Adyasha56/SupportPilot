@@ -19,6 +19,10 @@ import { ApiKeySchema, ApiKeyScope } from '../../src/db/schemas/api-key.schema';
 import { TenantSchema } from '../../src/db/schemas/tenant.schema';
 import { PolicyChunkSchema } from '../../src/db/schemas/policy-chunk.schema';
 import { PolicyDocumentSchema } from '../../src/db/schemas/policy-document.schema';
+import { ConversationSchema } from '../../src/db/schemas/conversation.schema';
+import { MessageSchema } from '../../src/db/schemas/message.schema';
+import { AgentRunSchema } from '../../src/db/schemas/agent-run.schema';
+import { CustomerPublicKeySchema } from '../../src/db/schemas/customer-public-key.schema';
 import { DEMO_TENANT_SETTINGS } from '../../src/db/tenant.repository';
 
 export interface TenantFixture {
@@ -96,6 +100,23 @@ export async function createApiKeyFixture(uri: string, tenantId: string, scope: 
 }
 
 /**
+ * Stage 6 - registers one Ed25519 public key for a tenant, the same shape
+ * register-customer-key.ts writes (direct model .create(), matching every
+ * other fixture function in this file - never going through the real
+ * CustomerPublicKeyRepository class, same reasoning as createTenantFixture
+ * not going through TenantRepository). The caller holds the matching
+ * PRIVATE key and signs tokens with signCustomerToken() directly
+ * (agent/identity/customer-token.ts) - this fixture only ever stores the
+ * public half.
+ */
+export async function createCustomerPublicKeyFixture(uri: string, tenantId: string, kid: number, publicKeyX: string): Promise<void> {
+  await ensureConnected(uri);
+
+  const CustomerPublicKeyModel = mongoose.model('CustomerPublicKey', CustomerPublicKeySchema);
+  await CustomerPublicKeyModel.create({ tenantId, kid, publicKeyX, status: 'active' });
+}
+
+/**
  * Cleanup by tenantId only, across every collection a test could have
  * written to - NEVER dropDatabase (the test database is shared across the
  * whole suite and, when run against a developer's own Atlas cluster per
@@ -103,6 +124,13 @@ export async function createApiKeyFixture(uri: string, tenantId: string, scope: 
  * just set up). Safe to call even if some collections have nothing for
  * this tenant. Callers should run this in a `finally`/`afterEach`, not just
  * on the happy path, so a failing assertion still cleans up.
+ *
+ * Stage 6 - extended with the four chat collections (Conversation,
+ * Message, AgentRun, CustomerPublicKey), which this function never touched
+ * before chat.integration-spec.ts existed - every OTHER integration spec
+ * that already calls this function benefits too, harmlessly (they never
+ * write to these collections, so these four deletes are always no-ops for
+ * them).
  */
 export async function cleanupTenant(uri: string, tenantId: string): Promise<void> {
   await ensureConnected(uri);
@@ -111,12 +139,20 @@ export async function cleanupTenant(uri: string, tenantId: string): Promise<void
   const ApiKeyModel = mongoose.model('ApiKey', ApiKeySchema);
   const PolicyChunkModel = mongoose.model('PolicyChunk', PolicyChunkSchema);
   const PolicyDocumentModel = mongoose.model('PolicyDocument', PolicyDocumentSchema);
+  const ConversationModel = mongoose.model('Conversation', ConversationSchema);
+  const MessageModel = mongoose.model('Message', MessageSchema);
+  const AgentRunModel = mongoose.model('AgentRun', AgentRunSchema);
+  const CustomerPublicKeyModel = mongoose.model('CustomerPublicKey', CustomerPublicKeySchema);
 
   await Promise.all([
     TenantModel.deleteOne({ _id: tenantId }),
     ApiKeyModel.deleteMany({ tenantId }),
     PolicyChunkModel.deleteMany({ tenantId }),
     PolicyDocumentModel.deleteMany({ tenantId }),
+    ConversationModel.deleteMany({ tenantId }),
+    MessageModel.deleteMany({ tenantId }),
+    AgentRunModel.deleteMany({ tenantId }),
+    CustomerPublicKeyModel.deleteMany({ tenantId }),
   ]);
 }
 
