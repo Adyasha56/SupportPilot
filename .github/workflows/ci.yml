@@ -47,6 +47,17 @@ jobs:
       - name: Test
         run: pnpm -r run test
 
+      # Validates both profiles' merged config is well-formed - no
+      # containers started, no build. The demo profile's own vars resolve
+      # against the committed, placeholder-only .env.demo.example (never a
+      # real secret) since this step only checks structure, never actually
+      # connects to anything.
+      - name: Validate docker compose config (default profile)
+        run: docker compose config --quiet
+
+      - name: Validate docker compose config (demo profile)
+        run: docker compose --profile demo --env-file .env.demo.example config --quiet
+
       - name: Docker Compose build
         run: docker compose build
 
