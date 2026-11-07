@@ -373,13 +373,24 @@ describe.skipIf(!integrationTestsEnabled())('Chat budgets and model availability
   });
 });
 
-describe.skipIf(!integrationTestsEnabled())('Chat history window, char cap, and conversation length cap (integration, real database)', () => {
+describe.skipIf(!integrationTestsEnabled())('Chat history window and char cap (integration, real database)', () => {
   let h: Harness;
   beforeAll(async () => {
     h = await bootChatTestApp({
       CHAT_HISTORY_WINDOW_SIZE: '2',
       CHAT_HISTORY_MAX_CHARS: '40',
-      CHAT_MAX_MESSAGES_PER_CONVERSATION: '4',
+      // Deliberately generous, NOT the tiny value the neighboring
+      // "conversation length cap" describe block needs - a real bug here
+      // (CI, not just reasoning about it): both tests used to share ONE
+      // app with CHAT_MAX_MESSAGES_PER_CONVERSATION=4, sized for the OTHER
+      // test. This test's own 3 turns legitimately hit THAT cap on its own
+      // 3rd request (messageCount 0->2->4, then 4+2=6 > 4), getting a real
+      // 409 CONVERSATION_LENGTH_EXCEEDED where the test expected 200 - not
+      // a lock, not a leftover from another test, just one app's setting
+      // sized for a different test's own scenario. Each concern now gets
+      // its own app instance, same pattern every other describe block in
+      // this file already follows.
+      CHAT_MAX_MESSAGES_PER_CONVERSATION: '100',
     });
   }, 150_000);
   afterAll(() => h.close());
@@ -441,7 +452,7 @@ describe.skipIf(!integrationTestsEnabled())('Chat history window, char cap, and 
       .post('/v1/chat')
       .set('Authorization', `Bearer ${tenant.publicKey}`)
       .send({ message: 'THIRD_TURN_MARKER_CCC', conversationId, customerToken: token });
-    expect(res.status).toBe(200);
+    expect(res.status, `expected 200, got ${res.status} with body ${JSON.stringify(res.body)}`).toBe(200);
     expect(res.body.conversationId).toBe(conversationId);
 
     const composeCallContent = calls[1].messages.map((m) => m.text).join('\n');
@@ -457,6 +468,18 @@ describe.skipIf(!integrationTestsEnabled())('Chat history window, char cap, and 
     expect(allStored).toHaveLength(6); // 3 turns x (customer message + agent reply)
     expect(allStored.some((m) => (m as unknown as { content: string }).content === 'FIRST_TURN_MARKER_AAA')).toBe(true);
   });
+});
+
+describe.skipIf(!integrationTestsEnabled())('Chat conversation length cap (integration, real database)', () => {
+  let h: Harness;
+  beforeAll(async () => {
+    // Its OWN app, deliberately separate from the history-window describe
+    // block above - this is the test that actually needs a tiny
+    // CHAT_MAX_MESSAGES_PER_CONVERSATION; history/char-cap settings are
+    // left at their generous defaults since this test doesn't exercise them.
+    h = await bootChatTestApp({ CHAT_MAX_MESSAGES_PER_CONVERSATION: '4' });
+  }, 150_000);
+  afterAll(() => h.close());
 
   it('a conversation at its configured message-count ceiling gets 409 CONVERSATION_LENGTH_EXCEEDED before runAgent ever runs', async () => {
     const tenant = await newTenant();
@@ -473,7 +496,7 @@ describe.skipIf(!integrationTestsEnabled())('Chat history window, char cap, and 
       .set('Authorization', `Bearer ${tenant.publicKey}`)
       .send({ message: 'hi', conversationId: conversation.id });
 
-    expect(res.status).toBe(409);
+    expect(res.status, `expected 409, got ${res.status} with body ${JSON.stringify(res.body)}`).toBe(409);
     expect(res.body).toMatchObject({ code: 'CONVERSATION_LENGTH_EXCEEDED' });
     expect(h.scriptableLlm.generateCalls).toBe(before);
   });
