@@ -46,6 +46,31 @@ export default defineConfig({
     expect: {
       requireAssertions: true,
     },
+    /**
+     * TEMPORARY, pending a real CI run against Atlas Local - remove once
+     * that run's output is captured and the hang is understood. A real CI
+     * run reported "close timed out after 10000ms ... something prevents 2
+     * Vite servers from exiting" after Stage 6's four new chat-*.
+     * integration-spec.ts files were added. Investigated directly (not
+     * guessed): booted AppModule repeatedly, sent real supertest requests
+     * through it, started/stopped the in-process mock-store, and ran a
+     * full real get_order call through the real tool runner's own HTTP
+     * client - all against a real standalone local mongod, with every
+     * app/server closed and Node's own `_getActiveHandles()` checked
+     * afterward. Every one of those came back clean (0 leaked handles).
+     * The one thing none of that could exercise: a REAL replica-set
+     * topology (Atlas Local, even single-node, runs as one) - the MongoDB
+     * driver's topology monitor does periodic heartbeat/connect calls
+     * against each known server with `connectTimeoutMS`/
+     * `heartbeatFrequencyMS` both defaulting to exactly 10000ms, which a
+     * plain standalone-mongod connection's simpler topology never
+     * exercises the same way. That number matching the reported "10000ms"
+     * is suggestive, not confirmed - `['default', 'hanging-process']` adds
+     * vitest's own built-in hanging-process reporter (no new dependency)
+     * so the NEXT real CI run names the actual open handle directly,
+     * instead of this being reasoned about from a number alone.
+     */
+    reporters: ['default', 'hanging-process'],
   },
   plugins: [swc.vite()],
 });

@@ -183,7 +183,13 @@ describe.skipIf(!integrationTestsEnabled())('Chat rate limits (integration, real
     it('exceeding the TENANT total (summed across several DIFFERENT keys) gets the SERVICE-level 429, with a tenant-specific message', async () => {
       const tenant = await newTenant();
       const keyB = await createApiKeyFixture(uri, tenant.tenantId, 'public');
-      const keys = [tenant.publicKey, tenant.publicKey, keyB.rawKey, keyB.rawKey];
+      // Exactly CHAT_RATE_LIMIT_TENANT_MAX_REQUESTS (3) successful requests,
+      // summed across two DIFFERENT keys - not one more. A 4th request in
+      // THIS loop (as an earlier version had) would itself already exceed
+      // the tenant limit and get 429 here, failing the "should be 200"
+      // assertion below for the wrong reason before the test ever reaches
+      // its own dedicated "now exceed it" request.
+      const keys = [tenant.publicKey, tenant.publicKey, keyB.rawKey];
 
       for (const key of keys) {
         h.scriptableLlm.setScript([planOutput(), composeOutput()]);
@@ -403,29 +409,53 @@ describe.skipIf(!integrationTestsEnabled())('Chat history window, char cap, and 
     const { kid, privateKey } = await registerCustomerKeyFixture(uri, tenant.tenantId);
     const token = mintCustomerToken(tenant.tenantId, 'cust_hist', kid, privateKey);
 
-    // Three real turns. historyWindowSize=2 means only the most recent 2
-    // STORED messages (one prior turn's worth) are ever loaded for the
-    // 3rd request - the far-older first turn's text must never reach it.
-    for (const [i, message] of ['FIRST_TURN_MARKER_AAA', 'SECOND_TURN_MARKER_BBB'].entries()) {
-      h.scriptableLlm.setScript([planOutput(), composeOutput({ outcome: 'clarify', message: `reply ${i}` })]);
-      const res = await request(h.app.getHttpServer()).post('/v1/chat').set('Authorization', `Bearer ${tenant.publicKey}`).send({ message, customerToken: token });
-      expect(res.status).toBe(200);
-    }
+    // Three real turns, all threaded onto the SAME conversation by explicitly
+    // passing conversationId from the first response into every later
+    // request. Without this, each request (none of them originally carried
+    // a conversationId) silently starts its OWN brand new conversation -
+    // resolveConversation() only ever reuses an existing one when the
+    // caller names it (chat.service.ts) - so the "first turn" would never
+    // actually be IN the conversation this test later inspects at all, a
+    // real bug in this test rather than evidence of windowing.
+    h.scriptableLlm.setScript([planOutput(), composeOutput({ outcome: 'clarify', message: 'reply 0' })]);
+    const firstRes = await request(h.app.getHttpServer())
+      .post('/v1/chat')
+      .set('Authorization', `Bearer ${tenant.publicKey}`)
+      .send({ message: 'FIRST_TURN_MARKER_AAA', customerToken: token });
+    expect(firstRes.status).toBe(200);
+    const conversationId = firstRes.body.conversationId as string;
+
+    // historyWindowSize=2 means only the most recent 2 STORED messages (one
+    // prior turn's worth) are ever loaded for the 3rd request - the
+    // far-older first turn's text must never reach it.
+    h.scriptableLlm.setScript([planOutput(), composeOutput({ outcome: 'clarify', message: 'reply 1' })]);
+    const secondRes = await request(h.app.getHttpServer())
+      .post('/v1/chat')
+      .set('Authorization', `Bearer ${tenant.publicKey}`)
+      .send({ message: 'SECOND_TURN_MARKER_BBB', conversationId, customerToken: token });
+    expect(secondRes.status).toBe(200);
 
     const { provider, calls } = capturingProvider([planOutput(), composeOutput({ outcome: 'clarify', message: 'third reply' })]);
     h.scriptableLlm.setProvider(provider);
     const res = await request(h.app.getHttpServer())
       .post('/v1/chat')
       .set('Authorization', `Bearer ${tenant.publicKey}`)
-      .send({ message: 'THIRD_TURN_MARKER_CCC', customerToken: token });
+      .send({ message: 'THIRD_TURN_MARKER_CCC', conversationId, customerToken: token });
     expect(res.status).toBe(200);
+    expect(res.body.conversationId).toBe(conversationId);
 
     const composeCallContent = calls[1].messages.map((m) => m.text).join('\n');
     expect(composeCallContent).not.toContain('FIRST_TURN_MARKER_AAA');
 
-    const messageRepo = h.app.get<MessageRepository>(MESSAGE_REPOSITORY);
-    const stored = await messageRepo.findRecentForConversation(tenant.tenantId, res.body.conversationId as string, 20);
-    expect(stored.some((m) => m.content === 'FIRST_TURN_MARKER_AAA')).toBe(true);
+    // findRecentForConversation is deliberately WINDOWED (bounded by the
+    // limit argument, same contract HistoryTurn[] relies on) - asserting
+    // "nothing was actually deleted from storage" needs an UNBOUNDED read
+    // instead, direct against the raw collection, not the windowed
+    // repository method whose whole job is to return less than everything.
+    const messageModel = h.app.get<Model<unknown>>(getModelToken('Message'));
+    const allStored = await messageModel.collection.find({ tenantId: tenant.tenantId, conversationId }).toArray();
+    expect(allStored).toHaveLength(6); // 3 turns x (customer message + agent reply)
+    expect(allStored.some((m) => (m as unknown as { content: string }).content === 'FIRST_TURN_MARKER_AAA')).toBe(true);
   });
 
   it('a conversation at its configured message-count ceiling gets 409 CONVERSATION_LENGTH_EXCEEDED before runAgent ever runs', async () => {

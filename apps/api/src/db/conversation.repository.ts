@@ -55,7 +55,7 @@ export class MongooseConversationRepository implements ConversationRepository {
     const doc = await this.model.findOneAndUpdate(
       { _id: id, tenantId },
       { $inc: { messageCount: by } },
-      { new: true },
+      { returnDocument: 'after' },
     );
     return doc?.messageCount ?? 0;
   }

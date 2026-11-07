@@ -56,7 +56,7 @@ import { PolicyRetrievalService } from '../../src/retrieval/policy-retrieval.ser
 import { AGENT_RUN_REPOSITORY, AgentRunRepository } from '../../src/db/agent-run.repository';
 import { CONVERSATION_REPOSITORY, ConversationRepository } from '../../src/db/conversation.repository';
 import { MESSAGE_REPOSITORY, MessageRepository } from '../../src/db/message.repository';
-import { signCustomerToken } from '../../src/agent/identity/customer-token';
+import { CLOCK_SKEW_ALLOWANCE_MS, signCustomerToken } from '../../src/agent/identity/customer-token';
 import {
   cleanupTenant,
   createCustomerPublicKeyFixture,
@@ -300,10 +300,45 @@ describe.skipIf(!integrationTestsEnabled())('Chat (integration, real database)',
   });
 
   describe('invalid customer tokens: identical 401, nothing persisted, no LLM call', () => {
-    it('expired token', async () => {
+    it('expired token (well past CLOCK_SKEW_ALLOWANCE_MS, unambiguously expired)', async () => {
       const tenant = await newTenant();
       const { kid, privateKey } = await registerCustomerKeyFixture(uri, tenant.tenantId);
-      const token = mintCustomerToken(tenant.tenantId, 'cust_1', kid, privateKey, -1000);
+      // A 1-second margin here was a real bug: verifyCustomerToken's EXPIRED
+      // check is `payload.expiresAt + CLOCK_SKEW_ALLOWANCE_MS <= now` - an
+      // expiry only 1000ms in the past is nowhere near CLOCK_SKEW_ALLOWANCE_MS
+      // (default 30s), so the token was still accepted as valid, identity
+      // resolved as 'identified', and the pipeline proceeded all the way to
+      // runAgent's plan call against a script this test had deliberately
+      // left empty - surfacing as an uncaught "called 1 time(s), but only 0
+      // response(s) were scripted" 500, not the 401 this test claimed to be
+      // testing. Fixed with a margin ten times the skew allowance -
+      // unambiguous regardless of the skew default ever changing. The exact
+      // boundary itself is covered by the two dedicated tests below.
+      const token = mintCustomerToken(tenant.tenantId, 'cust_1', kid, privateKey, -(CLOCK_SKEW_ALLOWANCE_MS * 10));
+      await assertUniform401(tenant, token);
+    });
+
+    it('expired by clearly LESS than the skew allowance: still accepted (identified, 200) - the skew is real tolerance, not a no-op', async () => {
+      const tenant = await newTenant();
+      const { kid, privateKey } = await registerCustomerKeyFixture(uri, tenant.tenantId);
+      // 5s of margin on either side of the boundary is comfortably larger
+      // than any real clock drift between minting this token and the
+      // server verifying it moments later within the same test process.
+      const token = mintCustomerToken(tenant.tenantId, 'cust_1', kid, privateKey, -(CLOCK_SKEW_ALLOWANCE_MS - 5000));
+
+      scriptableLlm.setScript([planOutput(), composeOutput({ outcome: 'clarify', message: 'ok' })]);
+      const res = await send(tenant.publicKey, { message: 'hi', customerToken: token });
+
+      expect(res.status).toBe(200);
+      const { conversation } = repos();
+      const conv = await conversation.findById(tenant.tenantId, res.body.conversationId as string);
+      expect(conv?.customerRef).toBe('cust_1');
+    });
+
+    it('expired by clearly MORE than the skew allowance: the uniform 401, right past the boundary', async () => {
+      const tenant = await newTenant();
+      const { kid, privateKey } = await registerCustomerKeyFixture(uri, tenant.tenantId);
+      const token = mintCustomerToken(tenant.tenantId, 'cust_1', kid, privateKey, -(CLOCK_SKEW_ALLOWANCE_MS + 5000));
       await assertUniform401(tenant, token);
     });
 

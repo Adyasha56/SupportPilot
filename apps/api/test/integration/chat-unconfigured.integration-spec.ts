@@ -29,7 +29,7 @@
  * beforeAll, so they never interfere with EACH OTHER either.
  */
 import './test-env';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
@@ -68,11 +68,49 @@ describe.skipIf(!integrationTestsEnabled())('No MONGODB_URI at all (integration)
   let close: () => Promise<void>;
   let priorMongoUri: string | undefined;
 
+  /**
+   * HARNESS BUG, found via a CI failure (ExceptionsHandler showed
+   * FakeLlmProvider.generate() being called through
+   * ChatService.runLockedPipeline - i.e. the request reached runAgent,
+   * meaning the repos were NOT undefined, meaning MONGODB_URI was NOT
+   * actually unset from AppModule's point of view): `app.module.ts` (and
+   * `auth.module.ts`/`chat.module.ts`/`ingestion.module.ts`/
+   * `retrieval.module.ts`) each compute their OWN "import DatabaseModule or
+   * not" decision as a plain module-level `const`, read from
+   * `process.env.MONGODB_URI` exactly ONCE, the first time that module is
+   * ever imported in this process (confirmed by reading app.module.ts:
+   * `const databaseImports = process.env.MONGODB_URI ? [DatabaseModule] : [];`
+   * at the top level, baked into the `@Module` decorator's metadata at
+   * class-definition time - never re-read later). This file's static
+   * `import { AppModule } from '../../src/app.module'` at the top already
+   * evaluated that line - under the REAL test URI `test-env.ts`'s
+   * `wireTestEnv()` setupFile had already set - before this describe
+   * block's own `beforeAll` ever got a chance to delete it. Deleting the
+   * env var afterward can never un-bake an already-finalized decorator.
+   *
+   * This exact trap, and its fix, is already documented precedent in this
+   * codebase (`ingestion.module.spec.ts`'s own "IngestionModule regression
+   * guard" describe block): `vi.resetModules()` clears the module cache so
+   * a FRESH `await import(...)` re-evaluates the whole chain (AppModule and
+   * every module it transitively imports) under whatever env is set AT
+   * THAT MOMENT. The matching `LLM_PROVIDER` symbol must come from the SAME
+   * fresh import batch, not the stale one imported at this file's top -
+   * `Symbol('LLM_PROVIDER')` is re-evaluated too under resetModules(), so
+   * overriding the STALE top-level `LLM_PROVIDER` constant would silently
+   * fail to match the fresh module graph's actual DI token.
+   */
   beforeAll(async () => {
     priorMongoUri = process.env.MONGODB_URI;
     delete process.env.MONGODB_URI;
 
-    const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).overrideProvider(LLM_PROVIDER).useValue(new ScriptableLlmProvider()).compile();
+    vi.resetModules();
+    const freshAppModule = await import('../../src/app.module.js');
+    const freshLlmModule = await import('../../src/llm/llm.module.js');
+
+    const moduleRef = await Test.createTestingModule({ imports: [freshAppModule.AppModule] })
+      .overrideProvider(freshLlmModule.LLM_PROVIDER)
+      .useValue(new ScriptableLlmProvider())
+      .compile();
     app = moduleRef.createNestApplication();
     await app.init();
     close = () => app.close();
@@ -85,6 +123,14 @@ describe.skipIf(!integrationTestsEnabled())('No MONGODB_URI at all (integration)
     } else {
       process.env.MONGODB_URI = priorMongoUri;
     }
+    // Restores a clean module-cache state before the NEXT describe block's
+    // beforeAll runs - that block keeps using this file's own static,
+    // top-of-file AppModule/LLM_PROVIDER references (unaffected by this
+    // call either way, since resetModules() only governs FUTURE import()
+    // cache lookups, never already-held object references), but resetting
+    // here keeps this file's env/module state fully symmetric rather than
+    // leaving a one-directional special case for whoever reads this later.
+    vi.resetModules();
   });
 
   it('/health still passes with no database at all', async () => {
