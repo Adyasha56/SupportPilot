@@ -17,7 +17,6 @@
     "db:ensure-indexes": "node --env-file-if-exists=.env dist/scripts/db-ensure-indexes.js",
     "create-api-key": "node --env-file-if-exists=.env dist/scripts/create-api-key.js",
     "register-customer-key": "node --env-file-if-exists=.env dist/scripts/register-customer-key.js",
-    "mint-customer-token": "node --env-file-if-exists=.env dist/scripts/mint-customer-token.js",
     "delete-scratch-tenant": "node --env-file-if-exists=.env dist/scripts/delete-scratch-tenant.js",
     "embedding-smoke-test": "node --env-file-if-exists=.env dist-dev/dev-scripts/embedding-smoke-test.js",
     "check-transactions": "node --env-file-if-exists=.env dist-dev/dev-scripts/check-transactions.js",
@@ -25,7 +24,8 @@
     "retrieval-quality-check": "node --env-file-if-exists=.env dist-dev/dev-scripts/retrieval-quality-check.js",
     "generate-schema-check": "node --env-file-if-exists=.env dist-dev/dev-scripts/generate-schema-check.js",
     "agent-pipeline-smoke-test": "node --env-file-if-exists=.env dist-dev/dev-scripts/agent-pipeline-smoke-test.js",
-    "latency-probe": "node --env-file-if-exists=.env dist-dev/dev-scripts/latency-probe.js"
+    "latency-probe": "node --env-file-if-exists=.env dist-dev/dev-scripts/latency-probe.js",
+    "mint-customer-token": "node --env-file-if-exists=.env dist-dev/dev-scripts/mint-customer-token.js"
   },
   "dependencies": {
     "@google/genai": "2.31.0",

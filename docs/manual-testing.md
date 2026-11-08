@@ -88,11 +88,11 @@ pnpm --filter @supportpilot/api run create-api-key -- --tenantId=smoke-local --n
 pnpm --filter @supportpilot/api run create-api-key -- --tenantId=smoke-local --name="My Local Test" --scope=public
 ```
 
-Each prints a raw key **exactly once**. Save them into this session's environment immediately - never into a file, never into shell history as a literal string:
+Each prints a raw key **exactly once**. Save them into this session's environment immediately - never into a file, never into shell history as a literal string. `ConvertFrom-SecureString -AsPlainText` is PowerShell 7+ only (confirmed directly: Windows PowerShell 5.1's `ConvertFrom-SecureString` has no `-AsPlainText` parameter at all, only DPAPI re-encryption) - the `[Runtime.InteropServices.Marshal]` calls below are the 5.1-compatible way to get a SecureString back out as plain text, and work identically on 7+ too:
 
 ```powershell
-$env:SP_SECRET_KEY = Read-Host -Prompt 'Paste the secret key' -AsSecureString | ConvertFrom-SecureString -AsPlainText
-$env:SP_PUBLIC_KEY = Read-Host -Prompt 'Paste the public key' -AsSecureString | ConvertFrom-SecureString -AsPlainText
+$env:SP_SECRET_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR((Read-Host -Prompt 'Paste the secret key' -AsSecureString)))
+$env:SP_PUBLIC_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR((Read-Host -Prompt 'Paste the public key' -AsSecureString)))
 ```
 
 Every command below reads `$env:SP_SECRET_KEY` / `$env:SP_PUBLIC_KEY` - the raw values themselves never appear in any command.
@@ -107,7 +107,7 @@ pnpm --filter @supportpilot/api run mint-customer-token -- --tenantId=smoke-loca
 This registers an Ed25519 key for `cust_1` (through the real repository, since `MONGODB_URI` is set) and prints a signed token good for 10 minutes. Copy it:
 
 ```powershell
-$env:SP_CUSTOMER_TOKEN = Read-Host -Prompt 'Paste the printed token' -AsSecureString | ConvertFrom-SecureString -AsPlainText
+$env:SP_CUSTOMER_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR((Read-Host -Prompt 'Paste the printed token' -AsSecureString)))
 ```
 
 ### 3c. Upload the sample policy (the one multipart step - `curl.exe`, not `Invoke-RestMethod`)

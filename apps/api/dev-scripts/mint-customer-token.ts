@@ -1,17 +1,31 @@
 /**
  * Manually run only, same reasoning as every other script in this
- * directory (runs compiled JS - see create-api-key.ts).
+ * directory (runs compiled JS - see create-api-key.ts, src/scripts/).
  *
  *   pnpm run mint-customer-token -- --tenantId=acme --customerRef=cust_1
  *   pnpm run mint-customer-token -- --tenantId=acme --customerRef=cust_1 --kid=2 --lifetimeMs=120000
  *
- * Placed alongside create-api-key.ts/register-customer-key.ts (not under
- * dev-scripts/, which this project reserves for standalone smoke-tests
- * that never touch the real repository layer - db-ensure-indexes.ts's own
- * directory already holds every other script that does) - this one
- * registers through the REAL CustomerPublicKeyRepository, same class
- * register-customer-key.ts uses, so it has to live where that database
- * wiring already is.
+ * Lives under dev-scripts/, NOT src/scripts/ - a real misplacement in an
+ * earlier version of this file, corrected directly: this one GENERATES
+ * and HOLDS Ed25519 PRIVATE KEY material locally, which is categorically
+ * different from every script that stays in src/scripts/ (create-api-key
+ * hashes a key it generates but never stores the raw value; register-
+ * customer-key only ever registers a public key someone else already
+ * generated - neither one ever persists private key material to disk).
+ * "dev-scripts never touches the real repository layer" was never
+ * actually the dividing line either - retrieval-quality-check.ts and
+ * agent-pipeline-smoke-test.ts, right here in this same directory, both
+ * already import and use the real MongoosePolicyChunkRepository/
+ * MongoosePolicyDocumentRepository/MongooseTransactionRunner directly.
+ * The real dividing line is build output: src/scripts/*.ts compiles into
+ * the PRODUCTION image via `nest build`'s own tsconfig.build.json
+ * (src/**\/*.ts only); dev-scripts/*.ts compiles separately, into
+ * dist-dev/, via `pnpm run build:dev-scripts` (tsconfig.dev-scripts.json)
+ * - excluded from the production build and the Docker image entirely. A
+ * tool that mints private keys has no business being reachable from a
+ * deployed container even in principle, which is exactly what this move
+ * guarantees (confirmed by the scratch deploy simulation - see
+ * docs/learning-notes.md).
  *
  * What this does, in order:
  *  1. Generates a FRESH Ed25519 keypair (a throwaway testing identity, one
@@ -45,10 +59,10 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import mongoose from 'mongoose';
 import { GENERIC_ID_PATTERN, TENANT_ID_PATTERN } from '@supportpilot/shared';
-import { assertNotTestDatabase } from '../db/database-name';
-import { CUSTOMER_TOKEN_MAX_LIFETIME_MS, signCustomerToken } from '../agent/identity/customer-token';
-import { CustomerPublicKeyDocument, CustomerPublicKeySchema } from '../db/schemas/customer-public-key.schema';
-import { MongooseCustomerPublicKeyRepository, DuplicateKidError } from '../db/customer-public-key.repository';
+import { assertNotTestDatabase } from '../src/db/database-name';
+import { CUSTOMER_TOKEN_MAX_LIFETIME_MS, signCustomerToken } from '../src/agent/identity/customer-token';
+import { CustomerPublicKeyDocument, CustomerPublicKeySchema } from '../src/db/schemas/customer-public-key.schema';
+import { MongooseCustomerPublicKeyRepository, DuplicateKidError } from '../src/db/customer-public-key.repository';
 
 const DEFAULT_KEY_DIR = './.customer-keys';
 const DEFAULT_KID = 1;

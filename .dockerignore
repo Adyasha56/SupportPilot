@@ -5,11 +5,30 @@
 .git
 .env
 *.md
-# Dev-only diagnostic scripts (apps/api/dev-scripts/) and their mock-store
-# dependency never need to be in the Docker build context at all - they're
-# excluded from tsconfig.build.json already, this just keeps the build
-# context itself smaller. See docs/learning-notes.md for why these moved
-# out of src/scripts/ in the first place.
+# Real secret-ish local-scratch directories (gitignored, never meant to
+# leave the developer's own machine) that apps/api/Dockerfile's own
+# `COPY apps/api apps/api` step would otherwise pick up wholesale, into
+# the build stage's filesystem layers, if they happen to exist on disk at
+# build time - mint-customer-token.ts (dev-scripts/) writes real Ed25519
+# PRIVATE keys to .customer-keys/; the embedding smoke-test/quality-check
+# scripts cache embedding vectors (not secret, but still never meant to
+# ship) in .embedding-cache/. A confirmed-real gap, found by checking: at
+# the time this was added, apps/api/.customer-keys/ had two real private
+# key files on disk from an actual manual-testing session.
+**/.customer-keys
+**/.embedding-cache
+# Dev-only diagnostic scripts (apps/api/dev-scripts/) never need to be in
+# the Docker build context for the API image - they're excluded from
+# tsconfig.build.json already, this just keeps the build context itself
+# smaller. See docs/learning-notes.md for why these moved out of
+# src/scripts/ in the first place.
 **/dev-scripts
+# This applies to the API image's build ONLY - mock-store's own real
+# source IS needed by mock-store/Dockerfile (the demo profile's own
+# image), which uses mock-store/Dockerfile.dockerignore instead of this
+# file for that one build (a BuildKit-specific ignore file next to the
+# Dockerfile REPLACES, never merges with, this root one - see that file's
+# own comment). Here, for the API image, only mock-store/package.json is
+# ever needed (pnpm workspace resolution), never its actual source.
 mock-store/*
 !mock-store/package.json
