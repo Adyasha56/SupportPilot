@@ -1,0 +1,16 @@
+# BuildKit-specific ignore file for mock-store/Dockerfile - used INSTEAD OF
+# (never merged with) the root .dockerignore for this one build, since this
+# build's own COPY instructions need mock-store/* (which the root file
+# deliberately excludes down to just mock-store/package.json, for the API
+# image's build). Mirrors the root file's own pattern, inverted: this build
+# needs apps/api/package.json ONLY (for the pnpm workspace install step),
+# never apps/api's actual source.
+**/node_modules
+**/dist
+**/dist-dev
+**/*.tsbuildinfo
+.git
+.env
+*.md
+apps/api/*
+!apps/api/package.json

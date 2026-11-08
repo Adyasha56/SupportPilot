@@ -9,7 +9,7 @@ import {
   resolveKid,
   resolveLifetimeMs,
 } from './mint-customer-token';
-import { CUSTOMER_TOKEN_MAX_LIFETIME_MS } from '../agent/identity/customer-token';
+import { CUSTOMER_TOKEN_MAX_LIFETIME_MS } from '../src/agent/identity/customer-token';
 
 describe('parseArgs', () => {
   it('parses --key=value pairs and bare --flags', () => {

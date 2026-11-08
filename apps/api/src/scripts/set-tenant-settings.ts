@@ -15,10 +15,10 @@
  * doesn't exist yet rather than silently creating one with partial
  * settings - run create-api-key first.
  */
-import mongoose from 'mongoose';
+import mongoose, { Model } from 'mongoose';
 import { TENANT_ID_PATTERN } from '@supportpilot/shared';
 import { assertNotTestDatabase } from '../db/database-name';
-import { TenantSchema } from '../db/schemas/tenant.schema';
+import { TenantDocument, TenantSchema } from '../db/schemas/tenant.schema';
 import { MongooseTenantRepository, Tenant, TenantSettingsPatch } from '../db/tenant.repository';
 
 export function parseArgs(argv: string[]): Record<string, string | boolean> {
@@ -120,7 +120,11 @@ async function main(): Promise<void> {
 
   await mongoose.connect(uri);
   try {
-    const TenantModel = mongoose.model('Tenant', TenantSchema);
+    // Explicit <TenantDocument> type argument (not left to inference) - TenantSchema's string
+    // _id (unlike every other schema's default ObjectId _id) makes mongoose.model()'s inferred
+    // return type too specific to structurally satisfy MongooseTenantRepository's constructor
+    // parameter (Model<TenantDocument> from @InjectModel) otherwise.
+    const TenantModel: Model<TenantDocument> = mongoose.model<TenantDocument>('Tenant', TenantSchema);
     const repository = new MongooseTenantRepository(TenantModel);
     const tenant = await repository.updateSettings(tenantId, patch);
     printTenant(tenant);
