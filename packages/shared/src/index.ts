@@ -1,4 +1,5 @@
 export * from './agent-schemas';
+export * from './approval-schemas';
 export * from './embedding';
 export * from './gemini-json-schema';
 export * from './ids';
