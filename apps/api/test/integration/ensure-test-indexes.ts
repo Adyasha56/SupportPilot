@@ -70,12 +70,16 @@ export async function ensureTestIndexes(uri: string, log: (message: string) => v
   try {
     await mongoose.connect(uri);
 
-    // A short, fixed retention period in tests - exercising the real
+    // Short, fixed retention periods in tests - exercising the real
     // TTL-index code path (and the real index it creates) without needing
-    // CHAT_RETENTION_DAYS set; the integration tests only check the index's
-    // existence/shape, never wait out a real 30-day expiry.
+    // CHAT_RETENTION_DAYS/APPROVAL_RETENTION_DAYS set; the integration
+    // tests only check the index's existence/shape, never wait out a real
+    // expiry. Deliberately DIFFERENT values (30 vs 45 days) so a test can
+    // confirm the two retention knobs are genuinely independent, not
+    // coincidentally equal.
     const testExpireAfterSeconds = 30 * 24 * 60 * 60;
-    const { collectionPlans, vectorSearchDeps } = buildIndexPlans(testExpireAfterSeconds);
+    const testApprovalExpireAfterSeconds = 45 * 24 * 60 * 60;
+    const { collectionPlans, vectorSearchDeps } = buildIndexPlans(testExpireAfterSeconds, testApprovalExpireAfterSeconds);
 
     for (const plan of collectionPlans) {
       await ensureCollectionIndexes(plan, log);

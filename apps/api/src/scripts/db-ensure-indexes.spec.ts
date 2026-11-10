@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   buildIndexPlans,
+  checkProtectedIndexes,
   CollectionIndexDeps,
   definitionsMatch,
   EnsureIndexDeps,
@@ -10,9 +11,12 @@ import {
   ExistingIndexInfo,
   ExistingSearchIndex,
   findSingleFieldTtlIndex,
+  ProtectedIndexSpec,
   RegularIndexSpec,
+  resolveRetentionDays,
 } from './db-ensure-indexes';
 import { POLICY_CHUNK_VECTOR_INDEX_DEFINITION, POLICY_CHUNK_VECTOR_INDEX_NAME } from '../db/schemas/policy-chunk.schema';
+import { APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME } from '../approvals/schemas/approval.schema';
 
 function makeDeps(overrides: Partial<EnsureIndexDeps> = {}): EnsureIndexDeps {
   return {
@@ -437,6 +441,23 @@ describe('ensureCollectionIndexes', () => {
     expect(existingLine).toContain('tenantId_1_status_1.'); // bare name, no "(...)" suffix - it's the last item before the trailing period
   });
 
+  it('(Milestone 4) the "would create" line also shows unique and partialFilterExpression, not just the "existing indexes" line', async () => {
+    const state: FakeState = { exists: false, indexes: [] };
+    const toCreate: RegularIndexSpec[] = [
+      [{ tenantId: 1, orderId: 1 }, { unique: true, partialFilterExpression: { active: true }, name: APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME }],
+    ];
+    const deps = makeFakeDeps('Approval', 'approvals', toCreate, state);
+
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m), true);
+
+    expect(
+      logs.some(
+        (l) => l.includes(APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME) && l.includes('unique') && l.includes('partial: {"active":true}'),
+      ),
+    ).toBe(true);
+  });
+
   it('(index audit e) demonstrates, via dry-run only, what removing a redundant standalone tenantId_1 would drop - the real schema is NOT changed by this test', async () => {
     // Models today's REAL deployed state for a collection like Conversation:
     // a standalone tenantId_1 (from the schema's field-level `index: true`)
@@ -473,10 +494,150 @@ describe('buildIndexPlans', () => {
     const labels = collectionPlans.map((plan) => plan.label);
 
     expect(labels).toContain('PolicyChunk');
-    expect(labels).toEqual(['Tenant', 'ApiKey', 'PolicyChunk', 'PolicyDocument', 'Conversation', 'Message', 'AgentRun', 'CustomerPublicKey']);
+    expect(labels).toEqual([
+      'Tenant',
+      'ApiKey',
+      'PolicyChunk',
+      'PolicyDocument',
+      'Conversation',
+      'Message',
+      'AgentRun',
+      'CustomerPublicKey',
+      'Approval',
+    ]);
 
     const policyChunkPlan = collectionPlans.find((plan) => plan.label === 'PolicyChunk')!;
     expect(policyChunkPlan.collectionName).toBe('policyChunks');
     expect(policyChunkPlan.ttl).toBeUndefined(); // PolicyChunk has no retention TTL - only its regular field-level indexes are managed here
+  });
+
+  it('(Milestone 4) Approval has its own TTL field and the protected active-per-order partial unique index', () => {
+    const { collectionPlans } = buildIndexPlans(2_592_000, 7_776_000);
+    const approvalPlan = collectionPlans.find((plan) => plan.label === 'Approval')!;
+
+    expect(approvalPlan.collectionName).toBe('approvals');
+    expect(approvalPlan.ttl?.field).toBe('createdAt');
+    expect(approvalPlan.ttl?.expireAfterSeconds).toBe(7_776_000); // the SEPARATE approval retention value, not the chat one
+    expect(approvalPlan.protectedIndexes).toEqual([
+      { name: APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME, expectedUnique: true, expectedPartialFilterExpression: { active: true } },
+    ]);
+  });
+
+  it('(Milestone 4) defaults the approval retention to the same value as chat retention when not given separately', () => {
+    const { collectionPlans } = buildIndexPlans(2_592_000);
+    const approvalPlan = collectionPlans.find((plan) => plan.label === 'Approval')!;
+    expect(approvalPlan.ttl?.expireAfterSeconds).toBe(2_592_000);
+  });
+});
+
+describe('resolveRetentionDays', () => {
+  it('returns the default when the env var is unset', () => {
+    expect(resolveRetentionDays(undefined, 90, 'APPROVAL_RETENTION_DAYS')).toBe(90);
+  });
+
+  it('parses a valid override', () => {
+    expect(resolveRetentionDays('120', 90, 'APPROVAL_RETENTION_DAYS')).toBe(120);
+  });
+
+  it('rejects a non-integer value', () => {
+    expect(() => resolveRetentionDays('30.5', 90, 'APPROVAL_RETENTION_DAYS')).toThrow(/must be a positive integer/);
+  });
+
+  it('rejects zero and negative values', () => {
+    expect(() => resolveRetentionDays('0', 90, 'APPROVAL_RETENTION_DAYS')).toThrow(/must be a positive integer/);
+    expect(() => resolveRetentionDays('-5', 90, 'APPROVAL_RETENTION_DAYS')).toThrow(/must be a positive integer/);
+  });
+
+  it('rejects a non-numeric value', () => {
+    expect(() => resolveRetentionDays('not-a-number', 90, 'APPROVAL_RETENTION_DAYS')).toThrow(/must be a positive integer/);
+  });
+});
+
+describe('checkProtectedIndexes (Milestone 4 amendment C)', () => {
+  const spec: ProtectedIndexSpec = {
+    name: APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME,
+    expectedUnique: true,
+    expectedPartialFilterExpression: { active: true },
+  };
+
+  it('does nothing when the index does not exist yet - diffSchemaIndexes\' own toCreate handles that normally', () => {
+    expect(() => checkProtectedIndexes([], [spec])).not.toThrow();
+  });
+
+  it('does nothing when the existing index matches exactly', () => {
+    const existing: ExistingIndexInfo[] = [
+      { name: spec.name, key: { tenantId: 1, orderId: 1 }, unique: true, partialFilterExpression: { active: true } },
+    ];
+    expect(() => checkProtectedIndexes(existing, [spec])).not.toThrow();
+  });
+
+  it('throws when the unique flag does not match', () => {
+    const existing: ExistingIndexInfo[] = [
+      { name: spec.name, key: { tenantId: 1, orderId: 1 }, unique: false, partialFilterExpression: { active: true } },
+    ];
+    expect(() => checkProtectedIndexes(existing, [spec])).toThrow(/does not match/);
+  });
+
+  it('throws when the partialFilterExpression does not match', () => {
+    const existing: ExistingIndexInfo[] = [
+      { name: spec.name, key: { tenantId: 1, orderId: 1 }, unique: true, partialFilterExpression: { active: false } },
+    ];
+    expect(() => checkProtectedIndexes(existing, [spec])).toThrow(/does not match/);
+  });
+
+  it('throws when the existing index has no partialFilterExpression at all (e.g. it was created as a plain unique index by mistake)', () => {
+    const existing: ExistingIndexInfo[] = [{ name: spec.name, key: { tenantId: 1, orderId: 1 }, unique: true }];
+    expect(() => checkProtectedIndexes(existing, [spec])).toThrow(/does not match/);
+  });
+
+  it('is checked unconditionally by ensureCollectionIndexes, even under --dry-run, and never auto-drops the mismatched index', async () => {
+    const state = {
+      exists: true,
+      indexes: [
+        { name: spec.name, key: { tenantId: 1, orderId: 1 }, unique: false, partialFilterExpression: { active: true } },
+      ] as ExistingIndexInfo[],
+    };
+    const deps: CollectionIndexDeps = {
+      label: 'Approval',
+      collectionName: 'approvals',
+      listCollectionNames: async () => (state.exists ? ['approvals'] : []),
+      createCollection: async () => undefined,
+      listIndexes: async () => state.indexes,
+      diffSchemaIndexes: async () => ({ toDrop: [spec.name], toCreate: [] }),
+      dropIndexes: async () => undefined,
+      createSchemaIndexes: async () => undefined,
+      protectedIndexes: [spec],
+    };
+
+    await expect(ensureCollectionIndexes(deps, () => undefined, true)).rejects.toThrow(/does not match/);
+    await expect(ensureCollectionIndexes(deps, () => undefined, false)).rejects.toThrow(/does not match/);
+  });
+
+  it('never appears in toDrop even when diffSchemaIndexes wants to drop it, once it matches - the same protection the TTL index already gets', async () => {
+    const state = {
+      exists: true,
+      indexes: [
+        { name: spec.name, key: { tenantId: 1, orderId: 1 }, unique: true, partialFilterExpression: { active: true } },
+      ] as ExistingIndexInfo[],
+    };
+    const dropped: string[] = [];
+    const deps: CollectionIndexDeps = {
+      label: 'Approval',
+      collectionName: 'approvals',
+      listCollectionNames: async () => ['approvals'],
+      createCollection: async () => undefined,
+      listIndexes: async () => state.indexes,
+      // Deliberately wrong, simulating a confused diff - this must be filtered out before
+      // ever reaching dropIndexes(), exactly like the ttlExisting?.name filter above it.
+      diffSchemaIndexes: async () => ({ toDrop: [spec.name], toCreate: [] }),
+      dropIndexes: async (names) => {
+        dropped.push(...names);
+      },
+      createSchemaIndexes: async () => undefined,
+      protectedIndexes: [spec],
+    };
+
+    await ensureCollectionIndexes(deps, () => undefined);
+    expect(dropped).toEqual([]);
   });
 });

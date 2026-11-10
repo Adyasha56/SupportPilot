@@ -10,6 +10,7 @@ export class InMemoryAgentRunRepository implements AgentRunRepository {
       ...run,
       degraded: run.degraded ?? null,
       proposedAction: run.proposedAction ?? null,
+      refundDisposition: run.refundDisposition ?? null,
       createdAt: new Date(),
     };
     this.runs.push(record);

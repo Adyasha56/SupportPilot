@@ -23,6 +23,7 @@ import { ConversationSchema } from '../../src/db/schemas/conversation.schema';
 import { MessageSchema } from '../../src/db/schemas/message.schema';
 import { AgentRunSchema } from '../../src/db/schemas/agent-run.schema';
 import { CustomerPublicKeySchema } from '../../src/db/schemas/customer-public-key.schema';
+import { ApprovalSchema } from '../../src/approvals/schemas/approval.schema';
 import { DEMO_TENANT_SETTINGS } from '../../src/db/tenant.repository';
 
 export interface TenantFixture {
@@ -143,6 +144,7 @@ export async function cleanupTenant(uri: string, tenantId: string): Promise<void
   const MessageModel = mongoose.model('Message', MessageSchema);
   const AgentRunModel = mongoose.model('AgentRun', AgentRunSchema);
   const CustomerPublicKeyModel = mongoose.model('CustomerPublicKey', CustomerPublicKeySchema);
+  const ApprovalModel = mongoose.model('Approval', ApprovalSchema);
 
   await Promise.all([
     TenantModel.deleteOne({ _id: tenantId }),
@@ -153,6 +155,8 @@ export async function cleanupTenant(uri: string, tenantId: string): Promise<void
     MessageModel.deleteMany({ tenantId }),
     AgentRunModel.deleteMany({ tenantId }),
     CustomerPublicKeyModel.deleteMany({ tenantId }),
+    // Milestone 4 - Approval rows a test created directly against the real database.
+    ApprovalModel.deleteMany({ tenantId }),
   ]);
 }
 

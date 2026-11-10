@@ -3,17 +3,24 @@
  * directory (runs compiled JS, see create-api-key.ts's own header).
  *
  *   pnpm run set-tenant-settings -- --tenantId=acme --refundCap=2000 \
- *     --approvalThreshold=250 --refundWindowDays=30 --autoExecuteRefunds=false \
- *     --approvalExpiryDays=7 [--dailyRefundCountLimit=3]
+ *     --approvalThreshold=250 --refundWindowDays=30 --approvalExpiryDays=7
+ *
+ *   # enabling auto-execute needs BOTH a daily count limit and explicit confirmation:
+ *   pnpm run set-tenant-settings -- --tenantId=acme --autoExecuteRefunds=true \
+ *     --dailyRefundCountLimit=3 --confirmAutoExecute
  *
  * There is no admin console yet (Milestone 5) - this is the only way to
  * change a tenant's Milestone 4 refund-verifier settings today. Only the
  * flags actually passed are changed; an omitted flag keeps its current
- * stored value, it is never reset to a default. Refuses to run against
- * what looks like the shared test database unless --allow-test-db is
- * passed, same as every other script here. Errors clearly if the tenant
- * doesn't exist yet rather than silently creating one with partial
- * settings - run create-api-key first.
+ * stored value, it is never reset to a default. Bounds and cross-field
+ * validation (approvalThreshold <= refundCap, a hard max on refundCap,
+ * autoExecuteRefunds requiring dailyRefundCountLimit) run against the
+ * EFFECTIVE merged settings in TenantRepository.updateSettings - see
+ * tenant-settings-validation.ts - not just this call's own flags in
+ * isolation. Refuses to run against what looks like the shared test
+ * database unless --allow-test-db is passed, same as every other script
+ * here. Errors clearly if the tenant doesn't exist yet rather than
+ * silently creating one with partial settings - run create-api-key first.
  */
 import mongoose, { Model } from 'mongoose';
 import { TENANT_ID_PATTERN } from '@supportpilot/shared';
@@ -91,6 +98,19 @@ function hasAnySetting(patch: TenantSettingsPatch): boolean {
   return Object.values(patch).some((value) => value !== undefined);
 }
 
+/**
+ * Amendment N-c: plain CLI-level friction, independent of the
+ * dailyRefundCountLimit requirement TenantRepository.updateSettings itself
+ * enforces - two separate reasons someone would have to deliberately
+ * override before an unattended refund can ever fire. Exported for its own
+ * unit test.
+ */
+export function requireAutoExecuteConfirmation(patch: TenantSettingsPatch, args: Record<string, string | boolean>): void {
+  if (patch.autoExecuteRefunds === true && args.confirmAutoExecute !== true) {
+    throw new Error('--autoExecuteRefunds=true also requires --confirmAutoExecute, to confirm you mean to enable unattended refund execution.');
+  }
+}
+
 function printTenant(tenant: Tenant): void {
   console.log(`Tenant "${tenant.id}" settings are now:`);
   console.log(`  refundCap: ${tenant.refundCap ?? '(unset)'}`);
@@ -115,6 +135,7 @@ async function main(): Promise<void> {
   if (!hasAnySetting(patch)) {
     throw new Error('No settings flags were passed - nothing to do. See this script\'s header for the available flags.');
   }
+  requireAutoExecuteConfirmation(patch, args);
 
   assertNotTestDatabase(uri, args['allow-test-db'] === true);
 

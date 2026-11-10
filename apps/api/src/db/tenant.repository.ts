@@ -1,7 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { TenantDocument } from './schemas/tenant.schema';
+import { validateEffectiveTenantSettings } from './tenant-settings-validation';
 
 export interface Tenant {
   id: string;
@@ -88,23 +89,38 @@ export class TenantNotFoundError extends Error {
   }
 }
 
-function toTenant(doc: Pick<TenantDocument, '_id' | 'name' | 'settings'>): Tenant {
+/**
+ * Milestone 4 amendment N-e: a tenant document created before a given
+ * settings field existed (or before Milestone 4 at all) must read back
+ * the SAME demo default a freshly-created tenant gets, never `undefined`
+ * - a legacy tenant silently behaving as "no refund window at all" (an
+ * undefined refundWindowDays would make the verifier's rule 6 always
+ * fail) would be a much worse failure mode than just applying the
+ * documented default. dailyRefundCountLimit is deliberately excluded -
+ * "no limit configured" is its own real, intentional meaning, not a gap
+ * to fill with a default.
+ */
+export function toTenant(doc: Pick<TenantDocument, '_id' | 'name' | 'settings'>): Tenant {
   const settings = doc.settings ?? {};
   return {
     id: doc._id,
     name: doc.name,
     ...(settings.allowedOrigins ? { allowedOrigins: settings.allowedOrigins } : {}),
-    ...(settings.refundCap !== undefined ? { refundCap: settings.refundCap } : {}),
-    ...(settings.approvalThreshold !== undefined ? { approvalThreshold: settings.approvalThreshold } : {}),
-    ...(settings.refundWindowDays !== undefined ? { refundWindowDays: settings.refundWindowDays } : {}),
-    ...(settings.autoExecuteRefunds !== undefined ? { autoExecuteRefunds: settings.autoExecuteRefunds } : {}),
-    ...(settings.approvalExpiryDays !== undefined ? { approvalExpiryDays: settings.approvalExpiryDays } : {}),
+    refundCap: settings.refundCap ?? DEMO_TENANT_SETTINGS.refundCap,
+    approvalThreshold: settings.approvalThreshold ?? DEMO_TENANT_SETTINGS.approvalThreshold,
+    refundWindowDays: settings.refundWindowDays ?? DEMO_TENANT_SETTINGS.refundWindowDays,
+    autoExecuteRefunds: settings.autoExecuteRefunds ?? DEMO_TENANT_SETTINGS.autoExecuteRefunds,
+    approvalExpiryDays: settings.approvalExpiryDays ?? DEMO_TENANT_SETTINGS.approvalExpiryDays,
     ...(settings.dailyRefundCountLimit !== undefined ? { dailyRefundCountLimit: settings.dailyRefundCountLimit } : {}),
   };
 }
 
+const SETTINGS_PATCH_KEYS = ['refundCap', 'approvalThreshold', 'refundWindowDays', 'autoExecuteRefunds', 'approvalExpiryDays', 'dailyRefundCountLimit'] as const;
+
 @Injectable()
 export class MongooseTenantRepository implements TenantRepository {
+  private readonly logger = new Logger(MongooseTenantRepository.name);
+
   constructor(@InjectModel('Tenant') private readonly model: Model<TenantDocument>) {}
 
   async findById(tenantId: string): Promise<Tenant | null> {
@@ -123,20 +139,73 @@ export class MongooseTenantRepository implements TenantRepository {
         { upsert: true, new: true },
       )
       .lean();
-    return { id: doc!._id, name: doc!.name };
+    return toTenant(doc!);
   }
 
+  /**
+   * Milestone 4 amendments N-b/N-d: validates the EFFECTIVE merged settings
+   * (current, defaults-applied values with patch's defined keys overlaid) -
+   * not patch in isolation - so a call that only passes --approvalThreshold
+   * still gets rejected if the result would exceed an already-stored
+   * refundCap, and logs a structured audit line naming only the keys that
+   * actually changed (settings values are not secrets, unlike customer
+   * PII, so logging their actual before/after values is fine and useful).
+   * Not atomic against a concurrent second admin call - acceptable for a
+   * single-operator CLI tool with no admin console yet (Milestone 5).
+   */
   async updateSettings(tenantId: string, patch: TenantSettingsPatch): Promise<Tenant> {
+    const existingDoc = await this.model.findById(tenantId).lean();
+    if (!existingDoc) {
+      throw new TenantNotFoundError(tenantId);
+    }
+    const before = toTenant(existingDoc);
+    const effective = { ...before, ...removeUndefinedPatchEntries(patch) };
+    validateEffectiveTenantSettings(effective);
+
     const $set: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(patch)) {
-      if (value !== undefined) {
+    const changedKeys: (typeof SETTINGS_PATCH_KEYS)[number][] = [];
+    for (const key of SETTINGS_PATCH_KEYS) {
+      const value = patch[key];
+      if (value !== undefined && value !== before[key]) {
         $set[`settings.${key}`] = value;
+        changedKeys.push(key);
       }
     }
+
+    // Every passed value already equals what's stored (e.g. a no-op re-run) - an empty $set
+    // is itself a MongoDB error, and there is nothing to change or audit-log anyway.
+    if (changedKeys.length === 0) {
+      return before;
+    }
+
     const doc = await this.model.findByIdAndUpdate(tenantId, { $set }, { new: true }).lean();
     if (!doc) {
       throw new TenantNotFoundError(tenantId);
     }
-    return toTenant(doc);
+    const after = toTenant(doc);
+
+    this.logger.log(
+      JSON.stringify({
+        event: 'tenant_settings_changed',
+        tenantId,
+        changedKeys,
+        before: Object.fromEntries(changedKeys.map((key) => [key, before[key]])),
+        after: Object.fromEntries(changedKeys.map((key) => [key, after[key]])),
+      }),
+    );
+
+    return after;
   }
+}
+
+/** A patch may structurally carry `undefined` for every key (TenantSettingsPatch is a Partial) - this is the one place that's filtered out before a merge, so an omitted flag never overwrites a stored value with undefined. */
+function removeUndefinedPatchEntries(patch: TenantSettingsPatch): Partial<TenantSettingsPatch> {
+  const result: Partial<TenantSettingsPatch> = {};
+  for (const key of SETTINGS_PATCH_KEYS) {
+    const value = patch[key];
+    if (value !== undefined) {
+      (result as Record<string, unknown>)[key] = value;
+    }
+  }
+  return result;
 }

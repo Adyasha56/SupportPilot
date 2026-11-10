@@ -2,10 +2,11 @@ import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { DegradedReason } from '@supportpilot/shared';
 import { Model } from 'mongoose';
-import { AgentProposedActionSubdocument, AgentRunDocument, AgentStepSubdocument } from './schemas/agent-run.schema';
+import { AgentProposedActionSubdocument, AgentRunDocument, AgentStepSubdocument, RefundDispositionSubdocument } from './schemas/agent-run.schema';
 
 export type NewAgentRunStep = AgentStepSubdocument;
 export type NewAgentRunProposedAction = AgentProposedActionSubdocument;
+export type NewAgentRunRefundDisposition = RefundDispositionSubdocument;
 
 export interface NewAgentRun {
   tenantId: string;
@@ -19,12 +20,15 @@ export interface NewAgentRun {
   latencyMs: number;
   steps: NewAgentRunStep[];
   proposedAction?: NewAgentRunProposedAction;
+  /** Milestone 4 amendment D - written once here, never updated afterward. Absent entirely for a run that never proposed a refund at all. */
+  refundDisposition?: NewAgentRunRefundDisposition;
 }
 
-export interface AgentRunRecord extends Omit<NewAgentRun, 'degraded' | 'proposedAction'> {
+export interface AgentRunRecord extends Omit<NewAgentRun, 'degraded' | 'proposedAction' | 'refundDisposition'> {
   id: string;
   degraded: DegradedReason | null;
   proposedAction: NewAgentRunProposedAction | null;
+  refundDisposition: NewAgentRunRefundDisposition | null;
   createdAt: Date;
 }
 
@@ -52,6 +56,7 @@ function toRecord(doc: AgentRunDocument): AgentRunRecord {
     latencyMs: doc.latencyMs,
     steps: doc.steps,
     proposedAction: doc.proposedAction,
+    refundDisposition: doc.refundDisposition,
     createdAt: doc.createdAt,
   };
 }
@@ -61,7 +66,12 @@ export class MongooseAgentRunRepository implements AgentRunRepository {
   constructor(@InjectModel('AgentRun') private readonly model: Model<AgentRunDocument>) {}
 
   async create(run: NewAgentRun): Promise<AgentRunRecord> {
-    const doc = await this.model.create({ ...run, degraded: run.degraded ?? null, proposedAction: run.proposedAction ?? null });
+    const doc = await this.model.create({
+      ...run,
+      degraded: run.degraded ?? null,
+      proposedAction: run.proposedAction ?? null,
+      refundDisposition: run.refundDisposition ?? null,
+    });
     return toRecord(doc);
   }
 

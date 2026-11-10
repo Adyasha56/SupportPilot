@@ -40,10 +40,29 @@ import { ConversationSchema } from '../db/schemas/conversation.schema';
 import { MessageSchema } from '../db/schemas/message.schema';
 import { AgentRunSchema } from '../db/schemas/agent-run.schema';
 import { CustomerPublicKeySchema } from '../db/schemas/customer-public-key.schema';
+import { APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME, ApprovalSchema } from '../approvals/schemas/approval.schema';
 
 export const COLLECTION_NAME = 'policyChunks';
 export const POLL_INTERVAL_MS = 10_000;
 export const QUERYABLE_TIMEOUT_MS = 120_000;
+
+/**
+ * Milestone 4 - validated, unlike CHAT_RETENTION_DAYS's existing bare
+ * `Number(...)` read (left as-is; not this task's scope to change). A
+ * malformed or non-positive APPROVAL_RETENTION_DAYS must fail loudly here
+ * rather than silently compute a nonsensical expireAfterSeconds (NaN, or
+ * zero/negative, which MongoDB would otherwise accept literally).
+ */
+export function resolveRetentionDays(envValue: string | undefined, defaultValue: number, envName: string): number {
+  if (envValue === undefined) {
+    return defaultValue;
+  }
+  const value = Number(envValue);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${envName} must be a positive integer number of days; got "${envValue}".`);
+  }
+  return value;
+}
 
 export interface ExistingSearchIndex {
   name?: string;
@@ -257,6 +276,8 @@ export interface ExistingIndexInfo {
   key: Record<string, number>;
   unique?: boolean;
   expireAfterSeconds?: number;
+  /** Milestone 4 amendment C - present only on a partial index (e.g. the Approval active-per-order unique index). */
+  partialFilterExpression?: Record<string, unknown>;
 }
 
 export type RegularIndexSpec = [Record<string, number>, Record<string, unknown>];
@@ -287,6 +308,8 @@ export interface CollectionIndexDeps {
     /** Changes an EXISTING TTL index's expiry via collMod - never drops/recreates the index. */
     updateExpiry(): Promise<void>;
   };
+  /** Milestone 4 amendment C - indexes that must error rather than be auto-dropped-and-recreated on a mismatch. See checkProtectedIndexes' own doc comment. */
+  protectedIndexes?: ProtectedIndexSpec[];
 }
 
 export function findSingleFieldTtlIndex(indexes: ExistingIndexInfo[], field: string): ExistingIndexInfo | undefined {
@@ -303,21 +326,80 @@ function indexNameFromKeys(keys: Record<string, number>): string {
 
 function describeIndexToCreate([keys, options]: RegularIndexSpec): string {
   const name = typeof options.name === 'string' ? options.name : indexNameFromKeys(keys);
-  return options.unique ? `${name} (unique)` : name;
+  const flags = [
+    options.unique ? 'unique' : undefined,
+    options.partialFilterExpression ? `partial: ${JSON.stringify(options.partialFilterExpression)}` : undefined,
+  ].filter((flag): flag is string => flag !== undefined);
+  return flags.length > 0 ? `${name} (${flags.join(', ')})` : name;
 }
 
 /**
- * Per-index detail for the "existing indexes" log line - unique and TTL
- * expiry are exactly the two properties that distinguish an index from
- * its bare name, and both are easy to get silently wrong in a schema
- * (see learning-notes.md's audit of the redundant tenantId_1 indexes and
- * the unique-flag check this was written for).
+ * Per-index detail for the "existing indexes" log line - unique, TTL
+ * expiry, and (Milestone 4 amendment C) a partial filter expression are
+ * exactly the properties that distinguish an index from its bare name,
+ * and all are easy to get silently wrong in a schema (see
+ * learning-notes.md's audit of the redundant tenantId_1 indexes and the
+ * unique-flag check this was written for).
  */
 function describeExistingIndex(idx: ExistingIndexInfo): string {
-  const flags = [idx.unique ? 'unique' : undefined, idx.expireAfterSeconds !== undefined ? `TTL ${idx.expireAfterSeconds}s` : undefined].filter(
-    (flag): flag is string => flag !== undefined,
-  );
+  const flags = [
+    idx.unique ? 'unique' : undefined,
+    idx.expireAfterSeconds !== undefined ? `TTL ${idx.expireAfterSeconds}s` : undefined,
+    idx.partialFilterExpression ? `partial: ${JSON.stringify(idx.partialFilterExpression)}` : undefined,
+  ].filter((flag): flag is string => flag !== undefined);
   return flags.length > 0 ? `${idx.name} (${flags.join(', ')})` : idx.name;
+}
+
+/** Plain structural equality for JSON-safe filter objects - order-independent on keys, which is all a partialFilterExpression ever needs (it's never deeply nested in this project's own usage). */
+function partialFilterExpressionsEqual(a: Record<string, unknown> | undefined, b: Record<string, unknown> | undefined): boolean {
+  if (!a || !b) {
+    return a === b;
+  }
+  const aKeys = Object.keys(a).sort();
+  const bKeys = Object.keys(b).sort();
+  if (aKeys.length !== bKeys.length || aKeys.some((k, i) => k !== bKeys[i])) {
+    return false;
+  }
+  return aKeys.every((k) => a[k] === b[k]);
+}
+
+/**
+ * Milestone 4 amendment C - a regular index this script must NEVER
+ * auto-drop-and-recreate just because diffIndexes() thinks its options
+ * changed, the same protection the TTL index already gets (see this
+ * file's own module doc comment), extended here to cover `unique` and
+ * `partialFilterExpression` rather than `expireAfterSeconds`. A real
+ * mismatch is a validation finding, not a mutation this script performs
+ * automatically - exactly like the PolicyChunk vector index's own
+ * definitionsMatch check - because changing a UNIQUE partial index's
+ * filter on a collection that already has live data can only be done
+ * safely by hand (a blind drop briefly removes the uniqueness guarantee;
+ * a blind recreate can fail outright if documents violating the NEW
+ * filter already exist).
+ */
+export interface ProtectedIndexSpec {
+  name: string;
+  expectedUnique: boolean;
+  expectedPartialFilterExpression: Record<string, unknown>;
+}
+
+export function checkProtectedIndexes(existingIndexes: ExistingIndexInfo[], protectedIndexes: ProtectedIndexSpec[]): void {
+  for (const spec of protectedIndexes) {
+    const existing = existingIndexes.find((idx) => idx.name === spec.name);
+    if (!existing) {
+      continue; // doesn't exist yet - diffSchemaIndexes()'s own toCreate handles this normally.
+    }
+    const matches =
+      Boolean(existing.unique) === spec.expectedUnique &&
+      partialFilterExpressionsEqual(existing.partialFilterExpression, spec.expectedPartialFilterExpression);
+    if (!matches) {
+      throw new Error(
+        `Index "${spec.name}" already exists but its unique flag or partialFilterExpression does not match the ` +
+          'expected definition. Not auto-fixing - resolve this manually (changing a partial unique index\'s filter ' +
+          'on a collection with live data needs a careful, deliberate migration, never an automated drop+recreate).',
+      );
+    }
+  }
 }
 
 type TtlAction = { kind: 'none' } | { kind: 'create' } | { kind: 'collMod'; fromSeconds: number | undefined };
@@ -403,12 +485,20 @@ export async function ensureCollectionIndexes(
       : `${deps.label}: no indexes exist yet.`,
   );
 
+  // Always checked, dry-run or not - a mismatch is a validation finding, not a mutation this
+  // script performs, same as the vector index's own definitionsMatch check below.
+  if (deps.protectedIndexes) {
+    checkProtectedIndexes(existingIndexes, deps.protectedIndexes);
+  }
+
   const { toDrop: rawToDrop, toCreate } = await deps.diffSchemaIndexes();
 
-  // Never let the regular-index diff drop the TTL-managed index - this is
-  // the fix for the bug described in the module doc comment above.
+  // Never let the regular-index diff drop the TTL-managed index, or a protected index (Milestone
+  // 4 amendment C) - this is the fix for the bug described in the module doc comment above,
+  // extended to cover the second kind of index this script must never auto-drop-and-recreate.
   const ttlExisting = deps.ttl ? findSingleFieldTtlIndex(existingIndexes, deps.ttl.field) : undefined;
-  const toDrop = rawToDrop.filter((name) => name !== ttlExisting?.name);
+  const protectedNames = new Set((deps.protectedIndexes ?? []).map((p) => p.name));
+  const toDrop = rawToDrop.filter((name) => name !== ttlExisting?.name && !protectedNames.has(name));
 
   const ttlAction: TtlAction = deps.ttl ? planTtlAction(deps.ttl, ttlExisting) : { kind: 'none' };
 
@@ -476,10 +566,12 @@ function makeCollectionDeps(
   collectionName: string,
   expireAfterSeconds: number,
   ttlField?: string,
+  protectedIndexes?: ProtectedIndexSpec[],
 ): CollectionIndexDeps {
   return {
     label,
     collectionName,
+    protectedIndexes,
     listCollectionNames: async () => {
       const collections = await mongoose.connection.db!.listCollections({ name: collectionName }).toArray();
       return collections.map((c) => c.name);
@@ -525,7 +617,10 @@ function makeCollectionDeps(
  * of this kind of wiring drifting apart; this keeps there from being a
  * second copy to drift.
  */
-export function buildIndexPlans(expireAfterSeconds: number): {
+export function buildIndexPlans(
+  expireAfterSeconds: number,
+  approvalExpireAfterSeconds: number = expireAfterSeconds,
+): {
   collectionPlans: CollectionIndexDeps[];
   vectorSearchDeps: EnsureIndexDeps;
 } {
@@ -537,6 +632,7 @@ export function buildIndexPlans(expireAfterSeconds: number): {
   const messageModel = mongoose.model('Message', MessageSchema);
   const agentRunModel = mongoose.model('AgentRun', AgentRunSchema);
   const customerPublicKeyModel = mongoose.model('CustomerPublicKey', CustomerPublicKeySchema);
+  const approvalModel = mongoose.model('Approval', ApprovalSchema);
 
   const vectorSearchDeps: EnsureIndexDeps = {
     listCollectionNames: async () => {
@@ -568,6 +664,17 @@ export function buildIndexPlans(expireAfterSeconds: number): {
     makeCollectionDeps('Message', messageModel, 'messages', expireAfterSeconds, 'createdAt'),
     makeCollectionDeps('AgentRun', agentRunModel, 'agentRuns', expireAfterSeconds, 'createdAt'),
     makeCollectionDeps('CustomerPublicKey', customerPublicKeyModel, 'customerPublicKeys', expireAfterSeconds),
+    // Milestone 4 amendment C - its own retention period (APPROVAL_RETENTION_DAYS, default 90,
+    // longer than CHAT_RETENTION_DAYS - an approval is an audit/compliance record), and the
+    // protected partial unique index that must error rather than auto-drop-and-recreate on a
+    // mismatch (checkProtectedIndexes, above).
+    makeCollectionDeps('Approval', approvalModel, 'approvals', approvalExpireAfterSeconds, 'createdAt', [
+      {
+        name: APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME,
+        expectedUnique: true,
+        expectedPartialFilterExpression: { active: true },
+      },
+    ]),
   ];
 
   return { collectionPlans, vectorSearchDeps };
@@ -583,8 +690,10 @@ async function main(): Promise<void> {
 
   const allowTestDb = process.argv.includes('--allow-test-db');
   const dryRun = process.argv.includes('--dry-run');
+  let approvalRetentionDays: number;
   try {
     assertNotTestDatabase(uri, allowTestDb);
+    approvalRetentionDays = resolveRetentionDays(process.env.APPROVAL_RETENTION_DAYS, 90, 'APPROVAL_RETENTION_DAYS');
   } catch (err) {
     console.error((err as Error).message);
     process.exitCode = 1;
@@ -600,10 +709,12 @@ async function main(): Promise<void> {
   await mongoose.connect(uri);
   const retentionDays = Number(process.env.CHAT_RETENTION_DAYS ?? 30);
   const expireAfterSeconds = retentionDays * 24 * 60 * 60;
-  const { collectionPlans, vectorSearchDeps } = buildIndexPlans(expireAfterSeconds);
+  const approvalExpireAfterSeconds = approvalRetentionDays * 24 * 60 * 60;
+  const { collectionPlans, vectorSearchDeps } = buildIndexPlans(expireAfterSeconds, approvalExpireAfterSeconds);
 
   try {
     console.log(`Retention: ${retentionDays} day(s) (CHAT_RETENTION_DAYS) - expireAfterSeconds=${expireAfterSeconds}.`);
+    console.log(`Retention: ${approvalRetentionDays} day(s) (APPROVAL_RETENTION_DAYS) - expireAfterSeconds=${approvalExpireAfterSeconds}.`);
     for (const plan of collectionPlans) {
       await ensureCollectionIndexes(plan, (message) => console.log(message), dryRun);
     }

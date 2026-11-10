@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildSettingsPatch, parseArgs, requireTenantId } from './set-tenant-settings';
+import { buildSettingsPatch, parseArgs, requireAutoExecuteConfirmation, requireTenantId } from './set-tenant-settings';
 
 describe('parseArgs', () => {
   it('parses --key=value pairs and bare --flags', () => {
@@ -79,5 +79,20 @@ describe('buildSettingsPatch', () => {
 
   it('rejects an invalid autoExecuteRefunds value', () => {
     expect(() => buildSettingsPatch({ autoExecuteRefunds: 'yes' })).toThrow(/--autoExecuteRefunds must be "true" or "false"/);
+  });
+});
+
+describe('requireAutoExecuteConfirmation (amendment N-c)', () => {
+  it('rejects enabling autoExecuteRefunds without --confirmAutoExecute', () => {
+    expect(() => requireAutoExecuteConfirmation({ autoExecuteRefunds: true }, {})).toThrow(/--confirmAutoExecute/);
+  });
+
+  it('accepts enabling autoExecuteRefunds with --confirmAutoExecute', () => {
+    expect(() => requireAutoExecuteConfirmation({ autoExecuteRefunds: true }, { confirmAutoExecute: true })).not.toThrow();
+  });
+
+  it('never requires confirmation when autoExecuteRefunds is not being set to true in this call', () => {
+    expect(() => requireAutoExecuteConfirmation({}, {})).not.toThrow();
+    expect(() => requireAutoExecuteConfirmation({ autoExecuteRefunds: false }, {})).not.toThrow();
   });
 });
