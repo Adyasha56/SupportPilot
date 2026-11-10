@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { NewApproval } from '../../approvals/approval.repository';
+import { DuplicateActiveApprovalError, NewApproval } from '../../approvals/approval.repository';
 import { InMemoryApprovalRepository } from './in-memory-approval.repository';
 
 const NOW = new Date('2026-11-09T00:00:00.000Z');
@@ -36,14 +36,39 @@ describe('InMemoryApprovalRepository.create', () => {
     expect(record.expiresAt.getTime()).toBe(NOW.getTime() + 7 * 24 * 60 * 60 * 1000);
   });
 
-  it('two proposals for the same order both succeed at the repository level - the active-uniqueness guarantee is the caller/index\'s job, not create()\'s', async () => {
-    // (confirmed deliberately: create() itself has no notion of "already active for this order" -
-    // that's the partial unique index's job in the real repository, exercised by the integration
-    // tests; this in-memory fake doesn't attempt to reproduce a database-level unique constraint.)
+  it('amendment F2: a second proposal for an order that already has an active approval throws DuplicateActiveApprovalError', async () => {
+    const repo = new InMemoryApprovalRepository();
+    await createPending(repo, { orderId: 'ORD-1001' });
+    await expect(createPending(repo, { orderId: 'ORD-1001' })).rejects.toBeInstanceOf(DuplicateActiveApprovalError);
+  });
+
+  it('a second proposal for the same order succeeds once the first is no longer active', async () => {
     const repo = new InMemoryApprovalRepository();
     const first = await createPending(repo, { orderId: 'ORD-1001' });
+    await repo.reject('acme', first.id, 'key_1', NOW);
     const second = await createPending(repo, { orderId: 'ORD-1001' });
-    expect(first.id).not.toBe(second.id);
+    expect(second.id).not.toBe(first.id);
+  });
+});
+
+describe('InMemoryApprovalRepository.findActiveByOrder (amendment F2)', () => {
+  it('finds the active row for an order', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const created = await createPending(repo, { orderId: 'ORD-1001' });
+    const found = await repo.findActiveByOrder('acme', 'ORD-1001');
+    expect(found?.id).toBe(created.id);
+  });
+
+  it('returns null once the row is no longer active', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const created = await createPending(repo, { orderId: 'ORD-1001' });
+    await repo.reject('acme', created.id, 'key_1', NOW);
+    expect(await repo.findActiveByOrder('acme', 'ORD-1001')).toBeNull();
+  });
+
+  it('returns null for an order with no approval at all', async () => {
+    const repo = new InMemoryApprovalRepository();
+    expect(await repo.findActiveByOrder('acme', 'ORD-9999')).toBeNull();
   });
 });
 
@@ -128,7 +153,7 @@ describe('InMemoryApprovalRepository.retryFromFailed (amendment A - no re-verifi
   async function setupRetryableFailure(repo: InMemoryApprovalRepository) {
     const created = await createPending(repo);
     await repo.beginExecution('acme', created.id, [], NOW);
-    await repo.markFailed('acme', created.id, { retryable: true, executionResultCode: 'UPSTREAM_TIMEOUT' }, NOW);
+    await repo.markFailed('acme', created.id, 1, { retryable: true, active: true, executionResultCode: 'TIMEOUT', failureClass: 'AMBIGUOUS', upstreamMaybeReceived: true }, NOW);
     return created.id;
   }
 
@@ -148,7 +173,7 @@ describe('InMemoryApprovalRepository.retryFromFailed (amendment A - no re-verifi
     const repo = new InMemoryApprovalRepository();
     const created = await createPending(repo);
     await repo.beginExecution('acme', created.id, [], NOW);
-    await repo.markFailed('acme', created.id, { retryable: false, executionResultCode: 'ALREADY_REFUNDED_UPSTREAM' }, NOW);
+    await repo.markFailed('acme', created.id, 1, { retryable: false, active: false, executionResultCode: 'NOT_FOUND', failureClass: 'DEFINITIVE', upstreamMaybeReceived: false }, NOW);
 
     expect(await repo.retryFromFailed('acme', created.id, NOW)).toBeNull();
   });
@@ -163,13 +188,13 @@ describe('InMemoryApprovalRepository.retryFromFailed (amendment A - no re-verifi
   });
 });
 
-describe('InMemoryApprovalRepository.markExecuted', () => {
-  it('executing -> executed, active: false, executionResultCode recorded', async () => {
+describe('InMemoryApprovalRepository.markExecuted (amendment F1 fencing)', () => {
+  it('executing -> executed, active: false, executionResultCode OK, when attemptCount matches', async () => {
     const repo = new InMemoryApprovalRepository();
     const created = await createPending(repo);
-    await repo.beginExecution('acme', created.id, [], NOW);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
 
-    const result = await repo.markExecuted('acme', created.id, 'OK', NOW);
+    const result = await repo.markExecuted('acme', created.id, begun!.attemptCount, NOW);
     expect(result?.status).toBe('executed');
     expect(result?.active).toBe(false);
     expect(result?.executionResultCode).toBe('OK');
@@ -178,28 +203,61 @@ describe('InMemoryApprovalRepository.markExecuted', () => {
   it('never executes a row that is not currently executing (e.g. still pending)', async () => {
     const repo = new InMemoryApprovalRepository();
     const created = await createPending(repo);
-    expect(await repo.markExecuted('acme', created.id, 'OK', NOW)).toBeNull();
+    expect(await repo.markExecuted('acme', created.id, 0, NOW)).toBeNull();
   });
 
-  it('lost race: a row already marked executed can never be marked executed again', async () => {
+  it('a STALE markExecuted (wrong attemptCount, after a lease takeover already moved it forward) does nothing', async () => {
     const repo = new InMemoryApprovalRepository();
     const created = await createPending(repo);
-    await repo.beginExecution('acme', created.id, [], NOW);
-    const first = await repo.markExecuted('acme', created.id, 'OK', NOW);
-    const second = await repo.markExecuted('acme', created.id, 'OK', NOW);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW); // attemptCount 1
+    await repo.takeOverStuckExecution('acme', created.id, begun!.executingSince!, new Date(NOW.getTime() + 120_000)); // attemptCount 2 now
+
+    // Attempt #1's own late success report still carries its OWN original attemptCount (1).
+    const staleResult = await repo.markExecuted('acme', created.id, 1, NOW);
+    expect(staleResult).toBeNull();
+
+    // The row is untouched by the stale call - still executing, at the NEW attempt.
+    const current = await repo.findById('acme', created.id);
+    expect(current?.status).toBe('executing');
+    expect(current?.attemptCount).toBe(2);
+  });
+
+  it('a stale markExecuted after the CURRENT attempt already succeeded is a safe no-op - the record already reflects the truth', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const created = await createPending(repo);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
+    await repo.takeOverStuckExecution('acme', created.id, begun!.executingSince!, new Date(NOW.getTime() + 120_000)); // now attemptCount 2
+    const executedByAttempt2 = await repo.markExecuted('acme', created.id, 2, NOW);
+    expect(executedByAttempt2?.status).toBe('executed');
+
+    // Attempt #1's late, stale success report - fenced out, but harmless, because attempt #2's
+    // (or the store's idempotent replay of attempt #1's own request) already recorded the truth.
+    const staleResult = await repo.markExecuted('acme', created.id, 1, NOW);
+    expect(staleResult).toBeNull();
+    const finalState = await repo.findById('acme', created.id);
+    expect(finalState?.status).toBe('executed'); // still correctly executed, exactly once
+  });
+
+  it('lost race: a row already marked executed can never be marked executed again, even with the right attemptCount', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const created = await createPending(repo);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
+    const first = await repo.markExecuted('acme', created.id, begun!.attemptCount, NOW);
+    const second = await repo.markExecuted('acme', created.id, begun!.attemptCount, NOW);
     expect(first).not.toBeNull();
     expect(second).toBeNull();
   });
 });
 
-describe('InMemoryApprovalRepository.markFailed', () => {
+describe('InMemoryApprovalRepository.markFailed (amendments F1/F4)', () => {
   it('pending -> failed, non-retryable, when the decision-time verifier re-check itself fails (no upstream attempt made)', async () => {
     const repo = new InMemoryApprovalRepository();
     const created = await createPending(repo);
     const result = await repo.markFailed(
       'acme',
       created.id,
-      { retryable: false, reasonCode: 'ORDER_STATUS_INELIGIBLE', verifierVerdictAtDecision: [{ code: 'ORDER_STATUS_INELIGIBLE', passed: false }] },
+      0,
+      { retryable: false, active: false, reasonCode: 'ORDER_STATUS_INELIGIBLE', verifierVerdictAtDecision: [{ code: 'ORDER_STATUS_INELIGIBLE', passed: false }] },
       NOW,
     );
     expect(result?.status).toBe('failed');
@@ -209,33 +267,75 @@ describe('InMemoryApprovalRepository.markFailed', () => {
     expect(result?.attemptCount).toBe(0); // no execution was ever attempted
   });
 
-  it('executing -> failed, retryable (ambiguous upstream outcome) stays active', async () => {
+  it('executing -> failed, AMBIGUOUS, stays active, fenced on attemptCount', async () => {
     const repo = new InMemoryApprovalRepository();
     const created = await createPending(repo);
-    await repo.beginExecution('acme', created.id, [], NOW);
-    const result = await repo.markFailed('acme', created.id, { retryable: true, executionResultCode: 'UPSTREAM_TIMEOUT' }, NOW);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
+    const result = await repo.markFailed(
+      'acme',
+      created.id,
+      begun!.attemptCount,
+      { retryable: true, active: true, executionResultCode: 'TIMEOUT', failureClass: 'AMBIGUOUS', upstreamMaybeReceived: true },
+      NOW,
+    );
     expect(result?.status).toBe('failed');
     expect(result?.retryable).toBe(true);
-    expect(result?.active).toBe(true); // still blocks a second active approval for this order
+    expect(result?.active).toBe(true);
+    expect(result?.upstreamMaybeReceived).toBe(true);
     expect(result?.decidedAt).toBeNull(); // nothing is actually decided yet
   });
 
-  it('executing -> failed, non-retryable (definitive upstream outcome) becomes inactive and decided', async () => {
+  it('executing -> failed, DEFINITIVE, becomes inactive and decided', async () => {
     const repo = new InMemoryApprovalRepository();
     const created = await createPending(repo);
-    await repo.beginExecution('acme', created.id, [], NOW);
-    const result = await repo.markFailed('acme', created.id, { retryable: false, executionResultCode: 'ALREADY_REFUNDED_UPSTREAM' }, NOW);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
+    const result = await repo.markFailed(
+      'acme',
+      created.id,
+      begun!.attemptCount,
+      { retryable: false, active: false, executionResultCode: 'NOT_FOUND', failureClass: 'DEFINITIVE', upstreamMaybeReceived: false },
+      NOW,
+    );
     expect(result?.retryable).toBe(false);
     expect(result?.active).toBe(false);
     expect(result?.decidedAt).toEqual(NOW);
   });
 
+  it('executing -> failed, NEEDS_RECONCILIATION (a retry-time CONFLICT): not retryable, but STAYS active and undecided', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const created = await createPending(repo);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
+    const result = await repo.markFailed(
+      'acme',
+      created.id,
+      begun!.attemptCount,
+      { retryable: false, active: true, executionResultCode: 'CONFLICT', failureClass: 'NEEDS_RECONCILIATION', upstreamMaybeReceived: true },
+      NOW,
+    );
+    expect(result?.retryable).toBe(false);
+    expect(result?.active).toBe(true); // still blocks a fresh proposal for this order - the money likely already moved
+    expect(result?.decidedAt).toBeNull(); // not a settled decision - needs a human
+  });
+
+  it('a STALE markFailed (wrong attemptCount, after a lease takeover) does nothing', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const created = await createPending(repo);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
+    await repo.takeOverStuckExecution('acme', created.id, begun!.executingSince!, new Date(NOW.getTime() + 120_000));
+
+    const staleResult = await repo.markFailed('acme', created.id, 1, { retryable: true, active: true, executionResultCode: 'TIMEOUT' }, NOW);
+    expect(staleResult).toBeNull();
+    const current = await repo.findById('acme', created.id);
+    expect(current?.status).toBe('executing');
+    expect(current?.attemptCount).toBe(2);
+  });
+
   it('never re-fails an already-terminal row (e.g. executed)', async () => {
     const repo = new InMemoryApprovalRepository();
     const created = await createPending(repo);
-    await repo.beginExecution('acme', created.id, [], NOW);
-    await repo.markExecuted('acme', created.id, 'OK', NOW);
-    expect(await repo.markFailed('acme', created.id, { retryable: false }, NOW)).toBeNull();
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
+    await repo.markExecuted('acme', created.id, begun!.attemptCount, NOW);
+    expect(await repo.markFailed('acme', created.id, begun!.attemptCount, { retryable: false, active: false }, NOW)).toBeNull();
   });
 });
 
@@ -249,21 +349,50 @@ describe('InMemoryApprovalRepository.reject', () => {
     expect(result?.decidedBy).toBe('key_1');
   });
 
-  it('failed non-retryable -> rejected (for the audit trail)', async () => {
+  it('failed non-retryable (DEFINITIVE) -> rejected (for the audit trail)', async () => {
     const repo = new InMemoryApprovalRepository();
     const created = await createPending(repo);
-    await repo.beginExecution('acme', created.id, [], NOW);
-    await repo.markFailed('acme', created.id, { retryable: false, executionResultCode: 'ALREADY_REFUNDED_UPSTREAM' }, NOW);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
+    await repo.markFailed('acme', created.id, begun!.attemptCount, { retryable: false, active: false, executionResultCode: 'NOT_FOUND', failureClass: 'DEFINITIVE' }, NOW);
     const result = await repo.reject('acme', created.id, 'key_1', NOW);
     expect(result?.status).toBe('rejected');
   });
 
-  it('amendment A: reject is BLOCKED on a failed-retryable (ambiguous) row', async () => {
+  it('amendment A: reject is BLOCKED on a failed-retryable (AMBIGUOUS) row', async () => {
     const repo = new InMemoryApprovalRepository();
     const created = await createPending(repo);
-    await repo.beginExecution('acme', created.id, [], NOW);
-    await repo.markFailed('acme', created.id, { retryable: true, executionResultCode: 'UPSTREAM_TIMEOUT' }, NOW);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
+    await repo.markFailed('acme', created.id, begun!.attemptCount, { retryable: true, active: true, executionResultCode: 'TIMEOUT', failureClass: 'AMBIGUOUS' }, NOW);
     expect(await repo.reject('acme', created.id, 'key_1', NOW)).toBeNull();
+  });
+
+  it('amendment F4: reject is BLOCKED on a NEEDS_RECONCILIATION row, even though retryable is false there too', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const created = await createPending(repo);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
+    await repo.markFailed(
+      'acme',
+      created.id,
+      begun!.attemptCount,
+      { retryable: false, active: true, executionResultCode: 'CONFLICT', failureClass: 'NEEDS_RECONCILIATION' },
+      NOW,
+    );
+    expect(await repo.reject('acme', created.id, 'key_1', NOW)).toBeNull();
+  });
+
+  it('amendment F4: reject IS allowed on a NOT_SENT row (retryable AND rejectable)', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const created = await createPending(repo);
+    const begun = await repo.beginExecution('acme', created.id, [], NOW);
+    await repo.markFailed(
+      'acme',
+      created.id,
+      begun!.attemptCount,
+      { retryable: true, active: true, executionResultCode: 'SECRET_NOT_CONFIGURED', failureClass: 'NOT_SENT' },
+      NOW,
+    );
+    const result = await repo.reject('acme', created.id, 'key_1', NOW);
+    expect(result?.status).toBe('rejected');
   });
 
   it('never rejects a row that is currently executing', async () => {
@@ -353,10 +482,10 @@ describe('InMemoryApprovalRepository.list', () => {
 describe('InMemoryApprovalRepository.countForCustomerToday', () => {
   it('counts only rows created within the same UTC calendar day', async () => {
     const repo = new InMemoryApprovalRepository();
-    await createPending(repo, { customerRef: 'cust_1', now: new Date('2026-11-09T01:00:00.000Z') });
-    await createPending(repo, { customerRef: 'cust_1', now: new Date('2026-11-09T23:00:00.000Z') });
-    await createPending(repo, { customerRef: 'cust_1', now: new Date('2026-11-10T00:00:01.000Z') }); // next UTC day
-    await createPending(repo, { customerRef: 'cust_2', now: new Date('2026-11-09T12:00:00.000Z') }); // different customer
+    await createPending(repo, { orderId: 'ORD-3001', customerRef: 'cust_1', now: new Date('2026-11-09T01:00:00.000Z') });
+    await createPending(repo, { orderId: 'ORD-3002', customerRef: 'cust_1', now: new Date('2026-11-09T23:00:00.000Z') });
+    await createPending(repo, { orderId: 'ORD-3003', customerRef: 'cust_1', now: new Date('2026-11-10T00:00:01.000Z') }); // next UTC day
+    await createPending(repo, { orderId: 'ORD-3004', customerRef: 'cust_2', now: new Date('2026-11-09T12:00:00.000Z') }); // different customer
 
     const count = await repo.countForCustomerToday('acme', 'cust_1', new Date('2026-11-09T18:00:00.000Z'));
     expect(count).toBe(2);

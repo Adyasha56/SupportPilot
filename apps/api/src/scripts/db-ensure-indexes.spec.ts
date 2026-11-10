@@ -523,6 +523,23 @@ describe('buildIndexPlans', () => {
     ]);
   });
 
+  it('(Milestone 4 amendment F3) Approval\'s TTL is partial on active:false, and migrate is wired', () => {
+    const { collectionPlans } = buildIndexPlans(2_592_000, 7_776_000);
+    const approvalPlan = collectionPlans.find((plan) => plan.label === 'Approval')!;
+
+    expect(approvalPlan.ttl?.partialFilterExpression).toEqual({ active: false });
+    expect(approvalPlan.ttl?.migrate).toBeDefined();
+  });
+
+  it('no OTHER collection has a partial TTL or a migrate config - this is Approval-specific', () => {
+    const { collectionPlans } = buildIndexPlans(2_592_000);
+    for (const plan of collectionPlans) {
+      if (plan.label === 'Approval' || !plan.ttl) continue;
+      expect(plan.ttl.partialFilterExpression).toBeUndefined();
+      expect(plan.ttl.migrate).toBeUndefined();
+    }
+  });
+
   it('(Milestone 4) defaults the approval retention to the same value as chat retention when not given separately', () => {
     const { collectionPlans } = buildIndexPlans(2_592_000);
     const approvalPlan = collectionPlans.find((plan) => plan.label === 'Approval')!;
@@ -639,5 +656,126 @@ describe('checkProtectedIndexes (Milestone 4 amendment C)', () => {
 
     await ensureCollectionIndexes(deps, () => undefined);
     expect(dropped).toEqual([]);
+  });
+});
+
+describe('TTL partial-filter migration (amendment F3)', () => {
+  function makeDepsWithTtl(opts: {
+    existingTtl?: ExistingIndexInfo;
+    desiredPartialFilterExpression?: Record<string, unknown>;
+    blockingCount?: number;
+  }): CollectionIndexDeps & { dropped: string[]; created: number; migrated: number } {
+    const result: CollectionIndexDeps & { dropped: string[]; created: number; migrated: number } = {
+      label: 'Approval',
+      collectionName: 'approvals',
+      dropped: [],
+      created: 0,
+      migrated: 0,
+      listCollectionNames: async () => ['approvals'],
+      createCollection: async () => undefined,
+      listIndexes: async () => (opts.existingTtl ? [opts.existingTtl] : []),
+      diffSchemaIndexes: async () => ({ toDrop: [], toCreate: [] }),
+      dropIndexes: async () => undefined,
+      createSchemaIndexes: async () => undefined,
+      ttl: {
+        field: 'createdAt',
+        expireAfterSeconds: 7_776_000,
+        partialFilterExpression: opts.desiredPartialFilterExpression,
+        createIndex: async () => {
+          result.created += 1;
+        },
+        updateExpiry: async () => undefined,
+        migrate: {
+          countBlocking: async () => opts.blockingCount ?? 0,
+          dropAndRecreate: async (name: string) => {
+            result.dropped.push(name);
+            result.migrated += 1;
+          },
+        },
+      },
+    };
+    return result;
+  }
+
+  it('STOPS with a clear error when the existing TTL has no partialFilterExpression but one is now desired - dry-run or not, without the flag', async () => {
+    const deps = makeDepsWithTtl({
+      existingTtl: { name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 7_776_000 },
+      desiredPartialFilterExpression: { active: false },
+    });
+
+    await expect(ensureCollectionIndexes(deps, () => undefined, true, false)).rejects.toThrow(/cannot change a TTL index's partialFilterExpression/);
+    await expect(ensureCollectionIndexes(deps, () => undefined, false, false)).rejects.toThrow(/cannot change a TTL index's partialFilterExpression/);
+    expect(deps.dropped).toEqual([]);
+    expect(deps.migrated).toBe(0);
+  });
+
+  it('the error message names the exact migration command', async () => {
+    const deps = makeDepsWithTtl({
+      existingTtl: { name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 7_776_000 },
+      desiredPartialFilterExpression: { active: false },
+    });
+    await expect(ensureCollectionIndexes(deps, () => undefined, true, false)).rejects.toThrow(/--migrate-approval-ttl/);
+  });
+
+  it('--dry-run alone never performs the migration, even with the flag - it only reports what it would do', async () => {
+    const deps = makeDepsWithTtl({
+      existingTtl: { name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 7_776_000 },
+      desiredPartialFilterExpression: { active: false },
+      blockingCount: 0,
+    });
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m), true, true);
+
+    expect(deps.dropped).toEqual([]);
+    expect(deps.migrated).toBe(0);
+    expect(logs.some((l) => l.includes('[dry-run]') && l.includes('would check for any blocking document'))).toBe(true);
+  });
+
+  it('with the flag and zero blocking documents, migrates for real: drops the old index, creates the new partial one', async () => {
+    const deps = makeDepsWithTtl({
+      existingTtl: { name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 7_776_000 },
+      desiredPartialFilterExpression: { active: false },
+      blockingCount: 0,
+    });
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m), false, true);
+
+    expect(deps.dropped).toEqual(['createdAt_1']);
+    expect(deps.migrated).toBe(1);
+    expect(logs.some((l) => l.includes('migrating TTL index'))).toBe(true);
+  });
+
+  it('refuses to migrate when any document still has active:true, even with the flag', async () => {
+    const deps = makeDepsWithTtl({
+      existingTtl: { name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 7_776_000 },
+      desiredPartialFilterExpression: { active: false },
+      blockingCount: 3,
+    });
+
+    await expect(ensureCollectionIndexes(deps, () => undefined, false, true)).rejects.toThrow(/3 document\(s\) still have active:true/);
+    expect(deps.dropped).toEqual([]);
+    expect(deps.migrated).toBe(0);
+  });
+
+  it('a brand-new collection with no existing TTL index at all just creates the partial one directly - no migration needed', async () => {
+    const deps = makeDepsWithTtl({
+      existingTtl: undefined,
+      desiredPartialFilterExpression: { active: false },
+    });
+    await ensureCollectionIndexes(deps, () => undefined, false, false);
+    expect(deps.created).toBe(1);
+    expect(deps.dropped).toEqual([]);
+  });
+
+  it('expireAfterSeconds-only changes (filter already matches) still use collMod, never the migration path', async () => {
+    const deps = makeDepsWithTtl({
+      existingTtl: { name: 'createdAt_1', key: { createdAt: 1 }, expireAfterSeconds: 2_592_000, partialFilterExpression: { active: false } },
+      desiredPartialFilterExpression: { active: false },
+    });
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m), false, false);
+
+    expect(deps.dropped).toEqual([]);
+    expect(logs.some((l) => l.includes('collMod'))).toBe(true);
   });
 });

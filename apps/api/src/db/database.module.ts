@@ -17,6 +17,8 @@ import { MongooseConversationRepository, CONVERSATION_REPOSITORY } from './conve
 import { MongooseMessageRepository, MESSAGE_REPOSITORY } from './message.repository';
 import { MongooseAgentRunRepository, AGENT_RUN_REPOSITORY } from './agent-run.repository';
 import { MongooseCustomerPublicKeyRepository, CUSTOMER_PUBLIC_KEY_REPOSITORY } from './customer-public-key.repository';
+import { ApprovalSchema } from '../approvals/schemas/approval.schema';
+import { MongooseApprovalRepository, APPROVAL_REPOSITORY } from '../approvals/approval.repository';
 
 const repositoryProviders: Provider[] = [
   { provide: TENANT_REPOSITORY, useClass: MongooseTenantRepository },
@@ -28,6 +30,7 @@ const repositoryProviders: Provider[] = [
   { provide: MESSAGE_REPOSITORY, useClass: MongooseMessageRepository },
   { provide: AGENT_RUN_REPOSITORY, useClass: MongooseAgentRunRepository },
   { provide: CUSTOMER_PUBLIC_KEY_REPOSITORY, useClass: MongooseCustomerPublicKeyRepository },
+  { provide: APPROVAL_REPOSITORY, useClass: MongooseApprovalRepository },
 ];
 
 /**
@@ -65,6 +68,7 @@ const repositoryProviders: Provider[] = [
       { name: 'Message', schema: MessageSchema },
       { name: 'AgentRun', schema: AgentRunSchema },
       { name: 'CustomerPublicKey', schema: CustomerPublicKeySchema },
+      { name: 'Approval', schema: ApprovalSchema },
     ]),
   ],
   providers: repositoryProviders,
@@ -79,6 +83,7 @@ const repositoryProviders: Provider[] = [
     MESSAGE_REPOSITORY,
     AGENT_RUN_REPOSITORY,
     CUSTOMER_PUBLIC_KEY_REPOSITORY,
+    APPROVAL_REPOSITORY,
   ],
 })
 export class DatabaseModule {}

@@ -124,7 +124,8 @@ export interface RunAgentResult {
   trace: AgentTrace;
 }
 
-const GENERIC_ESCALATE_MESSAGE = "I'm not able to help with this directly, so I've flagged it for a team member to follow up with you.";
+/** Exported so approval-message.ts (Milestone 4) can reuse the exact same string for its own ambiguous-auto-execute-failure path, rather than duplicating it. */
+export const GENERIC_ESCALATE_MESSAGE = "I'm not able to help with this directly, so I've flagged it for a team member to follow up with you.";
 /** Stage 4 finding 7 - distinct from the generic escalate message above, so this cause stays distinguishable to anyone reading the chat, not just the trace/logs. */
 const DAILY_BUDGET_MESSAGE = "Our automated assistant has reached its demo usage limit for today. I've flagged this for a team member to follow up with you.";
 /** Stage 4 item 2 - distinct from DAILY_BUDGET_MESSAGE above: this tenant's own allowance is spent, not the shared cross-tenant pool. */

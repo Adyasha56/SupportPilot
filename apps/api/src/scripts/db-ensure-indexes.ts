@@ -6,10 +6,22 @@
  *   pnpm run db:ensure-indexes
  *   pnpm run db:ensure-indexes -- --allow-test-db   (for the shared test db)
  *   pnpm run db:ensure-indexes -- --dry-run         (prints the plan, changes nothing)
+ *   pnpm run db:ensure-indexes -- --migrate-approval-ttl   (amendment F3, see below)
  *
  * --dry-run still connects and reads real state (so the plan it prints is
  * accurate), and the test_ database guard still applies to it - a dry-run
  * is not an exemption from that guard, only from making changes.
+ *
+ * --migrate-approval-ttl is a SEPARATE, explicit, protected flag for one
+ * specific operation MongoDB cannot do via the normal collMod path: Approval's
+ * TTL index's partialFilterExpression changed (amendment F3, active:false
+ * only) in a way that a database whose TTL index predates that change can
+ * never reach through the ordinary create/collMod flow - a plain TTL index's
+ * filter can only become partial via drop+recreate, never collMod. Without
+ * this flag, that mismatch STOPS the whole run with a clear error (checked
+ * unconditionally, dry-run or not, before any other index work on that
+ * collection) rather than ever being auto-applied. With it, the migration
+ * still refuses to run if any Approval document has active:true.
  *
  * Runs compiled JS (dist/scripts/...), not the .ts source directly: Node's
  * native TypeScript type stripping (stable since Node 24.12, confirmed
@@ -304,9 +316,23 @@ export interface CollectionIndexDeps {
   ttl?: {
     field: string;
     expireAfterSeconds: number;
+    /** Milestone 4 amendment F3 - only Approval sets this (partial TTL on active:false, so an unresolved approval is never deleted while it's still blocking). Undefined means a plain, unfiltered TTL index, same as every other collection. */
+    partialFilterExpression?: Record<string, unknown>;
     createIndex(): Promise<void>;
     /** Changes an EXISTING TTL index's expiry via collMod - never drops/recreates the index. */
     updateExpiry(): Promise<void>;
+    /**
+     * Amendment F3's explicit, protected migration path - only wired when
+     * `partialFilterExpression` is set, since that's the only case MongoDB
+     * can't collMod its way out of (expireAfterSeconds can change in
+     * place; partialFilterExpression cannot). Never invoked unless the
+     * caller passed the explicit CLI flag AND countBlocking() returns 0.
+     */
+    migrate?: {
+      /** Documents that must be zero before a drop+recreate is safe (e.g. any approval with active:true). */
+      countBlocking(): Promise<number>;
+      dropAndRecreate(existingIndexName: string): Promise<void>;
+    };
   };
   /** Milestone 4 amendment C - indexes that must error rather than be auto-dropped-and-recreated on a mismatch. See checkProtectedIndexes' own doc comment. */
   protectedIndexes?: ProtectedIndexSpec[];
@@ -402,19 +428,35 @@ export function checkProtectedIndexes(existingIndexes: ExistingIndexInfo[], prot
   }
 }
 
-type TtlAction = { kind: 'none' } | { kind: 'create' } | { kind: 'collMod'; fromSeconds: number | undefined };
+type TtlAction =
+  | { kind: 'none' }
+  | { kind: 'create' }
+  | { kind: 'collMod'; fromSeconds: number | undefined }
+  | { kind: 'filter_mismatch'; existing: ExistingIndexInfo };
 
-function planTtlAction(
-  ttl: NonNullable<CollectionIndexDeps['ttl']>,
-  existing: ExistingIndexInfo | undefined,
-): TtlAction {
+/**
+ * partialFilterExpression is checked FIRST and takes priority over
+ * expireAfterSeconds - MongoDB can collMod expireAfterSeconds on an
+ * existing TTL index in place, but it cannot change partialFilterExpression
+ * that way at all, so a filter mismatch is never just "also apply a
+ * collMod" - it's a different, far more careful operation (amendment F3).
+ */
+function planTtlAction(ttl: NonNullable<CollectionIndexDeps['ttl']>, existing: ExistingIndexInfo | undefined): TtlAction {
   if (!existing) {
     return { kind: 'create' };
+  }
+  if (!partialFilterExpressionsEqual(existing.partialFilterExpression, ttl.partialFilterExpression)) {
+    return { kind: 'filter_mismatch', existing };
   }
   if (existing.expireAfterSeconds !== ttl.expireAfterSeconds) {
     return { kind: 'collMod', fromSeconds: existing.expireAfterSeconds };
   }
   return { kind: 'none' };
+}
+
+/** The exact command this file's own error message and `main()`'s --help-equivalent output both point operators at - kept in one place so they can never drift apart. */
+export function migrateCommandFor(label: string): string {
+  return `pnpm run db:ensure-indexes -- --migrate-${label.toLowerCase()}-ttl`;
 }
 
 async function applyTtlAction(
@@ -423,6 +465,7 @@ async function applyTtlAction(
   label: string,
   log: (message: string) => void,
   dryRun: boolean,
+  allowTtlMigration: boolean,
 ): Promise<void> {
   if (action.kind === 'none') {
     log(`${label}: TTL index on "${ttl.field}" already matches (expireAfterSeconds=${ttl.expireAfterSeconds}).`);
@@ -437,14 +480,54 @@ async function applyTtlAction(
     await ttl.createIndex();
     return;
   }
+  if (action.kind === 'collMod') {
+    if (dryRun) {
+      log(
+        `${label}: [dry-run] would update the TTL index on "${ttl.field}" from ${action.fromSeconds}s to ${ttl.expireAfterSeconds}s (collMod, no drop).`,
+      );
+      return;
+    }
+    log(`${label}: updating the TTL index on "${ttl.field}" from ${action.fromSeconds}s to ${ttl.expireAfterSeconds}s (collMod, no drop).`);
+    await ttl.updateExpiry();
+    return;
+  }
+
+  // action.kind === 'filter_mismatch' - amendment F3. Always evaluated, dry-run or not, same as
+  // checkProtectedIndexes above: this is a validation finding this script never auto-fixes
+  // without the explicit flag, never a mutation --dry-run alone would defer.
+  const migrateCommand = migrateCommandFor(label);
+  const existingFilterText = JSON.stringify(action.existing.partialFilterExpression ?? null);
+  const desiredFilterText = JSON.stringify(ttl.partialFilterExpression ?? null);
+  if (!allowTtlMigration) {
+    throw new Error(
+      `${label}: TTL index "${action.existing.name}" on "${ttl.field}" has partialFilterExpression ${existingFilterText} but the ` +
+        `desired definition requires ${desiredFilterText}. MongoDB cannot change a TTL index's partialFilterExpression via collMod ` +
+        `(only expireAfterSeconds can be changed in place) - resolve with an explicit, protected migration: run '${migrateCommand}' ` +
+        '(add --allow-test-db too if targeting the test database). That migration refuses to run if any document still has active:true.',
+    );
+  }
+  if (!ttl.migrate) {
+    throw new Error(`${label}: a migration flag was passed but this collection's plan has no migrate configuration for its TTL index.`);
+  }
   if (dryRun) {
     log(
-      `${label}: [dry-run] would update the TTL index on "${ttl.field}" from ${action.fromSeconds}s to ${ttl.expireAfterSeconds}s (collMod, no drop).`,
+      `${label}: [dry-run] would check for any blocking document (active:true), then drop index "${action.existing.name}" and recreate ` +
+        `it on "${ttl.field}" with partialFilterExpression ${desiredFilterText} (expireAfterSeconds=${ttl.expireAfterSeconds}).`,
     );
     return;
   }
-  log(`${label}: updating the TTL index on "${ttl.field}" from ${action.fromSeconds}s to ${ttl.expireAfterSeconds}s (collMod, no drop).`);
-  await ttl.updateExpiry();
+  const blockingCount = await ttl.migrate.countBlocking();
+  if (blockingCount > 0) {
+    throw new Error(
+      `${label}: refusing to migrate the TTL index - ${blockingCount} document(s) still have active:true. Resolve those first ` +
+        '(they must reach a terminal state) before migrating.',
+    );
+  }
+  log(
+    `${label}: migrating TTL index "${action.existing.name}" on "${ttl.field}" (drop + recreate with partialFilterExpression ` +
+      `${desiredFilterText}) - 0 blocking documents, safe to proceed.`,
+  );
+  await ttl.migrate.dropAndRecreate(action.existing.name);
 }
 
 async function createCollectionTolerant(deps: CollectionIndexDeps, log: (message: string) => void): Promise<void> {
@@ -473,6 +556,7 @@ export async function ensureCollectionIndexes(
   deps: CollectionIndexDeps,
   log: (message: string) => void,
   dryRun = false,
+  allowTtlMigration = false,
 ): Promise<void> {
   const existingCollections = await deps.listCollectionNames();
   const exists = existingCollections.includes(deps.collectionName);
@@ -485,10 +569,19 @@ export async function ensureCollectionIndexes(
       : `${deps.label}: no indexes exist yet.`,
   );
 
-  // Always checked, dry-run or not - a mismatch is a validation finding, not a mutation this
-  // script performs, same as the vector index's own definitionsMatch check below.
+  // Always checked, dry-run or not, and BEFORE any other index work for this collection -
+  // a mismatch is a validation finding this script STOPS on, never a mutation it performs or
+  // defers, same as the vector index's own definitionsMatch check below.
   if (deps.protectedIndexes) {
     checkProtectedIndexes(existingIndexes, deps.protectedIndexes);
+  }
+
+  const ttlExisting = deps.ttl ? findSingleFieldTtlIndex(existingIndexes, deps.ttl.field) : undefined;
+  const ttlAction: TtlAction = deps.ttl ? planTtlAction(deps.ttl, ttlExisting) : { kind: 'none' };
+  if (ttlAction.kind === 'filter_mismatch' && !allowTtlMigration) {
+    // Stop here, before touching this collection's regular indexes at all - applyTtlAction
+    // throws the actual, detailed message; this just ensures it fires first, every time.
+    await applyTtlAction(deps.ttl!, ttlAction, deps.label, log, dryRun, allowTtlMigration);
   }
 
   const { toDrop: rawToDrop, toCreate } = await deps.diffSchemaIndexes();
@@ -496,11 +589,8 @@ export async function ensureCollectionIndexes(
   // Never let the regular-index diff drop the TTL-managed index, or a protected index (Milestone
   // 4 amendment C) - this is the fix for the bug described in the module doc comment above,
   // extended to cover the second kind of index this script must never auto-drop-and-recreate.
-  const ttlExisting = deps.ttl ? findSingleFieldTtlIndex(existingIndexes, deps.ttl.field) : undefined;
   const protectedNames = new Set((deps.protectedIndexes ?? []).map((p) => p.name));
   const toDrop = rawToDrop.filter((name) => name !== ttlExisting?.name && !protectedNames.has(name));
-
-  const ttlAction: TtlAction = deps.ttl ? planTtlAction(deps.ttl, ttlExisting) : { kind: 'none' };
 
   const nothingToDo = exists && toDrop.length === 0 && toCreate.length === 0 && ttlAction.kind === 'none';
   if (nothingToDo) {
@@ -532,7 +622,7 @@ export async function ensureCollectionIndexes(
   }
 
   if (deps.ttl) {
-    await applyTtlAction(deps.ttl, ttlAction, deps.label, log, dryRun);
+    await applyTtlAction(deps.ttl, ttlAction, deps.label, log, dryRun, allowTtlMigration);
   }
 }
 
@@ -560,6 +650,11 @@ interface IndexCapableModel {
   createIndexes(options?: Record<string, unknown>): Promise<unknown>;
 }
 
+interface MakeCollectionDepsTtlOptions {
+  /** Amendment F3 - only Approval sets this. Wiring `migrate` below is unconditional on this being set; WHETHER it's actually allowed to run is gated separately, by the `allowTtlMigration` flag threaded through ensureCollectionIndexes/applyTtlAction. */
+  partialFilterExpression?: Record<string, unknown>;
+}
+
 function makeCollectionDeps(
   label: string,
   collectionModel: IndexCapableModel,
@@ -567,6 +662,7 @@ function makeCollectionDeps(
   expireAfterSeconds: number,
   ttlField?: string,
   protectedIndexes?: ProtectedIndexSpec[],
+  ttlOptions?: MakeCollectionDepsTtlOptions,
 ): CollectionIndexDeps {
   return {
     label,
@@ -592,8 +688,12 @@ function makeCollectionDeps(
       ? {
           field: ttlField,
           expireAfterSeconds,
+          partialFilterExpression: ttlOptions?.partialFilterExpression,
           createIndex: async () => {
-            await mongoose.connection.db!.collection(collectionName).createIndex({ [ttlField]: 1 }, { expireAfterSeconds });
+            await mongoose.connection.db!.collection(collectionName).createIndex(
+              { [ttlField]: 1 },
+              { expireAfterSeconds, ...(ttlOptions?.partialFilterExpression ? { partialFilterExpression: ttlOptions.partialFilterExpression } : {}) },
+            );
           },
           updateExpiry: async () => {
             await mongoose.connection.db!.command({
@@ -601,6 +701,18 @@ function makeCollectionDeps(
               index: { keyPattern: { [ttlField]: 1 }, expireAfterSeconds },
             });
           },
+          migrate: ttlOptions?.partialFilterExpression
+            ? {
+                countBlocking: async () => mongoose.connection.db!.collection(collectionName).countDocuments({ active: true }),
+                dropAndRecreate: async (existingIndexName: string) => {
+                  await mongoose.connection.db!.collection(collectionName).dropIndex(existingIndexName);
+                  await mongoose.connection.db!.collection(collectionName).createIndex(
+                    { [ttlField]: 1 },
+                    { expireAfterSeconds, partialFilterExpression: ttlOptions.partialFilterExpression },
+                  );
+                },
+              }
+            : undefined,
         }
       : undefined,
   };
@@ -667,14 +779,25 @@ export function buildIndexPlans(
     // Milestone 4 amendment C - its own retention period (APPROVAL_RETENTION_DAYS, default 90,
     // longer than CHAT_RETENTION_DAYS - an approval is an audit/compliance record), and the
     // protected partial unique index that must error rather than auto-drop-and-recreate on a
-    // mismatch (checkProtectedIndexes, above).
-    makeCollectionDeps('Approval', approvalModel, 'approvals', approvalExpireAfterSeconds, 'createdAt', [
-      {
-        name: APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME,
-        expectedUnique: true,
-        expectedPartialFilterExpression: { active: true },
-      },
-    ]),
+    // mismatch (checkProtectedIndexes, above). Amendment F3 - the TTL itself is ALSO partial
+    // (active: false), so an unresolved approval is never deleted while it's still blocking a
+    // fresh proposal for its order; changing that filter on an existing plain TTL index needs
+    // the explicit --migrate-approval-ttl path (applyTtlAction's filter_mismatch branch).
+    makeCollectionDeps(
+      'Approval',
+      approvalModel,
+      'approvals',
+      approvalExpireAfterSeconds,
+      'createdAt',
+      [
+        {
+          name: APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME,
+          expectedUnique: true,
+          expectedPartialFilterExpression: { active: true },
+        },
+      ],
+      { partialFilterExpression: { active: false } },
+    ),
   ];
 
   return { collectionPlans, vectorSearchDeps };
@@ -690,6 +813,10 @@ async function main(): Promise<void> {
 
   const allowTestDb = process.argv.includes('--allow-test-db');
   const dryRun = process.argv.includes('--dry-run');
+  // Amendment F3's explicit, protected migration flag - see applyTtlAction's filter_mismatch
+  // branch for what this actually gates (a drop+recreate of Approval's TTL index, refused
+  // outright if any document still has active:true).
+  const migrateApprovalTtl = process.argv.includes('--migrate-approval-ttl');
   let approvalRetentionDays: number;
   try {
     assertNotTestDatabase(uri, allowTestDb);
@@ -716,7 +843,9 @@ async function main(): Promise<void> {
     console.log(`Retention: ${retentionDays} day(s) (CHAT_RETENTION_DAYS) - expireAfterSeconds=${expireAfterSeconds}.`);
     console.log(`Retention: ${approvalRetentionDays} day(s) (APPROVAL_RETENTION_DAYS) - expireAfterSeconds=${approvalExpireAfterSeconds}.`);
     for (const plan of collectionPlans) {
-      await ensureCollectionIndexes(plan, (message) => console.log(message), dryRun);
+      // migrateApprovalTtl only has any effect on the Approval plan (the only one with a
+      // partialFilterExpression TTL) - harmless to pass unconditionally to every other plan.
+      await ensureCollectionIndexes(plan, (message) => console.log(message), dryRun, migrateApprovalTtl);
     }
     await ensureIndexes(vectorSearchDeps, (message) => console.log(message), dryRun);
   } finally {
