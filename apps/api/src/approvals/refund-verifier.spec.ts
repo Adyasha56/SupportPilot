@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   RefundVerifierInput,
   RefundVerifierOrderSnapshot,
@@ -221,6 +221,26 @@ describe('verifyRefundProposal - the auto/human split', () => {
     const result = verifyRefundProposal(input({ citations: [], proposedAmountCents: 1, tenantSettings: settings }));
     expect(result.decision).toBe('deny');
   });
+
+  it('rule 7 (refundCap) is enforced even when autoExecuteRefunds is true and the amount is within approvalThreshold-sized reach - the cap is never bypassed by the flag', () => {
+    const settings = tenantSettings({ autoExecuteRefunds: true, approvalThreshold: 100000, refundCap: 2000 }); // cap = 200000 cents
+    const result = verifyRefundProposal(
+      input({ order: order({ totalCents: 10_000_000 }), proposedAmountCents: 200001, tenantSettings: settings }),
+    );
+    expect(result.decision).toBe('deny');
+    expect(result.decision === 'deny' && result.failedRuleCodes).toEqual(['AMOUNT_EXCEEDS_REFUND_CAP']);
+  });
+
+  it('rule 7 (refundCap) denies even when approvalThreshold itself is set higher than refundCap', () => {
+    // approvalThreshold alone would have allowed auto_execute at this amount, but refundCap is
+    // the hard ceiling (plan §4: "never bypassed by auto-execute") and must still win.
+    const settings = tenantSettings({ autoExecuteRefunds: true, approvalThreshold: 5000, refundCap: 2000 });
+    const result = verifyRefundProposal(
+      input({ order: order({ totalCents: 10_000_000 }), proposedAmountCents: 300000, tenantSettings: settings }),
+    );
+    expect(result.decision).toBe('deny');
+    expect(result.decision === 'deny' && result.failedRuleCodes).toEqual(['AMOUNT_EXCEEDS_REFUND_CAP']);
+  });
 });
 
 describe('verifyRefundProposal - verdicts cover every rule, every time', () => {
@@ -234,5 +254,30 @@ describe('verifyRefundProposal - verdicts cover every rule, every time', () => {
     const result = verifyRefundProposal(input({ verifiedCustomerRef: 'cust_2', citations: [] }));
     expect(result.verdicts).toHaveLength(9);
     expect(result.verdicts.filter((v) => !v.passed).map((v) => v.code)).toEqual(['ORDER_OWNERSHIP_MISMATCH', 'MISSING_POLICY_CITATION']);
+  });
+});
+
+describe('verifyRefundProposal - the clock is injected, never the real wall clock', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('never calls Date.now() - every time-based decision goes through the injected clock', () => {
+    const dateNowSpy = vi.spyOn(Date, 'now');
+    verifyRefundProposal(input());
+    expect(dateNowSpy).not.toHaveBeenCalled();
+  });
+
+  it('never calls Date.now() even on the window-check path with a missing deliveredAt', () => {
+    const dateNowSpy = vi.spyOn(Date, 'now');
+    verifyRefundProposal(input({ order: order({ deliveredAt: undefined }) }));
+    expect(dateNowSpy).not.toHaveBeenCalled();
+  });
+
+  it('is fully reproducible from the injected clock alone - a "today" far in the future than the real wall clock still evaluates the window correctly', () => {
+    const farFutureClock = () => new Date('2099-01-01T00:00:00.000Z');
+    const deliveredAt = new Date('2098-12-01T00:00:00.000Z').toISOString(); // 31 days before farFutureClock's "now"
+    const result = verifyRefundProposal(input({ order: order({ deliveredAt }), clock: farFutureClock, tenantSettings: tenantSettings({ refundWindowDays: 30 }) }));
+    expect(result.decision === 'deny' && result.failedRuleCodes).toEqual(['OUTSIDE_REFUND_WINDOW']);
   });
 });

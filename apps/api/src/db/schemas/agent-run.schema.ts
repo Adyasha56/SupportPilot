@@ -1,5 +1,5 @@
 import { Schema, Types } from 'mongoose';
-import { DegradedReasonSchema } from '@supportpilot/shared';
+import { DegradedReasonSchema, VERIFIER_FAILURE_CODES, VerifierFailureCode } from '@supportpilot/shared';
 
 /**
  * Mirrors run-agent.ts's own AgentStepType/ChatOutcomeSchema exactly - kept
@@ -34,6 +34,26 @@ export interface AgentProposedActionSubdocument {
 }
 
 /**
+ * Milestone 4 amendment D - the refund-verifier's immediate disposition for
+ * this run's proposal (if any), written ONCE at AgentRun creation time, in
+ * the same transaction as the Approval row it may also create, and NEVER
+ * updated afterward: AgentRun stays exactly as immutable as every other
+ * field already is. Milestone 6's eval harness reads this directly for the
+ * immediate outcome (denied/already_pending/auto_executed/pending_approval)
+ * and only follows `approvalId` to the Approval record for the LATER
+ * human-decision outcome of a pending_approval case.
+ */
+export const REFUND_DISPOSITION_KINDS = ['denied', 'pending_approval', 'auto_executed', 'already_pending'] as const;
+
+export interface RefundDispositionSubdocument {
+  kind: (typeof REFUND_DISPOSITION_KINDS)[number];
+  /** Only present for kind: 'denied' - every rule that failed, in fixed order (amendment F). */
+  failedRuleCodes?: VerifierFailureCode[];
+  /** Present for every kind except 'denied' - the Approval row this disposition refers to. */
+  approvalId?: string;
+}
+
+/**
  * Never stores: prompt text, raw model response text, raw upstream tool
  * response bodies, chunk text, secrets, boundary tokens - only ids, counts,
  * codes, and durations (PROJECT.md's Guardrails/Multi-tenancy sections,
@@ -64,6 +84,7 @@ export interface AgentRunDocument {
   latencyMs: number;
   steps: AgentStepSubdocument[];
   proposedAction: AgentProposedActionSubdocument | null;
+  refundDisposition: RefundDispositionSubdocument | null;
   createdAt: Date;
 }
 
@@ -92,6 +113,15 @@ const AgentProposedActionSchema = new Schema<AgentProposedActionSubdocument>(
   { _id: false },
 );
 
+const RefundDispositionSchema = new Schema<RefundDispositionSubdocument>(
+  {
+    kind: { type: String, required: true, enum: REFUND_DISPOSITION_KINDS },
+    failedRuleCodes: { type: [String], enum: VERIFIER_FAILURE_CODES },
+    approvalId: { type: String },
+  },
+  { _id: false },
+);
+
 export const AgentRunSchema = new Schema<AgentRunDocument>(
   {
     tenantId: { type: String, required: true, index: true },
@@ -105,6 +135,7 @@ export const AgentRunSchema = new Schema<AgentRunDocument>(
     latencyMs: { type: Number, required: true },
     steps: { type: [AgentStepSchema], required: true, default: [] },
     proposedAction: { type: AgentProposedActionSchema, default: null },
+    refundDisposition: { type: RefundDispositionSchema, default: null },
   },
   { collection: 'agentRuns', timestamps: { createdAt: true, updatedAt: false } },
 );
