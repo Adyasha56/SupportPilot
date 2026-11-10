@@ -24,7 +24,7 @@ import mongoose, { Model, Types } from 'mongoose';
 import { cleanupTenant, disconnectFixtureConnection, randomTenantId } from './tenant-fixture';
 import { getTestMongoUri, integrationTestsEnabled } from './test-env';
 import { ApprovalDocument, ApprovalSchema } from '../../src/approvals/schemas/approval.schema';
-import { MongooseApprovalRepository, NewApproval } from '../../src/approvals/approval.repository';
+import { DuplicateActiveApprovalError, MongooseApprovalRepository, NewApproval } from '../../src/approvals/approval.repository';
 
 // Explicit <ApprovalDocument> type argument (not left to inference) - same reasoning as
 // set-tenant-settings.ts's own comment: feeding mongoose.model()'s own precise inferred return
@@ -78,7 +78,7 @@ describe.skipIf(!integrationTestsEnabled())('Approval persistence (integration, 
 
       const first = await repository.create(input(tenantId, { orderId: 'ORD-2001' }));
 
-      await expect(repository.create(input(tenantId, { orderId: 'ORD-2001' }))).rejects.toMatchObject({ code: 11000 });
+      await expect(repository.create(input(tenantId, { orderId: 'ORD-2001' }))).rejects.toBeInstanceOf(DuplicateActiveApprovalError);
 
       // Deactivate the first (reject it) - the partial index's filter ({ active: true }) no
       // longer covers this row, so a second active row for the same order is allowed again.
@@ -129,6 +129,27 @@ describe.skipIf(!integrationTestsEnabled())('Approval persistence (integration, 
   );
 
   it(
+    'amendment F1: markExecuted/markFailed are fenced on attemptCount against a REAL database - a stale attempt after a takeover matches nothing',
+    async () => {
+      const tenantId = trackedTenant();
+      const repository = await repo();
+      const created = await repository.create(input(tenantId, { orderId: 'ORD-2004b' }));
+      const begun = await repository.beginExecution(tenantId, created.id, [], new Date());
+      const staleAttemptCount = begun!.attemptCount; // 1
+
+      await repository.takeOverStuckExecution(tenantId, created.id, begun!.executingSince!, new Date());
+      // Real current attemptCount is now 2 - the stale attempt's own (1) must not match.
+      expect(await repository.markExecuted(tenantId, created.id, staleAttemptCount, new Date())).toBeNull();
+      expect(await repository.markFailed(tenantId, created.id, staleAttemptCount, { retryable: true, active: true }, new Date())).toBeNull();
+
+      const stillExecuting = await repository.findById(tenantId, created.id);
+      expect(stillExecuting?.status).toBe('executing');
+      expect(stillExecuting?.attemptCount).toBe(2);
+    },
+    30_000,
+  );
+
+  it(
     'takeOverStuckExecution only succeeds when executingSince exactly matches the current stored value - the compare-and-swap amendment B\'s lease relies on',
     async () => {
       const tenantId = trackedTenant();
@@ -153,14 +174,20 @@ describe.skipIf(!integrationTestsEnabled())('Approval persistence (integration, 
   );
 
   it(
-    'the createdAt TTL index on Approval matches the retention the test harness configured (45 days) - and is independent of CHAT_RETENTION_DAYS\'s own 30-day test value',
+    'the createdAt TTL index on Approval matches the retention the test harness configured (45 days), is PARTIAL on active:false (amendment F3), and is independent of CHAT_RETENTION_DAYS\'s own 30-day test value',
     async () => {
       const model = approvalModel();
-      const indexes = (await model.listIndexes()) as unknown as Array<{ name: string; key: Record<string, number>; expireAfterSeconds?: number }>;
+      const indexes = (await model.listIndexes()) as unknown as Array<{
+        name: string;
+        key: Record<string, number>;
+        expireAfterSeconds?: number;
+        partialFilterExpression?: Record<string, unknown>;
+      }>;
       const ttlIndex = indexes.find((idx) => idx.expireAfterSeconds !== undefined && Object.keys(idx.key).length === 1 && idx.key.createdAt === 1);
 
       expect(ttlIndex).toBeDefined();
       expect(ttlIndex?.expireAfterSeconds).toBe(45 * 24 * 60 * 60);
+      expect(ttlIndex?.partialFilterExpression).toEqual({ active: false });
     },
     30_000,
   );

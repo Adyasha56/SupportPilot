@@ -35,15 +35,65 @@ export const VerifierFailureCodeSchema = z.enum(VERIFIER_FAILURE_CODES);
 export type VerifierFailureCode = z.infer<typeof VerifierFailureCodeSchema>;
 
 /**
- * What actually happened when execution was attempted: `OK` on a real (or
- * idempotent-replay) success, one of the upstream-call outcomes, or - if the
- * decision-time re-check itself failed before any upstream call was ever
- * made - the SAME VerifierFailureCode the proposal-time check would have
- * produced, reused rather than duplicated under a different name.
+ * Mirrors apps/api/src/agent/tool-runner/tool-runner.ts's own
+ * `ToolRunErrorCode` exactly - duplicated here, not imported, because
+ * packages/shared sits BELOW apps/api in the dependency graph and can never
+ * import from it. Kept honest by a compile-time exhaustiveness guard in
+ * apps/api/src/approvals/refund-execution-classification.ts (a `switch`
+ * over the real `ToolRunErrorCode` with a `never`-typed default branch) -
+ * if that type ever gains a member not listed here, the API package fails
+ * to compile, not silently drifts.
  */
-export const EXECUTION_FAILURE_CODES = ['UPSTREAM_UNAVAILABLE', 'UPSTREAM_TIMEOUT', 'ALREADY_REFUNDED_UPSTREAM'] as const;
-export const ExecutionResultCodeSchema = z.union([z.literal('OK'), z.enum(EXECUTION_FAILURE_CODES), VerifierFailureCodeSchema]);
+export const TOOL_RUN_ERROR_CODES = [
+  'INVALID_INPUT',
+  'CONFIG_ERROR',
+  'SECRET_NOT_CONFIGURED',
+  'BLOCKED_BY_POLICY',
+  'TIMEOUT',
+  'NOT_FOUND',
+  'CONFLICT',
+  'UPSTREAM_AUTH_FAILED',
+  'UPSTREAM_ERROR',
+  'RESPONSE_TOO_LARGE',
+  'INVALID_RESPONSE',
+] as const;
+export const ToolRunErrorCodeSchema = z.enum(TOOL_RUN_ERROR_CODES);
+
+/**
+ * What actually happened when execution was attempted: `OK` on a real (or
+ * idempotent-replay) success, the raw tool-runner error code on a failed
+ * attempt, or - if the decision-time re-check itself failed before any
+ * upstream call was ever made - the SAME VerifierFailureCode the
+ * proposal-time check would have produced, reused rather than duplicated
+ * under a different name.
+ */
+export const ExecutionResultCodeSchema = z.union([z.literal('OK'), ToolRunErrorCodeSchema, VerifierFailureCodeSchema]);
 export type ExecutionResultCode = z.infer<typeof ExecutionResultCodeSchema>;
+
+/**
+ * Amendment F4's four-way classification of a failed execution attempt -
+ * never derived from the tool-runner code alone at the schema level (see
+ * refund-execution-classification.ts for the real logic); just the
+ * vocabulary, shared so the admin API and the Approval record can never
+ * drift from what the classifier actually produces.
+ *
+ * - NOT_SENT: confident the refund was never applied (the request never
+ *   meaningfully reached the upstream refund operation) - retryable, and
+ *   reject is also allowed (either action is safe).
+ * - AMBIGUOUS: genuinely unknown whether it was applied - retryable, but
+ *   reject is BLOCKED (amendment A) since rejecting would falsely claim
+ *   "we decided not to" when it may have already happened.
+ * - DEFINITIVE: a clean, explicit "no" from upstream (not found, or a
+ *   first-attempt conflict that predates this run entirely) - not
+ *   retryable, reject is allowed (there is nothing ambiguous to protect).
+ * - NEEDS_RECONCILIATION: a conflict on a RETRY, meaning our own earlier
+ *   attempt most likely already succeeded - not retryable by us, reject is
+ *   blocked, and this is never surfaced to the customer as a plain
+ *   failure; it is flagged for a human to reconcile (Stage 6+ admin work).
+ */
+export const REFUND_EXECUTION_FAILURE_CLASSES = ['NOT_SENT', 'AMBIGUOUS', 'DEFINITIVE', 'NEEDS_RECONCILIATION'] as const;
+export const RefundExecutionFailureClassSchema = z.enum(REFUND_EXECUTION_FAILURE_CLASSES);
+export type RefundExecutionFailureClass = z.infer<typeof RefundExecutionFailureClassSchema>;
 
 export const ApprovalDecisionSchema = z.enum(['approve', 'reject']);
 export type ApprovalDecision = z.infer<typeof ApprovalDecisionSchema>;
@@ -98,6 +148,9 @@ export const ApprovalRecordSchema = z.object({
   status: ApprovalStatusSchema,
   reasonCode: VerifierFailureCodeSchema.optional(),
   executionResultCode: ExecutionResultCodeSchema.optional(),
+  failureClass: RefundExecutionFailureClassSchema.optional(),
+  /** F4 - whether the refund might actually have been applied upstream, independent of whether WE can retry it. */
+  upstreamMaybeReceived: z.boolean().optional(),
   decidedBy: z.string().optional(),
   decidedAt: z.string().optional(),
   expiresAt: z.string(),

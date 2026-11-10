@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { centsEqual, centsGreaterThan, hasAtMostTwoDecimals, moneyAmountSchema, toCents } from './money';
+import { centsEqual, centsGreaterThan, fromCents, hasAtMostTwoDecimals, moneyAmountSchema, toCents } from './money';
 
 describe('toCents - the one dollars-to-cents conversion every money-accepting field reuses', () => {
   it('converts 19.99 to exactly 1999', () => {
@@ -23,6 +23,19 @@ describe('toCents - the one dollars-to-cents conversion every money-accepting fi
   it('rounds rather than truncates on genuine sub-cent input', () => {
     expect(toCents(19.995)).toBe(2000);
     expect(toCents(19.994)).toBe(1999);
+  });
+});
+
+describe('fromCents - the inverse conversion PrivilegedRefundRunner uses to rebuild a dollar amount from stored cents', () => {
+  it('round-trips every cent value toCents can produce', () => {
+    for (const dollars of [0.01, 19.99, 49.99, 250, 1249.0, 124900 / 100]) {
+      expect(fromCents(toCents(dollars))).toBeCloseTo(dollars, 2);
+      expect(hasAtMostTwoDecimals(fromCents(toCents(dollars)))).toBe(true);
+    }
+  });
+
+  it('converts 1999 to exactly 19.99', () => {
+    expect(fromCents(1999)).toBe(19.99);
   });
 });
 

@@ -1,8 +1,10 @@
 import { Schema, Types } from 'mongoose';
 import {
   ApprovalStatusSchema,
-  EXECUTION_FAILURE_CODES,
   ExecutionResultCode,
+  REFUND_EXECUTION_FAILURE_CLASSES,
+  RefundExecutionFailureClass,
+  TOOL_RUN_ERROR_CODES,
   VERIFIER_FAILURE_CODES,
   VerifierFailureCode,
 } from '@supportpilot/shared';
@@ -19,8 +21,8 @@ import {
 export const APPROVAL_STATUSES = ApprovalStatusSchema.options;
 export type ApprovalStatusValue = (typeof APPROVAL_STATUSES)[number];
 
-/** 'OK' plus every upstream-failure code plus every verifier-failure code (a decision-time re-check failure reuses those same codes) - see ExecutionResultCodeSchema's own doc comment for why these are reused rather than duplicated under new names. */
-export const EXECUTION_RESULT_CODE_VALUES = ['OK', ...EXECUTION_FAILURE_CODES, ...VERIFIER_FAILURE_CODES] as const;
+/** 'OK' plus every raw tool-runner error code plus every verifier-failure code (a decision-time re-check failure reuses those same codes) - see ExecutionResultCodeSchema's own doc comment for why these are reused rather than duplicated under new names. */
+export const EXECUTION_RESULT_CODE_VALUES = ['OK', ...TOOL_RUN_ERROR_CODES, ...VERIFIER_FAILURE_CODES] as const;
 
 export interface RuleVerdictSubdocument {
   code: VerifierFailureCode;
@@ -57,10 +59,19 @@ export interface ApprovalDocument {
   amountCents: number;
   citations: string[];
   status: ApprovalStatusValue;
-  /** Only meaningful when status === 'failed' (amendment A) - null otherwise, never a stray true/false. */
+  /** Only meaningful when status === 'failed' (amendment A) - null otherwise, never a stray true/false. Whether WE may retry via approve - false for NEEDS_RECONCILIATION too (amendment F4), even though that state also stays active. */
   retryable: boolean | null;
-  /** True for pending/executing/failed-retryable; false for every terminal state (amendment C). */
+  /**
+   * True for pending/executing/failed-retryable, AND failed-NEEDS_RECONCILIATION
+   * (amendment F4 - the money may have already moved, so a fresh proposal for
+   * the same order must stay blocked even though WE can't retry it ourselves);
+   * false for every other terminal state (amendment C).
+   */
   active: boolean;
+  /** F4 - only meaningful when status === 'failed'. Whether the refund might actually have been applied upstream, independent of `retryable`. */
+  upstreamMaybeReceived: boolean | null;
+  /** F4 - the four-way classification a failed execution attempt was given. Only meaningful when status === 'failed'. */
+  failureClass: RefundExecutionFailureClass | null;
   verifierVerdictAtProposal: RuleVerdictSubdocument[];
   /** Populated only after the first decision-time re-check has actually run (amendment A/I) - null until then. */
   verifierVerdictAtDecision: RuleVerdictSubdocument[] | null;
@@ -92,6 +103,8 @@ const ApprovalSchema = new Schema<ApprovalDocument>(
     status: { type: String, required: true, enum: APPROVAL_STATUSES },
     retryable: { type: Boolean, default: null },
     active: { type: Boolean, required: true },
+    upstreamMaybeReceived: { type: Boolean, default: null },
+    failureClass: { type: String, enum: REFUND_EXECUTION_FAILURE_CLASSES, default: null },
     verifierVerdictAtProposal: { type: [RuleVerdictSchema], required: true, default: [] },
     verifierVerdictAtDecision: { type: [RuleVerdictSchema], default: null },
     idempotencyKey: { type: String, required: true },

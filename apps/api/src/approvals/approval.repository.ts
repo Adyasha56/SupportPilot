@@ -1,7 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
-import { DEFAULT_APPROVAL_LIST_LIMIT, ExecutionResultCode, MAX_APPROVAL_LIST_LIMIT, VerifierFailureCode } from '@supportpilot/shared';
+import {
+  DEFAULT_APPROVAL_LIST_LIMIT,
+  ExecutionResultCode,
+  MAX_APPROVAL_LIST_LIMIT,
+  RefundExecutionFailureClass,
+  VerifierFailureCode,
+} from '@supportpilot/shared';
 import { ApprovalDocument, ApprovalStatusValue, RuleVerdictSubdocument } from './schemas/approval.schema';
 
 export interface ApprovalRecord {
@@ -16,6 +22,8 @@ export interface ApprovalRecord {
   status: ApprovalStatusValue;
   retryable: boolean | null;
   active: boolean;
+  upstreamMaybeReceived: boolean | null;
+  failureClass: RefundExecutionFailureClass | null;
   verifierVerdictAtProposal: RuleVerdictSubdocument[];
   verifierVerdictAtDecision: RuleVerdictSubdocument[] | null;
   idempotencyKey: string;
@@ -31,7 +39,7 @@ export interface ApprovalRecord {
   updatedAt: Date;
 }
 
-/** Everything the caller (ApprovalService, a later stage) decides at proposal time - id/idempotencyKey/status/active/attemptCount are NOT inputs, they're computed here (amendment G). */
+/** Everything the caller (ApprovalService) decides at proposal time - id/idempotencyKey/status/active/attemptCount are NOT inputs, they're computed here (amendment G). */
 export interface NewApproval {
   tenantId: string;
   runId: string;
@@ -58,29 +66,55 @@ export interface ApprovalListResult {
   nextCursor?: string;
 }
 
+/** amendment F1 - thrown instead of a plain duplicate-key passthrough, so callers (ApprovalService) can distinguish "the active-per-order index blocked this insert" from any other create() failure without inspecting a raw Mongo error code. */
+export class DuplicateActiveApprovalError extends Error {
+  constructor(public readonly orderId: string) {
+    super(`An active Approval already exists for order "${orderId}".`);
+  }
+}
+
+/** amendment F4 - params a failed execution attempt (or a pending-time verifier denial) is recorded with. `active`/`retryable` are independent (NEEDS_RECONCILIATION sets retryable: false but active: true). */
+export interface MarkFailedParams {
+  retryable: boolean;
+  active: boolean;
+  executionResultCode?: ExecutionResultCode;
+  upstreamMaybeReceived?: boolean;
+  failureClass?: RefundExecutionFailureClass;
+  /** Pending-time verifier denial only - a single-code summary; the full detail lives in verifierVerdictAtDecision. */
+  reasonCode?: VerifierFailureCode;
+  verifierVerdictAtDecision?: RuleVerdictSubdocument[];
+}
+
 /**
  * Every method is tenant-scoped - tenantId is a required, explicit
  * parameter everywhere, never optional and never inferred (RULES.md
  * §5's "every database query... must be scoped by tenantId", restated
  * here as a type-level guarantee as well as a runtime one).
  *
- * The six transition methods are each a SINGLE atomic findOneAndUpdate
- * matching tenantId + id + the expected prior state. A `null` result
- * means the expected prior state didn't match (lost a race, already
- * decided, wrong tenant, or doesn't exist) - none of them ever throw for
- * that; the caller (a later stage's ApprovalService) is what turns a null
- * into the right HTTP response.
+ * Every transition method is a SINGLE atomic findOneAndUpdate matching
+ * tenantId + id + the expected prior state - `markExecuted`/`markFailed`
+ * additionally match `expectedAttemptCount` (amendment F1's fencing
+ * token), since status alone can't distinguish a stale attempt from the
+ * current one once a lease takeover has moved attemptCount forward while
+ * status stays 'executing' throughout. A `null` result means the expected
+ * prior state didn't match (lost a race, already decided, wrong tenant,
+ * stale attempt, or doesn't exist) - none of them ever throw for that;
+ * the caller is what turns a null into the right response.
  */
 export interface ApprovalRepository {
   /**
-   * The dual-write-with-AgentRun transaction hook point (amendment D) -
-   * wired in a later stage. `session` is accepted now so the eventual
-   * caller can pass a Mongoose ClientSession and have this insert
-   * participate in that transaction; omitted, it's a plain standalone
-   * insert (exactly what every test in this stage uses).
+   * The dual-write-with-AgentRun transaction hook point (amendment D).
+   * `session` is accepted so the eventual caller can pass a Mongoose
+   * ClientSession and have this insert participate in that transaction;
+   * omitted, it's a plain standalone insert. Throws DuplicateActiveApprovalError
+   * (amendment F2) when the active-per-order partial unique index rejects
+   * the insert - never a raw Mongo E11000 error - so ApprovalService can
+   * react without inspecting driver-specific error shapes.
    */
   create(input: NewApproval, session?: unknown): Promise<ApprovalRecord>;
   findById(tenantId: string, id: string): Promise<ApprovalRecord | null>;
+  /** amendment F2 - the row (if any) currently blocking a new proposal for this order, so the caller can decide whether it's actually still active or just a stale pending row past its expiry. */
+  findActiveByOrder(tenantId: string, orderId: string): Promise<ApprovalRecord | null>;
   list(tenantId: string, query: ApprovalListQuery): Promise<ApprovalListResult>;
   /** UTC calendar day containing `now` - see startOfUtcDay's own doc comment for why UTC, not server-local or the customer's own timezone. */
   countForCustomerToday(tenantId: string, customerRef: string, now: Date): Promise<number>;
@@ -91,24 +125,22 @@ export interface ApprovalRepository {
   takeOverStuckExecution(tenantId: string, id: string, staleExecutingSince: Date, now: Date): Promise<ApprovalRecord | null>;
   /** failed (retryable only) -> executing, refreshed. No re-verification (amendment A) - the caller never re-runs the verifier for this path. */
   retryFromFailed(tenantId: string, id: string, now: Date): Promise<ApprovalRecord | null>;
-  /** executing -> executed. */
-  markExecuted(tenantId: string, id: string, executionResultCode: ExecutionResultCode, now: Date): Promise<ApprovalRecord | null>;
   /**
-   * pending OR executing -> failed. `retryable` decides whether `active`
-   * stays true (amendment C) - the caller decides retryable/non-retryable
-   * from the upstream outcome (or, for a pending-time verifier denial,
-   * always passes retryable: false - there's no ambiguity to retry when
-   * no upstream call was ever attempted). `verifierVerdictAtDecision` is
-   * only passed on the pending-time denial path (beginExecution already
-   * recorded it for the executing-time path).
+   * executing -> executed. Fenced on `expectedAttemptCount` (amendment F1):
+   * a stale attempt (superseded by a lease takeover) matches nothing and
+   * returns null - see this file's "stale success" doc comment on the
+   * Mongoose implementation for how that's reconciled.
    */
-  markFailed(
-    tenantId: string,
-    id: string,
-    params: { retryable: boolean; executionResultCode?: ExecutionResultCode; reasonCode?: VerifierFailureCode; verifierVerdictAtDecision?: RuleVerdictSubdocument[] },
-    now: Date,
-  ): Promise<ApprovalRecord | null>;
-  /** pending, OR failed+non-retryable -> rejected. Never matches failed+retryable (amendment A's reject-blocked-after-ambiguous-failure rule falls out of this query, not a separate check). */
+  markExecuted(tenantId: string, id: string, expectedAttemptCount: number, now: Date): Promise<ApprovalRecord | null>;
+  /**
+   * pending OR executing -> failed, fenced on `expectedAttemptCount` when
+   * leaving 'executing' (a pending-time verifier denial has attemptCount
+   * 0 and no concurrent attempt to fence against). `params.active` is set
+   * directly by the caller, independent of `retryable` - NEEDS_RECONCILIATION
+   * is `retryable: false, active: true`.
+   */
+  markFailed(tenantId: string, id: string, expectedAttemptCount: number, params: MarkFailedParams, now: Date): Promise<ApprovalRecord | null>;
+  /** pending, OR failed+(DEFINITIVE or NOT_SENT) -> rejected. Blocked for AMBIGUOUS and NEEDS_RECONCILIATION regardless of `retryable` (NOT_SENT is retryable AND rejectable at once - amendment F4). */
   reject(tenantId: string, id: string, decidedBy: string, now: Date): Promise<ApprovalRecord | null>;
   /** pending (and already past expiresAt) -> expired. */
   expire(tenantId: string, id: string, now: Date): Promise<ApprovalRecord | null>;
@@ -196,6 +228,8 @@ function toApprovalRecord(doc: ApprovalDocument): ApprovalRecord {
     status: doc.status,
     retryable: doc.retryable,
     active: doc.active,
+    upstreamMaybeReceived: doc.upstreamMaybeReceived,
+    failureClass: doc.failureClass,
     verifierVerdictAtProposal: doc.verifierVerdictAtProposal,
     verifierVerdictAtDecision: doc.verifierVerdictAtDecision,
     idempotencyKey: doc.idempotencyKey,
@@ -212,6 +246,10 @@ function toApprovalRecord(doc: ApprovalDocument): ApprovalRecord {
   };
 }
 
+function isDuplicateKeyError(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && 'code' in err && (err as { code: unknown }).code === 11000;
+}
+
 @Injectable()
 export class MongooseApprovalRepository implements ApprovalRepository {
   constructor(@InjectModel('Approval') private readonly model: Model<ApprovalDocument>) {}
@@ -221,36 +259,45 @@ export class MongooseApprovalRepository implements ApprovalRepository {
     const idempotencyKey = `apr_${id.toHexString()}`;
     const expiresAt = new Date(input.now.getTime() + input.approvalExpiryDays * 24 * 60 * 60 * 1000);
 
-    const [doc] = await this.model.create(
-      [
-        {
-          _id: id,
-          tenantId: input.tenantId,
-          runId: input.runId,
-          conversationId: input.conversationId,
-          orderId: input.orderId,
-          customerRef: input.customerRef,
-          amountCents: input.amountCents,
-          citations: input.citations,
-          status: 'pending',
-          retryable: null,
-          active: true,
-          verifierVerdictAtProposal: input.verifierVerdictAtProposal,
-          verifierVerdictAtDecision: null,
-          idempotencyKey,
-          attemptCount: 0,
-          executionStartedAt: null,
-          executingSince: null,
-          decidedBy: null,
-          decidedAt: null,
-          reasonCode: null,
-          executionResultCode: null,
-          expiresAt,
-        },
-      ],
-      { session: session as never },
-    );
-    return toApprovalRecord(doc);
+    try {
+      const [doc] = await this.model.create(
+        [
+          {
+            _id: id,
+            tenantId: input.tenantId,
+            runId: input.runId,
+            conversationId: input.conversationId,
+            orderId: input.orderId,
+            customerRef: input.customerRef,
+            amountCents: input.amountCents,
+            citations: input.citations,
+            status: 'pending',
+            retryable: null,
+            active: true,
+            upstreamMaybeReceived: null,
+            failureClass: null,
+            verifierVerdictAtProposal: input.verifierVerdictAtProposal,
+            verifierVerdictAtDecision: null,
+            idempotencyKey,
+            attemptCount: 0,
+            executionStartedAt: null,
+            executingSince: null,
+            decidedBy: null,
+            decidedAt: null,
+            reasonCode: null,
+            executionResultCode: null,
+            expiresAt,
+          },
+        ],
+        { session: session as never },
+      );
+      return toApprovalRecord(doc);
+    } catch (err) {
+      if (isDuplicateKeyError(err)) {
+        throw new DuplicateActiveApprovalError(input.orderId);
+      }
+      throw err;
+    }
   }
 
   async findById(tenantId: string, id: string): Promise<ApprovalRecord | null> {
@@ -258,6 +305,11 @@ export class MongooseApprovalRepository implements ApprovalRepository {
       return null;
     }
     const doc = await this.model.findOne({ _id: id, tenantId }).lean();
+    return doc ? toApprovalRecord(doc as unknown as ApprovalDocument) : null;
+  }
+
+  async findActiveByOrder(tenantId: string, orderId: string): Promise<ApprovalRecord | null> {
+    const doc = await this.model.findOne({ tenantId, orderId, active: true }).lean();
     return doc ? toApprovalRecord(doc as unknown as ApprovalDocument) : null;
   }
 
@@ -334,36 +386,52 @@ export class MongooseApprovalRepository implements ApprovalRepository {
     return doc ? toApprovalRecord(doc as unknown as ApprovalDocument) : null;
   }
 
-  async markExecuted(tenantId: string, id: string, executionResultCode: ExecutionResultCode, now: Date): Promise<ApprovalRecord | null> {
+  /**
+   * Amendment F1's "stale success" case: attempt #1's own upstream call
+   * eventually resolves with success, but a lease takeover already moved
+   * attemptCount forward (or a different attempt already landed
+   * markExecuted first) - this `findOneAndUpdate` then matches nothing and
+   * returns null, exactly like any other lost race. Nothing is lost: the
+   * refund itself is governed by the SAME idempotencyKey regardless of
+   * which attempt's HTTP call "wins" the race to report it, so the store
+   * only ever applies it once; whichever attempt's write actually lands
+   * first in Mongo is what the record reflects, and the other's late,
+   * fenced-out success report is correctly a no-op, not an error - the
+   * caller (ApprovalService) logs it as a reconciliation-for-visibility
+   * event, never retries or alarms, because the system is already in the
+   * correct state (`executed`) by the time the stale report arrives.
+   */
+  async markExecuted(tenantId: string, id: string, expectedAttemptCount: number, now: Date): Promise<ApprovalRecord | null> {
     if (!Types.ObjectId.isValid(id)) {
       return null;
     }
     const doc = await this.model
       .findOneAndUpdate(
-        { _id: id, tenantId, status: 'executing' },
-        { $set: { status: 'executed', active: false, executionResultCode, decidedAt: now } },
+        { _id: id, tenantId, status: 'executing', attemptCount: expectedAttemptCount },
+        { $set: { status: 'executed', active: false, executionResultCode: 'OK', decidedAt: now } },
         { new: true },
       )
       .lean();
     return doc ? toApprovalRecord(doc as unknown as ApprovalDocument) : null;
   }
 
-  async markFailed(
-    tenantId: string,
-    id: string,
-    params: { retryable: boolean; executionResultCode?: ExecutionResultCode; reasonCode?: VerifierFailureCode; verifierVerdictAtDecision?: RuleVerdictSubdocument[] },
-    now: Date,
-  ): Promise<ApprovalRecord | null> {
+  async markFailed(tenantId: string, id: string, expectedAttemptCount: number, params: MarkFailedParams, now: Date): Promise<ApprovalRecord | null> {
     if (!Types.ObjectId.isValid(id)) {
       return null;
     }
     const $set: Record<string, unknown> = {
       status: 'failed',
       retryable: params.retryable,
-      active: params.retryable,
+      active: params.active,
     };
     if (params.executionResultCode !== undefined) {
       $set.executionResultCode = params.executionResultCode;
+    }
+    if (params.upstreamMaybeReceived !== undefined) {
+      $set.upstreamMaybeReceived = params.upstreamMaybeReceived;
+    }
+    if (params.failureClass !== undefined) {
+      $set.failureClass = params.failureClass;
     }
     if (params.reasonCode !== undefined) {
       $set.reasonCode = params.reasonCode;
@@ -371,15 +439,15 @@ export class MongooseApprovalRepository implements ApprovalRepository {
     if (params.verifierVerdictAtDecision !== undefined) {
       $set.verifierVerdictAtDecision = params.verifierVerdictAtDecision;
     }
-    // A failed-retryable row stays unresolved - no decidedAt yet, matching "decidedAt is when a
-    // human/system decision actually settled the matter" (an ambiguous failure settles nothing).
-    if (!params.retryable) {
+    // A failed row that's still active (retryable, or NEEDS_RECONCILIATION) stays unresolved -
+    // no decidedAt yet, matching "decidedAt is when a decision actually settled the matter."
+    if (!params.active) {
       $set.decidedAt = now;
     }
 
     const doc = await this.model
       .findOneAndUpdate(
-        { _id: id, tenantId, status: { $in: ['pending', 'executing'] } },
+        { _id: id, tenantId, status: { $in: ['pending', 'executing'] }, attemptCount: expectedAttemptCount },
         { $set },
         { new: true },
       )
@@ -393,7 +461,11 @@ export class MongooseApprovalRepository implements ApprovalRepository {
     }
     const doc = await this.model
       .findOneAndUpdate(
-        { _id: id, tenantId, $or: [{ status: 'pending' }, { status: 'failed', retryable: false }] },
+        {
+          _id: id,
+          tenantId,
+          $or: [{ status: 'pending' }, { status: 'failed', failureClass: { $nin: ['AMBIGUOUS', 'NEEDS_RECONCILIATION'] } }],
+        },
         { $set: { status: 'rejected', active: false, decidedBy, decidedAt: now } },
         { new: true },
       )

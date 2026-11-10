@@ -3,7 +3,9 @@ import {
   ApprovalDecisionRequestSchema,
   ApprovalListQuerySchema,
   ApprovalRecordSchema,
-  EXECUTION_FAILURE_CODES,
+  REFUND_EXECUTION_FAILURE_CLASSES,
+  RefundExecutionFailureClassSchema,
+  TOOL_RUN_ERROR_CODES,
   ExecutionResultCodeSchema,
   MAX_APPROVAL_LIST_LIMIT,
   VERIFIER_FAILURE_CODES,
@@ -45,6 +47,18 @@ describe('ApprovalRecordSchema', () => {
     expect(result.success).toBe(true);
   });
 
+  it('accepts a failed record with failureClass and upstreamMaybeReceived (amendment F4)', () => {
+    const result = ApprovalRecordSchema.safeParse(
+      approvalRecord({
+        status: 'failed',
+        executionResultCode: 'TIMEOUT',
+        failureClass: 'AMBIGUOUS',
+        upstreamMaybeReceived: true,
+      }),
+    );
+    expect(result.success).toBe(true);
+  });
+
   it('rejects an unknown status', () => {
     expect(ApprovalRecordSchema.safeParse(approvalRecord({ status: 'done' })).success).toBe(false);
   });
@@ -59,7 +73,7 @@ describe('ExecutionResultCodeSchema', () => {
     expect(ExecutionResultCodeSchema.safeParse('OK').success).toBe(true);
   });
 
-  it.each(EXECUTION_FAILURE_CODES)('accepts upstream failure code %s', (code) => {
+  it.each(TOOL_RUN_ERROR_CODES)('accepts raw tool-runner error code %s', (code) => {
     expect(ExecutionResultCodeSchema.safeParse(code).success).toBe(true);
   });
 
@@ -69,6 +83,18 @@ describe('ExecutionResultCodeSchema', () => {
 
   it('rejects an unrelated string', () => {
     expect(ExecutionResultCodeSchema.safeParse('SOMETHING_ELSE').success).toBe(false);
+  });
+});
+
+describe('RefundExecutionFailureClassSchema', () => {
+  it('accepts every documented class', () => {
+    for (const cls of REFUND_EXECUTION_FAILURE_CLASSES) {
+      expect(RefundExecutionFailureClassSchema.safeParse(cls).success).toBe(true);
+    }
+  });
+
+  it('rejects an unrelated string', () => {
+    expect(RefundExecutionFailureClassSchema.safeParse('MAYBE').success).toBe(false);
   });
 });
 

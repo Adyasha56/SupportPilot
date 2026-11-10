@@ -1,15 +1,16 @@
 import { randomBytes } from 'node:crypto';
-import { ExecutionResultCode, VerifierFailureCode } from '@supportpilot/shared';
 import {
   ApprovalListQuery,
   ApprovalListResult,
   ApprovalRecord,
   ApprovalRepository,
+  DuplicateActiveApprovalError,
   encodeCursor,
   endOfUtcDay,
+  MarkFailedParams,
+  NewApproval,
   resolveListLimit,
   startOfUtcDay,
-  NewApproval,
 } from '../../approvals/approval.repository';
 import { RuleVerdictSubdocument } from '../../approvals/schemas/approval.schema';
 
@@ -27,6 +28,11 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
   private readonly approvals = new Map<string, ApprovalRecord>();
 
   async create(input: NewApproval): Promise<ApprovalRecord> {
+    const existingActive = [...this.approvals.values()].find((a) => a.tenantId === input.tenantId && a.orderId === input.orderId && a.active);
+    if (existingActive) {
+      throw new DuplicateActiveApprovalError(input.orderId);
+    }
+
     const id = randomBytes(12).toString('hex'); // same shape as a real ObjectId.toHexString()
     const idempotencyKey = `apr_${id}`;
     const expiresAt = new Date(input.now.getTime() + input.approvalExpiryDays * 24 * 60 * 60 * 1000);
@@ -42,6 +48,8 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
       status: 'pending',
       retryable: null,
       active: true,
+      upstreamMaybeReceived: null,
+      failureClass: null,
       verifierVerdictAtProposal: input.verifierVerdictAtProposal,
       verifierVerdictAtDecision: null,
       idempotencyKey,
@@ -66,6 +74,11 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
       return null;
     }
     return { ...record };
+  }
+
+  async findActiveByOrder(tenantId: string, orderId: string): Promise<ApprovalRecord | null> {
+    const record = [...this.approvals.values()].find((a) => a.tenantId === tenantId && a.orderId === orderId && a.active);
+    return record ? { ...record } : null;
   }
 
   async list(tenantId: string, query: ApprovalListQuery): Promise<ApprovalListResult> {
@@ -125,34 +138,35 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
     return { ...record };
   }
 
-  async markExecuted(tenantId: string, id: string, executionResultCode: ExecutionResultCode, now: Date): Promise<ApprovalRecord | null> {
+  async markExecuted(tenantId: string, id: string, expectedAttemptCount: number, now: Date): Promise<ApprovalRecord | null> {
     const record = this.get(tenantId, id);
-    if (!record || record.status !== 'executing') {
+    if (!record || record.status !== 'executing' || record.attemptCount !== expectedAttemptCount) {
       return null;
     }
     record.status = 'executed';
     record.active = false;
-    record.executionResultCode = executionResultCode;
+    record.executionResultCode = 'OK';
     record.decidedAt = now;
     record.updatedAt = now;
     return { ...record };
   }
 
-  async markFailed(
-    tenantId: string,
-    id: string,
-    params: { retryable: boolean; executionResultCode?: ExecutionResultCode; reasonCode?: VerifierFailureCode; verifierVerdictAtDecision?: RuleVerdictSubdocument[] },
-    now: Date,
-  ): Promise<ApprovalRecord | null> {
+  async markFailed(tenantId: string, id: string, expectedAttemptCount: number, params: MarkFailedParams, now: Date): Promise<ApprovalRecord | null> {
     const record = this.get(tenantId, id);
-    if (!record || (record.status !== 'pending' && record.status !== 'executing')) {
+    if (!record || (record.status !== 'pending' && record.status !== 'executing') || record.attemptCount !== expectedAttemptCount) {
       return null;
     }
     record.status = 'failed';
     record.retryable = params.retryable;
-    record.active = params.retryable;
+    record.active = params.active;
     if (params.executionResultCode !== undefined) {
       record.executionResultCode = params.executionResultCode;
+    }
+    if (params.upstreamMaybeReceived !== undefined) {
+      record.upstreamMaybeReceived = params.upstreamMaybeReceived;
+    }
+    if (params.failureClass !== undefined) {
+      record.failureClass = params.failureClass;
     }
     if (params.reasonCode !== undefined) {
       record.reasonCode = params.reasonCode;
@@ -160,7 +174,7 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
     if (params.verifierVerdictAtDecision !== undefined) {
       record.verifierVerdictAtDecision = params.verifierVerdictAtDecision;
     }
-    if (!params.retryable) {
+    if (!params.active) {
       record.decidedAt = now;
     }
     record.updatedAt = now;
@@ -172,7 +186,8 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
     if (!record) {
       return null;
     }
-    const allowed = record.status === 'pending' || (record.status === 'failed' && record.retryable === false);
+    const allowed =
+      record.status === 'pending' || (record.status === 'failed' && record.failureClass !== 'AMBIGUOUS' && record.failureClass !== 'NEEDS_RECONCILIATION');
     if (!allowed) {
       return null;
     }

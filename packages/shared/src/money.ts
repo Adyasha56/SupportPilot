@@ -1,3 +1,4 @@
+
 import { z } from 'zod';
 
 /**
@@ -7,6 +8,11 @@ import { z } from 'zod';
  */
 export function toCents(amount: number): number {
   return Math.round(amount * 100);
+}
+
+/** The inverse of toCents - exact for any integer cents value toCents itself produced; hasAtMostTwoDecimals' own small tolerance absorbs any residual float noise from the division. */
+export function fromCents(cents: number): number {
+  return Math.round(cents) / 100;
 }
 
 export function hasAtMostTwoDecimals(amount: number): boolean {
