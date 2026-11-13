@@ -233,29 +233,36 @@ describe.skipIf(!integrationTestsEnabled())('Chat + Approvals (integration, real
   });
 
   it('auto-execute ON, amount at or under the approval threshold: the real mock-store refund is issued exactly once, reply (not pending_approval)', async () => {
+    // ORD-1008 (cust_5, delivered, $44.00) is used nowhere else in this file - this test is the
+    // ONLY one in the whole suite that actually EXECUTES a real refund via the mock store, which
+    // mutates that order's alreadyRefundedTotal permanently for the lifetime of the shared
+    // in-process mock-store instance (one boot per file, never reset between tests). Reusing
+    // ORD-1001 here (as an earlier draft did) silently broke every OTHER test in this file that
+    // also proposes against ORD-1001, since each would see it as already-fully-refunded from
+    // this point on - a real test-isolation bug, not a product bug (see docs/learning-notes.md).
     const tenant = await newTenant();
     await repos().tenant.updateSettings(tenant.tenantId, { autoExecuteRefunds: true, approvalThreshold: 100, dailyRefundCountLimit: 10 });
     const { kid, privateKey } = await registerCustomerKeyFixture(uri, tenant.tenantId);
-    const token = mintCustomerToken(tenant.tenantId, 'cust_1', kid, privateKey);
+    const token = mintCustomerToken(tenant.tenantId, 'cust_5', kid, privateKey);
     const { chunkKey, uniqueWord } = await seedCitableChunk(tenant, 'A delivered order that arrived damaged can be refunded automatically.');
 
     scriptableLlm.setScript([
-      planOutput({ needsPolicy: true, searchQuery: uniqueWord, toolRequests: [{ tool: 'get_order', order_id: 'ORD-1001' }] }),
-      composeOutput({ outcome: 'propose_refund', message: 'Refunding you.', citedChunkKeys: [chunkKey], proposedRefund: { order_id: 'ORD-1001', amount: 49.99 } }),
+      planOutput({ needsPolicy: true, searchQuery: uniqueWord, toolRequests: [{ tool: 'get_order', order_id: 'ORD-1008' }] }),
+      composeOutput({ outcome: 'propose_refund', message: 'Refunding you.', citedChunkKeys: [chunkKey], proposedRefund: { order_id: 'ORD-1008', amount: 44.0 } }),
     ]);
 
     const res = await send(tenant.publicKey, { message: 'refund my damaged order', customerToken: token });
 
     expect(res.status).toBe(200);
     expect(res.body.outcome).toBe('reply');
-    expect(res.body.message).toMatch(/49\.99/);
+    expect(res.body.message).toMatch(/44\.00/);
     expect(res.body.proposedAction).toBeUndefined();
 
     const { agentRun, approval } = repos();
     const runs = await agentRun.findByConversation(tenant.tenantId, res.body.conversationId as string);
     expect(runs[0].refundDisposition?.kind).toBe('auto_executed');
     const approvalRecord = await approval.findById(tenant.tenantId, runs[0].refundDisposition!.approvalId!);
-    expect(approvalRecord).toMatchObject({ status: 'executed', active: false, orderId: 'ORD-1001', amountCents: 4999, decidedBy: 'system:auto_execute' });
+    expect(approvalRecord).toMatchObject({ status: 'executed', active: false, orderId: 'ORD-1008', amountCents: 4400, decidedBy: 'system:auto_execute' });
   });
 
   it('auto-execute OFF (tenant default): the SAME scenario stays pending_approval - no refund issued yet', async () => {

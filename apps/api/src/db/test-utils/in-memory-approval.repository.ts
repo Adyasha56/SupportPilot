@@ -101,7 +101,7 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
     ).length;
   }
 
-  async beginExecution(tenantId: string, id: string, verifierVerdictAtDecision: RuleVerdictSubdocument[], now: Date): Promise<ApprovalRecord | null> {
+  async beginExecution(tenantId: string, id: string, verifierVerdictAtDecision: RuleVerdictSubdocument[], now: Date, decidedBy?: string): Promise<ApprovalRecord | null> {
     const record = this.get(tenantId, id);
     if (!record || record.status !== 'pending') {
       return null;
@@ -111,22 +111,28 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
     record.executionStartedAt = now;
     record.attemptCount = 1;
     record.verifierVerdictAtDecision = verifierVerdictAtDecision;
+    if (decidedBy !== undefined) {
+      record.decidedBy = decidedBy;
+    }
     record.updatedAt = now;
     return { ...record };
   }
 
-  async takeOverStuckExecution(tenantId: string, id: string, staleExecutingSince: Date, now: Date): Promise<ApprovalRecord | null> {
+  async takeOverStuckExecution(tenantId: string, id: string, staleExecutingSince: Date, now: Date, decidedBy?: string): Promise<ApprovalRecord | null> {
     const record = this.get(tenantId, id);
     if (!record || record.status !== 'executing' || record.executingSince?.getTime() !== staleExecutingSince.getTime()) {
       return null;
     }
     record.executingSince = now;
     record.attemptCount += 1;
+    if (decidedBy !== undefined) {
+      record.decidedBy = decidedBy;
+    }
     record.updatedAt = now;
     return { ...record };
   }
 
-  async retryFromFailed(tenantId: string, id: string, now: Date): Promise<ApprovalRecord | null> {
+  async retryFromFailed(tenantId: string, id: string, now: Date, decidedBy?: string): Promise<ApprovalRecord | null> {
     const record = this.get(tenantId, id);
     if (!record || record.status !== 'failed' || record.retryable !== true) {
       return null;
@@ -134,6 +140,9 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
     record.status = 'executing';
     record.executingSince = now;
     record.attemptCount += 1;
+    if (decidedBy !== undefined) {
+      record.decidedBy = decidedBy;
+    }
     record.updatedAt = now;
     return { ...record };
   }

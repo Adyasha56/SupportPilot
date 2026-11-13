@@ -172,7 +172,7 @@ export class ApprovalService implements ApprovalProposalPort {
     // HTTP call (the privileged refund runner) must never happen while holding a Mongo
     // transaction open. beginExecution (pending -> executing) is its own separate atomic write,
     // exactly like every other state transition in this service.
-    const beganApproval = await this.repository.beginExecution(input.tenantId, approval.id, verifierResult.verdicts, input.now);
+    const beganApproval = await this.repository.beginExecution(input.tenantId, approval.id, verifierResult.verdicts, input.now, 'system:auto_execute');
     if (!beganApproval) {
       // Structurally shouldn't happen (nothing else has touched this brand-new row yet), but
       // fail closed rather than claim success if it somehow does.
@@ -345,14 +345,14 @@ export class ApprovalService implements ApprovalProposalPort {
         return { ok: false, code: 'ALREADY_DECIDED' };
 
       case 'pending':
-        return this.approveFromPending(tenantId, approval, now, tenantSettings, fetchFreshOrderSnapshot, appendCustomerMessage);
+        return this.approveFromPending(tenantId, approval, decidedBy, now, tenantSettings, fetchFreshOrderSnapshot, appendCustomerMessage);
 
       case 'executing': {
         const leaseExpired = now.getTime() - (approval.executingSince?.getTime() ?? 0) >= this.settings.executionLeaseMs;
         if (!leaseExpired) {
           return { ok: false, code: 'IN_PROGRESS' };
         }
-        const taken = await this.repository.takeOverStuckExecution(tenantId, approval.id, approval.executingSince!, now);
+        const taken = await this.repository.takeOverStuckExecution(tenantId, approval.id, approval.executingSince!, now, decidedBy);
         if (!taken) {
           return { ok: false, code: 'IN_PROGRESS' };
         }
@@ -363,7 +363,7 @@ export class ApprovalService implements ApprovalProposalPort {
         if (!approval.retryable) {
           return { ok: false, code: approval.failureClass === 'NEEDS_RECONCILIATION' ? 'AMBIGUOUS_RETRY_REQUIRED' : 'ALREADY_DECIDED' };
         }
-        const retried = await this.repository.retryFromFailed(tenantId, approval.id, now);
+        const retried = await this.repository.retryFromFailed(tenantId, approval.id, now, decidedBy);
         if (!retried) {
           return { ok: false, code: 'IN_PROGRESS' };
         }
@@ -375,6 +375,7 @@ export class ApprovalService implements ApprovalProposalPort {
   private async approveFromPending(
     tenantId: string,
     approval: ApprovalRecord,
+    decidedBy: string,
     now: Date,
     tenantSettings: RefundVerifierTenantSettings,
     fetchFreshOrderSnapshot: FetchFreshOrderSnapshot,
@@ -408,7 +409,7 @@ export class ApprovalService implements ApprovalProposalPort {
       return this.denyAtDecisionTime(tenantId, approval, now, recheck.failedRuleCodes, recheck.verdicts, appendCustomerMessage);
     }
 
-    const begun = await this.repository.beginExecution(tenantId, approval.id, recheck.verdicts, now);
+    const begun = await this.repository.beginExecution(tenantId, approval.id, recheck.verdicts, now, decidedBy);
     if (!begun) {
       return { ok: false, code: 'IN_PROGRESS' };
     }
