@@ -6,6 +6,7 @@ import { LlmModule } from '../llm/llm.module';
 import { RetrievalModule } from '../retrieval/retrieval.module';
 import { ToolRunnerModule } from '../agent/tool-runner/tool-runner.module';
 import { ConnectorsModule } from '../connectors/connectors.module';
+import { ApprovalsModule } from '../approvals/approvals.module';
 import { AuthModule } from '../auth/auth.module';
 
 /**
@@ -32,17 +33,18 @@ describe('chatDatabaseImportsFor (pure function - no import, no module reset, no
 });
 
 describe('ChatModule (real, statically-imported class - no dynamic import, no module reset)', () => {
-  it('always imports LlmModule, RetrievalModule, ToolRunnerModule, and ConnectorsModule, regardless of MONGODB_URI', () => {
+  it('always imports LlmModule, RetrievalModule, ToolRunnerModule, ConnectorsModule, and ApprovalsModule, regardless of MONGODB_URI', () => {
     const imports = Reflect.getMetadata('imports', ChatModule) as unknown[];
     expect(imports).toContain(LlmModule);
     expect(imports).toContain(RetrievalModule);
     expect(imports).toContain(ToolRunnerModule);
     expect(imports).toContain(ConnectorsModule);
+    expect(imports).toContain(ApprovalsModule);
   });
 
   it("the real decorator's imports match exactly what chatDatabaseImportsFor(process.env) computes for the ambient env this module was actually loaded under", () => {
     const imports = Reflect.getMetadata('imports', ChatModule) as unknown[];
-    expect(imports).toEqual([LlmModule, RetrievalModule, ToolRunnerModule, ConnectorsModule, ...chatDatabaseImportsFor(process.env)]);
+    expect(imports).toEqual([LlmModule, RetrievalModule, ToolRunnerModule, ConnectorsModule, ApprovalsModule, ...chatDatabaseImportsFor(process.env)]);
   });
 
   it('never imports AuthModule - it provides its own ApiKeyGuard scoped to this route (see chat-api-key-guard-settings.provider.ts)', () => {

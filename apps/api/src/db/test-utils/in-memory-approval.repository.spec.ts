@@ -114,6 +114,23 @@ describe('InMemoryApprovalRepository.beginExecution', () => {
     const repo = new InMemoryApprovalRepository();
     expect(await repo.beginExecution('acme', 'ffffffffffffffffffffffff', [], NOW)).toBeNull();
   });
+
+  // Stage 5 follow-up (CI failure fix): decidedBy is optional and appended LAST specifically so
+  // every pre-existing 4-arg call above keeps compiling and keeps its exact prior behavior.
+  it('records decidedBy when the caller passes it (e.g. "system:auto_execute")', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const created = await createPending(repo);
+    const result = await repo.beginExecution('acme', created.id, [], NOW, 'system:auto_execute');
+    expect(result?.decidedBy).toBe('system:auto_execute');
+  });
+
+  it('leaves decidedBy exactly as it already was when the caller omits it', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const created = await createPending(repo);
+    expect(created.decidedBy).toBeNull();
+    const result = await repo.beginExecution('acme', created.id, [], NOW);
+    expect(result?.decidedBy).toBeNull();
+  });
 });
 
 describe('InMemoryApprovalRepository.takeOverStuckExecution (amendment B lease steal)', () => {

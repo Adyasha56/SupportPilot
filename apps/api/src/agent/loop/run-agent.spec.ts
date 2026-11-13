@@ -170,7 +170,7 @@ describe('runAgent', () => {
       toolRunner,
     });
 
-    const { result } = await runAgent(makeInput(), deps);
+    const { result, trace } = await runAgent(makeInput(), deps);
 
     expect(result.outcome).toBe('pending_approval');
     expect(result.proposedAction).toEqual({
@@ -178,6 +178,27 @@ describe('runAgent', () => {
       args: { order_id: 'ORD-1001', amount: 49.99, idempotencyKey: expect.stringMatching(/^[0-9a-f]{64}$/) },
       reasonCitations: [],
     });
+
+    // Stage 5 - internal only, never sent to the customer: the SAME order facts this run already
+    // verified ownership for, handed to chat.service.ts for ApprovalProposalPort.createFromProposal.
+    expect(trace.proposedOrderSnapshot).toEqual({
+      orderId: 'ORD-1001',
+      status: 'delivered',
+      customerRef: 'cust_1',
+      deliveredAt: '2026-10-01T00:00:00.000Z',
+      totalCents: 4999,
+      alreadyRefundedCents: 0,
+    });
+  });
+
+  it('proposedOrderSnapshot is absent for every outcome other than pending_approval', async () => {
+    const { deps } = makeDeps({
+      generateQueue: [planOutput({ toolRequests: [] }), composeOutput({ outcome: 'clarify', message: 'Which order?' })],
+    });
+
+    const { trace } = await runAgent(makeInput({ customerMessage: 'I want a refund' }), deps);
+
+    expect(trace.proposedOrderSnapshot).toBeUndefined();
   });
 
   it('missing order id: clarify', async () => {

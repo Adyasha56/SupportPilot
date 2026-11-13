@@ -56,6 +56,7 @@ import { PolicyRetrievalService } from '../../src/retrieval/policy-retrieval.ser
 import { AGENT_RUN_REPOSITORY, AgentRunRepository } from '../../src/db/agent-run.repository';
 import { CONVERSATION_REPOSITORY, ConversationRepository } from '../../src/db/conversation.repository';
 import { MESSAGE_REPOSITORY, MessageRepository } from '../../src/db/message.repository';
+import { APPROVAL_REPOSITORY, ApprovalRepository } from '../../src/approvals/approval.repository';
 import { CLOCK_SKEW_ALLOWANCE_MS, signCustomerToken } from '../../src/agent/identity/customer-token';
 import {
   cleanupTenant,
@@ -140,11 +141,12 @@ describe.skipIf(!integrationTestsEnabled())('Chat (integration, real database)',
     return fixture;
   }
 
-  function repos(): { conversation: ConversationRepository; message: MessageRepository; agentRun: AgentRunRepository } {
+  function repos(): { conversation: ConversationRepository; message: MessageRepository; agentRun: AgentRunRepository; approval: ApprovalRepository } {
     return {
       conversation: app.get(CONVERSATION_REPOSITORY),
       message: app.get(MESSAGE_REPOSITORY),
       agentRun: app.get(AGENT_RUN_REPOSITORY),
+      approval: app.get(APPROVAL_REPOSITORY),
     };
   }
 
@@ -206,13 +208,105 @@ describe.skipIf(!integrationTestsEnabled())('Chat (integration, real database)',
     expect(runs[0].steps.some((s) => s.type === 'compose' && s.citedChunkKeys?.includes(chunkKey))).toBe(true);
   });
 
-  it('late-shipment refund: pending_approval with a validated proposedAction, mandatory AgentRun persisted', async () => {
+  it('delivered-order refund within window: pending_approval with a validated proposedAction, mandatory AgentRun+Approval persisted transactionally', async () => {
+    const tenant = await newTenant();
+    const { kid, privateKey } = await registerCustomerKeyFixture(uri, tenant.tenantId);
+    const token = mintCustomerToken(tenant.tenantId, 'cust_1', kid, privateKey);
+
+    // Milestone 4's refund-verifier (rule 3, ORDER_STATUS_INELIGIBLE - delivered only, PROJECT.md
+    // Milestone 4 design §4's rules table) and rule 8 (MISSING_POLICY_CITATION) both post-date
+    // Milestone 3, which never checked order status or required a citation at all. Two genuine,
+    // documented behavior changes versus Milestone 3: (1) ORD-1003 (status 'delayed', never
+    // delivered - Milestone 3's own "late shipment" fixture) can no longer reach pending_approval
+    // at all; it now denies on ORDER_STATUS_INELIGIBLE - see "not-yet-delivered order: denied"
+    // below, and docs/known-limitations.md's note on this. (2) a citation is now mandatory - the
+    // original script's citedChunkKeys: [] would now deny on MISSING_POLICY_CITATION too. This
+    // test uses ORD-1001 (delivered, within window) and a real cited policy chunk instead, same
+    // upload+poll pattern as "owner asks order status" above.
+    const uniqueWord = `damagedorderlexeme${Date.now()}`;
+    const uploadRes = await request(app.getHttpServer())
+      .post('/v1/policies')
+      .set('Authorization', `Bearer ${tenant.secretKey}`)
+      .attach('file', Buffer.from(`# Refund policy\n\nA delivered order that arrived damaged qualifies for a refund. ${uniqueWord}.`), 'policy.md')
+      .field('title', 'Refund policy');
+    expect(uploadRes.status).toBe(201);
+    const documentId = uploadRes.body.id as string;
+
+    const retrievalService = app.get(PolicyRetrievalService);
+    const found = await pollUntil(async () => {
+      const r = await retrievalService.retrieve(tenant.tenantId, uniqueWord);
+      return r.ok && r.results.some((x) => x.documentId === documentId) ? r.results.find((x) => x.documentId === documentId) : undefined;
+    }, `tenant ${tenant.tenantId}'s policy chunk becoming searchable for "${uniqueWord}"`);
+    const chunkKey = found!.chunkKey;
+
+    scriptableLlm.setScript([
+      planOutput({
+        needsPolicy: true,
+        searchQuery: uniqueWord,
+        toolRequests: [
+          { tool: 'get_order', order_id: 'ORD-1001' },
+          { tool: 'track_shipment', order_id: 'ORD-1001' },
+        ],
+      }),
+      composeOutput({
+        outcome: 'propose_refund',
+        message: 'Your order arrived damaged - we are issuing a refund.',
+        citedChunkKeys: [chunkKey],
+        proposedRefund: { order_id: 'ORD-1001', amount: 49.99 },
+      }),
+    ]);
+
+    const res = await send(tenant.publicKey, { message: 'my order arrived damaged, refund me', customerToken: token });
+
+    expect(res.status).toBe(200);
+    expect(res.body.outcome).toBe('pending_approval');
+    expect(res.body.proposedAction).toEqual({
+      tool: 'issue_refund',
+      args: { order_id: 'ORD-1001', amount: 49.99, idempotencyKey: expect.stringMatching(/^[0-9a-f]{64}$/) },
+      reasonCitations: [chunkKey],
+    });
+    const conversationId = res.body.conversationId as string;
+
+    const { agentRun } = repos();
+    const runs = await agentRun.findByConversation(tenant.tenantId, conversationId);
+    expect(runs).toHaveLength(1);
+    // Stage 5 - the AgentRun's own `outcome` for a require_approval disposition is
+    // 'pending_approval' (genuinely not yet resolved at the moment this write happens) -
+    // refundDisposition is the new field that distinguishes WHICH of the four dispositions this
+    // was, written once, in the same transaction as the Approval row it names.
+    expect(runs[0].outcome).toBe('pending_approval');
+    expect(runs[0].proposedAction).toEqual({ tool: 'issue_refund', orderId: 'ORD-1001', amount: 49.99 });
+    expect(runs[0].refundDisposition?.kind).toBe('pending_approval');
+    expect(runs[0].refundDisposition?.approvalId).toMatch(/^[0-9a-f]{24}$/);
+    expect(runs[0].steps.some((s) => s.type === 'tool' && s.toolName === 'track_shipment' && s.orderId === 'ORD-1001')).toBe(true);
+
+    const approval = await repos().approval.findById(tenant.tenantId, runs[0].refundDisposition!.approvalId!);
+    expect(approval).toMatchObject({ status: 'pending', active: true, orderId: 'ORD-1001', amountCents: 4999, citations: [chunkKey] });
+  });
+
+  it('not-yet-delivered order (status "delayed"): denied on ORDER_STATUS_INELIGIBLE, no Approval row, escalate to the customer', async () => {
     const tenant = await newTenant();
     const { kid, privateKey } = await registerCustomerKeyFixture(uri, tenant.tenantId);
     const token = mintCustomerToken(tenant.tenantId, 'cust_2', kid, privateKey);
 
+    const uniqueWord = `neverarrivedlexeme${Date.now()}`;
+    const uploadRes = await request(app.getHttpServer())
+      .post('/v1/policies')
+      .set('Authorization', `Bearer ${tenant.secretKey}`)
+      .attach('file', Buffer.from(`# Refund policy\n\nA shipment well past its estimate qualifies for a refund. ${uniqueWord}.`), 'policy.md')
+      .field('title', 'Refund policy');
+    const documentId = uploadRes.body.id as string;
+    const retrievalService = app.get(PolicyRetrievalService);
+    const found = await pollUntil(async () => {
+      const r = await retrievalService.retrieve(tenant.tenantId, uniqueWord);
+      return r.ok && r.results.some((x) => x.documentId === documentId) ? r.results.find((x) => x.documentId === documentId) : undefined;
+    }, `tenant ${tenant.tenantId}'s policy chunk becoming searchable for "${uniqueWord}"`);
+    const chunkKey = found!.chunkKey;
+
     scriptableLlm.setScript([
       planOutput({
+        needsPolicy: true,
+        searchQuery: uniqueWord,
         toolRequests: [
           { tool: 'get_order', order_id: 'ORD-1003' },
           { tool: 'track_shipment', order_id: 'ORD-1003' },
@@ -221,7 +315,7 @@ describe.skipIf(!integrationTestsEnabled())('Chat (integration, real database)',
       composeOutput({
         outcome: 'propose_refund',
         message: 'Your shipment is well past its estimate - we are issuing a refund.',
-        citedChunkKeys: [],
+        citedChunkKeys: [chunkKey],
         proposedRefund: { order_id: 'ORD-1003', amount: 32.0 },
       }),
     ]);
@@ -229,20 +323,17 @@ describe.skipIf(!integrationTestsEnabled())('Chat (integration, real database)',
     const res = await send(tenant.publicKey, { message: 'my order never arrived, refund me', customerToken: token });
 
     expect(res.status).toBe(200);
-    expect(res.body.outcome).toBe('pending_approval');
-    expect(res.body.proposedAction).toEqual({
-      tool: 'issue_refund',
-      args: { order_id: 'ORD-1003', amount: 32.0, idempotencyKey: expect.stringMatching(/^[0-9a-f]{64}$/) },
-      reasonCitations: [],
-    });
+    expect(res.body.outcome).toBe('escalate');
+    expect(res.body.proposedAction).toBeUndefined();
     const conversationId = res.body.conversationId as string;
 
-    const { agentRun } = repos();
+    const { agentRun, approval } = repos();
     const runs = await agentRun.findByConversation(tenant.tenantId, conversationId);
     expect(runs).toHaveLength(1);
-    expect(runs[0].outcome).toBe('pending_approval');
-    expect(runs[0].proposedAction).toEqual({ tool: 'issue_refund', orderId: 'ORD-1003', amount: 32.0 });
-    expect(runs[0].steps.some((s) => s.type === 'tool' && s.toolName === 'track_shipment' && s.orderId === 'ORD-1003')).toBe(true);
+    expect(runs[0].outcome).toBe('escalate');
+    expect(runs[0].refundDisposition?.kind).toBe('denied');
+    expect(runs[0].refundDisposition?.failedRuleCodes).toContain('ORDER_STATUS_INELIGIBLE');
+    expect((await approval.list(tenant.tenantId, {})).approvals).toHaveLength(0);
   });
 
   it('anonymous public caller (no token at all): policy-only, no order-scoped tool call ever attempted', async () => {

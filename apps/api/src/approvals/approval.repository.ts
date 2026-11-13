@@ -119,12 +119,21 @@ export interface ApprovalRepository {
   /** UTC calendar day containing `now` - see startOfUtcDay's own doc comment for why UTC, not server-local or the customer's own timezone. */
   countForCustomerToday(tenantId: string, customerRef: string, now: Date): Promise<number>;
 
-  /** pending -> executing. First-ever attempt only - sets executionStartedAt, executingSince=now, attemptCount=1. */
-  beginExecution(tenantId: string, id: string, verifierVerdictAtDecision: RuleVerdictSubdocument[], now: Date): Promise<ApprovalRecord | null>;
-  /** executing (matching the exact stale executingSince just read) -> executing, refreshed. The lease-steal, amendment B - never matches a row whose lease hasn't expired, because the caller only calls this after confirming that itself. */
-  takeOverStuckExecution(tenantId: string, id: string, staleExecutingSince: Date, now: Date): Promise<ApprovalRecord | null>;
-  /** failed (retryable only) -> executing, refreshed. No re-verification (amendment A) - the caller never re-runs the verifier for this path. */
-  retryFromFailed(tenantId: string, id: string, now: Date): Promise<ApprovalRecord | null>;
+  /**
+   * pending -> executing. First-ever attempt only - sets executionStartedAt, executingSince=now,
+   * attemptCount=1. `decidedBy` (an apiKeyId, or `'system:auto_execute'`) is recorded here, the
+   * moment a decision actually moves the row into "someone/something is now acting on this" -
+   * never overwritten by a later markExecuted/markFailed, which only ever set `decidedAt`.
+   * Optional and appended LAST (not inserted before `now`) specifically so every pre-existing
+   * caller that doesn't pass it keeps compiling and keeps its exact prior behavior (decidedBy
+   * left exactly as it already was) - only a caller that explicitly passes it gets a value
+   * actually recorded.
+   */
+  beginExecution(tenantId: string, id: string, verifierVerdictAtDecision: RuleVerdictSubdocument[], now: Date, decidedBy?: string): Promise<ApprovalRecord | null>;
+  /** executing (matching the exact stale executingSince just read) -> executing, refreshed. The lease-steal, amendment B - never matches a row whose lease hasn't expired, because the caller only calls this after confirming that itself. `decidedBy` (optional, see beginExecution's own doc comment) reflects whoever is performing THIS takeover, which may differ from the original decider. */
+  takeOverStuckExecution(tenantId: string, id: string, staleExecutingSince: Date, now: Date, decidedBy?: string): Promise<ApprovalRecord | null>;
+  /** failed (retryable only) -> executing, refreshed. No re-verification (amendment A) - the caller never re-runs the verifier for this path. `decidedBy` (optional, see beginExecution's own doc comment) reflects whoever is performing THIS retry. */
+  retryFromFailed(tenantId: string, id: string, now: Date, decidedBy?: string): Promise<ApprovalRecord | null>;
   /**
    * executing -> executed. Fenced on `expectedAttemptCount` (amendment F1):
    * a stale attempt (superseded by a lease takeover) matches nothing and
@@ -336,50 +345,50 @@ export class MongooseApprovalRepository implements ApprovalRepository {
     });
   }
 
-  async beginExecution(tenantId: string, id: string, verifierVerdictAtDecision: RuleVerdictSubdocument[], now: Date): Promise<ApprovalRecord | null> {
+  async beginExecution(tenantId: string, id: string, verifierVerdictAtDecision: RuleVerdictSubdocument[], now: Date, decidedBy?: string): Promise<ApprovalRecord | null> {
     if (!Types.ObjectId.isValid(id)) {
       return null;
     }
+    const $set: Record<string, unknown> = {
+      status: 'executing',
+      executingSince: now,
+      executionStartedAt: now,
+      attemptCount: 1,
+      verifierVerdictAtDecision,
+    };
+    if (decidedBy !== undefined) {
+      $set.decidedBy = decidedBy;
+    }
+    const doc = await this.model.findOneAndUpdate({ _id: id, tenantId, status: 'pending' }, { $set }, { new: true }).lean();
+    return doc ? toApprovalRecord(doc as unknown as ApprovalDocument) : null;
+  }
+
+  async takeOverStuckExecution(tenantId: string, id: string, staleExecutingSince: Date, now: Date, decidedBy?: string): Promise<ApprovalRecord | null> {
+    if (!Types.ObjectId.isValid(id)) {
+      return null;
+    }
+    const $set: Record<string, unknown> = { executingSince: now };
+    if (decidedBy !== undefined) {
+      $set.decidedBy = decidedBy;
+    }
     const doc = await this.model
-      .findOneAndUpdate(
-        { _id: id, tenantId, status: 'pending' },
-        {
-          $set: {
-            status: 'executing',
-            executingSince: now,
-            executionStartedAt: now,
-            attemptCount: 1,
-            verifierVerdictAtDecision,
-          },
-        },
-        { new: true },
-      )
+      .findOneAndUpdate({ _id: id, tenantId, status: 'executing', executingSince: staleExecutingSince }, { $set, $inc: { attemptCount: 1 } }, { new: true })
       .lean();
     return doc ? toApprovalRecord(doc as unknown as ApprovalDocument) : null;
   }
 
-  async takeOverStuckExecution(tenantId: string, id: string, staleExecutingSince: Date, now: Date): Promise<ApprovalRecord | null> {
+  async retryFromFailed(tenantId: string, id: string, now: Date, decidedBy?: string): Promise<ApprovalRecord | null> {
     if (!Types.ObjectId.isValid(id)) {
       return null;
     }
-    const doc = await this.model
-      .findOneAndUpdate(
-        { _id: id, tenantId, status: 'executing', executingSince: staleExecutingSince },
-        { $set: { executingSince: now }, $inc: { attemptCount: 1 } },
-        { new: true },
-      )
-      .lean();
-    return doc ? toApprovalRecord(doc as unknown as ApprovalDocument) : null;
-  }
-
-  async retryFromFailed(tenantId: string, id: string, now: Date): Promise<ApprovalRecord | null> {
-    if (!Types.ObjectId.isValid(id)) {
-      return null;
+    const $set: Record<string, unknown> = { status: 'executing', executingSince: now };
+    if (decidedBy !== undefined) {
+      $set.decidedBy = decidedBy;
     }
     const doc = await this.model
       .findOneAndUpdate(
         { _id: id, tenantId, status: 'failed', retryable: true },
-        { $set: { status: 'executing', executingSince: now }, $inc: { attemptCount: 1 } },
+        { $set, $inc: { attemptCount: 1 } },
         { new: true },
       )
       .lean();

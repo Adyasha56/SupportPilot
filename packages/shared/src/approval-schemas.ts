@@ -54,6 +54,8 @@ export const TOOL_RUN_ERROR_CODES = [
   'CONFLICT',
   'UPSTREAM_AUTH_FAILED',
   'UPSTREAM_ERROR',
+  /** Amendment G1 - a 4xx (400, 422) meaning "this exact request is invalid", distinct from UPSTREAM_ERROR's 5xx/unknown-status bucket. */
+  'UPSTREAM_REJECTED',
   'RESPONSE_TOO_LARGE',
   'INVALID_RESPONSE',
 ] as const;

@@ -33,7 +33,8 @@ export interface AgentRunRecord extends Omit<NewAgentRun, 'degraded' | 'proposed
 }
 
 export interface AgentRunRepository {
-  create(run: NewAgentRun): Promise<AgentRunRecord>;
+  /** `session` (Stage 5) - a Mongoose ClientSession, so this write can participate in the same transaction as an Approval row's own insert; omitted, a plain standalone insert. Typed `unknown`, same convention `ApprovalRepository.create`'s own `session?: unknown` already uses. */
+  create(run: NewAgentRun, session?: unknown): Promise<AgentRunRecord>;
   /** Milestone 5's admin console reasoning panel, and Milestone 6's eval harness - both need a run's full trace, never filtered by step type. */
   findByConversation(tenantId: string, conversationId: string): Promise<AgentRunRecord[]>;
   /** Test/ops cleanup only. */
@@ -65,13 +66,18 @@ function toRecord(doc: AgentRunDocument): AgentRunRecord {
 export class MongooseAgentRunRepository implements AgentRunRepository {
   constructor(@InjectModel('AgentRun') private readonly model: Model<AgentRunDocument>) {}
 
-  async create(run: NewAgentRun): Promise<AgentRunRecord> {
-    const doc = await this.model.create({
-      ...run,
-      degraded: run.degraded ?? null,
-      proposedAction: run.proposedAction ?? null,
-      refundDisposition: run.refundDisposition ?? null,
-    });
+  async create(run: NewAgentRun, session?: unknown): Promise<AgentRunRecord> {
+    const [doc] = await this.model.create(
+      [
+        {
+          ...run,
+          degraded: run.degraded ?? null,
+          proposedAction: run.proposedAction ?? null,
+          refundDisposition: run.refundDisposition ?? null,
+        },
+      ],
+      { session: session as never },
+    );
     return toRecord(doc);
   }
 

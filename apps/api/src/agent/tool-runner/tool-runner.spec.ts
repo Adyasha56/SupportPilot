@@ -213,10 +213,19 @@ describe('runTool', () => {
 
   it.each([
     [401, 'UPSTREAM_AUTH_FAILED'],
+    [403, 'UPSTREAM_AUTH_FAILED'],
     [404, 'NOT_FOUND'],
     [409, 'CONFLICT'],
+    // Amendment G1 - 400/422 get their own UPSTREAM_REJECTED code (a clean, definitive "no",
+    // never grouped with a 5xx the server might have half-applied before failing).
+    [400, 'UPSTREAM_REJECTED'],
+    [422, 'UPSTREAM_REJECTED'],
     [500, 'UPSTREAM_ERROR'],
-  ] as const)('maps HTTP %i to %s', async (status, expectedCode) => {
+    [502, 'UPSTREAM_ERROR'],
+    // An unlisted status (e.g. 429) deliberately stays in the UPSTREAM_ERROR bucket - the safe
+    // default when this function has no specific evidence is "ambiguous", not "definitely fine".
+    [429, 'UPSTREAM_ERROR'],
+  ] as const)('maps HTTP %i to %s, exposing the real httpStatus (amendment G1)', async (status, expectedCode) => {
     server = await startStubServer((_req, res) => {
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end('{}');
@@ -232,7 +241,27 @@ describe('runTool', () => {
       resolveDns: async () => ['127.0.0.1'],
     });
 
-    expect(result).toEqual({ ok: false, error: { code: expectedCode, message: expect.any(String) } });
+    expect(result).toEqual({ ok: false, error: { code: expectedCode, message: expect.any(String), httpStatus: status } });
+  });
+
+  it('never exposes httpStatus for a failure that never received a real HTTP response (e.g. a timeout)', async () => {
+    server = await startStubServer(() => {
+      /* never responds */
+    });
+
+    const result = await runTool({
+      tenantId: 'acme',
+      toolName: 'get_order',
+      args: { order_id: 'ORD-1001' },
+      repository: new InMemoryRepository([makeGetOrderConfig(server.url)]),
+      settings: makeSettings(server.port, { requestTimeoutMs: 100 }),
+      secretProvider: testSecretProvider,
+      resolveDns: async () => ['127.0.0.1'],
+    });
+
+    expect(result).toEqual({ ok: false, error: { code: 'TIMEOUT', message: expect.any(String) } });
+    expect(result.ok).toBe(false);
+    expect(!result.ok && 'httpStatus' in result.error).toBe(false);
   });
 
   it('INVALID_RESPONSE when the mapped output fails schema validation', async () => {

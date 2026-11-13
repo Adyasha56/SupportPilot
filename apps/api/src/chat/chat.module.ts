@@ -4,6 +4,7 @@ import { LlmModule } from '../llm/llm.module';
 import { RetrievalModule } from '../retrieval/retrieval.module';
 import { ToolRunnerModule } from '../agent/tool-runner/tool-runner.module';
 import { ConnectorsModule } from '../connectors/connectors.module';
+import { ApprovalsModule } from '../approvals/approvals.module';
 import { ApiKeyGuard } from '../auth/api-key.guard';
 import { chatApiKeyGuardSettingsProvider } from './chat-api-key-guard-settings.provider';
 import { chatSettingsProvider } from './chat-settings.provider';
@@ -42,9 +43,17 @@ export function chatDatabaseImportsFor(env: NodeJS.ProcessEnv): [typeof Database
  * TenantAndGlobalGenerateBudgetGuard composite - see budget-guards.provider.ts's
  * own doc comment for why wiring the composite here too would double-charge
  * every tenant.
+ *
+ * Stage 5 - ApprovalsModule is imported for exactly one thing: the narrow
+ * APPROVAL_PROPOSAL_PORT token (amendment G3). ApprovalsModule itself never
+ * exports ApprovalService or PrivilegedRefundRunner, so importing it here
+ * grants ChatService no more reach than that one method - proven by
+ * test/architecture/privileged-runner-not-injectable.e2e-spec.ts's
+ * ChatModule-specific cases, now that this import makes that proof
+ * non-vacuous (see that file's own doc comment).
  */
 @Module({
-  imports: [LlmModule, RetrievalModule, ToolRunnerModule, ConnectorsModule, ...chatDatabaseImportsFor(process.env)],
+  imports: [LlmModule, RetrievalModule, ToolRunnerModule, ConnectorsModule, ApprovalsModule, ...chatDatabaseImportsFor(process.env)],
   controllers: [ChatController],
   providers: [
     ApiKeyGuard,
