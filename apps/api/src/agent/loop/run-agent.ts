@@ -114,9 +114,27 @@ export interface AgentStepTrace {
   attempts?: number;
 }
 
+/**
+ * Milestone 4 Stage 5 - internal only, NEVER sent to the customer (it is
+ * not part of ChatResult). The order facts chat.service.ts needs to call
+ * ApprovalProposalPort.createFromProposal, taken from the SAME orderFacts
+ * entry this run already verified ownership for and used to validate the
+ * proposal - never re-fetched, never re-trusted from anywhere else.
+ */
+export interface ProposedOrderSnapshot {
+  orderId: string;
+  status: string;
+  customerRef: string;
+  deliveredAt?: string;
+  totalCents: number;
+  alreadyRefundedCents: number;
+}
+
 export interface AgentTrace {
   steps: AgentStepTrace[];
   llmCallCount: number;
+  /** Present only when the run's own outcome is 'pending_approval' - see ProposedOrderSnapshot's doc comment. */
+  proposedOrderSnapshot?: ProposedOrderSnapshot;
 }
 
 export interface RunAgentResult {
@@ -188,6 +206,7 @@ function degradedReasonFor(reasonCode: EscalationReasonCode): DegradedReason | u
 
 interface OrderFacts {
   status: string;
+  customerRef: string;
   totalCents: number;
   alreadyRefundedCents: number;
   deliveredAt?: string;
@@ -562,7 +581,13 @@ export async function runAgent(input: RunAgentInput, deps: RunAgentDeps): Promis
         continue;
       }
 
-      orderFacts.set(orderId, { status: output.status, totalCents: output.total, alreadyRefundedCents: output.alreadyRefundedTotal, deliveredAt: output.deliveredAt });
+      orderFacts.set(orderId, {
+        status: output.status,
+        customerRef: output.customerRef,
+        totalCents: output.total,
+        alreadyRefundedCents: output.alreadyRefundedTotal,
+        deliveredAt: output.deliveredAt,
+      });
       toolResultFacts.push({ tool: 'get_order', orderId, ok: true, code: 'OK', fields: { status: output.status } });
     }
 
@@ -707,7 +732,22 @@ export async function runAgent(input: RunAgentInput, deps: RunAgentDeps): Promis
       // close to implying completion) and mentioned irrelevant thresholds.
       const message = buildPendingApprovalMessage(validated.action.args.order_id, validated.action.args.amount);
       logFinal('pending_approval');
-      return { result: buildResult('pending_approval', message, guarded.citations, validated.action), trace: { steps, llmCallCount } };
+      // Stage 5 - facts is guaranteed defined here: `validated.ok` only ever
+      // comes back true when `facts` (looked up by the same proposal.order_id,
+      // above) was present and passed to validateProposedRefund in the first
+      // place - `facts ? validateProposedRefund(...) : { ok: false, ... }`.
+      const proposedOrderSnapshot: ProposedOrderSnapshot = {
+        orderId: proposal.order_id,
+        status: facts!.status,
+        customerRef: facts!.customerRef,
+        deliveredAt: facts!.deliveredAt,
+        totalCents: facts!.totalCents,
+        alreadyRefundedCents: facts!.alreadyRefundedCents,
+      };
+      return {
+        result: buildResult('pending_approval', message, guarded.citations, validated.action),
+        trace: { steps, llmCallCount, proposedOrderSnapshot },
+      };
     }
 
     await callEscalationTool('REFUND_PROPOSAL_REJECTED', proposal.order_id);

@@ -147,7 +147,7 @@ describe('runTool against the real mock-store', () => {
 
     it('returns NOT_FOUND for a nonexistent order', async () => {
       const result = await run('get_order', { order_id: 'ORD-9999' });
-      expect(result).toEqual({ ok: false, error: { code: 'NOT_FOUND', message: expect.any(String) } });
+      expect(result).toEqual({ ok: false, error: { code: 'NOT_FOUND', message: expect.any(String), httpStatus: 404 } });
     });
   });
 
@@ -162,7 +162,7 @@ describe('runTool against the real mock-store', () => {
 
     it('returns NOT_FOUND for a nonexistent order', async () => {
       const result = await run('track_shipment', { order_id: 'ORD-9999' });
-      expect(result).toEqual({ ok: false, error: { code: 'NOT_FOUND', message: expect.any(String) } });
+      expect(result).toEqual({ ok: false, error: { code: 'NOT_FOUND', message: expect.any(String), httpStatus: 404 } });
     });
   });
 
@@ -178,12 +178,15 @@ describe('runTool against the real mock-store', () => {
     it('returns CONFLICT when refunding an order that is already refunded', async () => {
       // ORD-1005 is pre-seeded as already refunded - no mutation needed here.
       const result = await run('issue_refund', { order_id: 'ORD-1005', amount: 120.0 });
-      expect(result).toEqual({ ok: false, error: { code: 'CONFLICT', message: expect.any(String) } });
+      expect(result).toEqual({ ok: false, error: { code: 'CONFLICT', message: expect.any(String), httpStatus: 409 } });
     });
 
-    it('maps "amount exceeds total" (upstream 400) to UPSTREAM_ERROR', async () => {
+    // Amendment G1: a 4xx the mock store uses to say "this exact request is invalid" (400) now
+    // gets its own UPSTREAM_REJECTED code, distinct from UPSTREAM_ERROR's 5xx/unknown-status
+    // bucket - a legitimate result change from Milestone 1's original mapping, not a regression.
+    it('maps "amount exceeds total" (upstream 400) to UPSTREAM_REJECTED', async () => {
       const result = await run('issue_refund', { order_id: 'ORD-1003', amount: 999 });
-      expect(result).toEqual({ ok: false, error: { code: 'UPSTREAM_ERROR', message: expect.any(String) } });
+      expect(result).toEqual({ ok: false, error: { code: 'UPSTREAM_REJECTED', message: expect.any(String), httpStatus: 400 } });
     });
 
     it('replays the original result for a repeated idempotencyKey with the same body', async () => {
@@ -220,7 +223,7 @@ describe('runTool against the real mock-store', () => {
         amount: 200,
         idempotencyKey: 'integration-conflict-key',
       });
-      expect(second).toEqual({ ok: false, error: { code: 'CONFLICT', message: expect.any(String) } });
+      expect(second).toEqual({ ok: false, error: { code: 'CONFLICT', message: expect.any(String), httpStatus: 409 } });
     });
   });
 

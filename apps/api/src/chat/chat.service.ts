@@ -1,18 +1,34 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
-import { ChatRequest, ChatRequestSchema, ChatResult, ProposedAction } from '@supportpilot/shared';
+import { ChatRequest, ChatRequestSchema, ChatResult, ProposedAction, toCents } from '@supportpilot/shared';
 import { ConnectorConfigRepository } from '../connectors/connector-config.repository';
 import { CONNECTOR_CONFIG_REPOSITORY } from '../connectors/connector-config-repository.provider';
-import { AgentStepTrace, RunAgentDeps, RunAgentSettings, ToolRunnerLike, runAgent as runAgentFn } from '../agent/loop/run-agent';
+import {
+  AgentStepTrace,
+  AgentTrace,
+  GENERIC_ESCALATE_MESSAGE,
+  RunAgentDeps,
+  RunAgentSettings,
+  ToolRunnerLike,
+  runAgent as runAgentFn,
+} from '../agent/loop/run-agent';
 import { DailyGenerateBudgetGuard } from '../agent/loop/daily-generate-budget';
 import { LlmProvider } from '../llm/llm-provider.interface';
 import { LLM_PROVIDER } from '../llm/llm.module';
 import { PolicyRetrievalService } from '../retrieval/policy-retrieval.service';
-import { AgentRunRepository, AGENT_RUN_REPOSITORY, NewAgentRun, NewAgentRunProposedAction } from '../db/agent-run.repository';
+import { AgentRunRepository, AGENT_RUN_REPOSITORY, NewAgentRun, NewAgentRunProposedAction, NewAgentRunRefundDisposition } from '../db/agent-run.repository';
 import { ConversationRecord, ConversationRepository, CONVERSATION_REPOSITORY } from '../db/conversation.repository';
 import { MessageRepository, MESSAGE_REPOSITORY } from '../db/message.repository';
 import { CustomerPublicKeyRepository, CUSTOMER_PUBLIC_KEY_REPOSITORY } from '../db/customer-public-key.repository';
 import { ApiKeyScope } from '../db/schemas/api-key.schema';
+import { TenantRepository, TENANT_REPOSITORY } from '../db/tenant.repository';
 import { RateLimiter } from '../auth/rate-limiter';
+import {
+  ApprovalProposalPort,
+  APPROVAL_PROPOSAL_PORT,
+  CreateFromProposalResult,
+  PersistAgentRunForProposal,
+  RefundDispositionForAgentRun,
+} from '../approvals/approval-proposal.port';
 import { ChatSettings } from './chat.settings';
 import { CHAT_SETTINGS } from './chat-settings.provider';
 import { RUN_AGENT_SETTINGS } from './run-agent-settings.provider';
@@ -54,6 +70,11 @@ function sumTokenUsage(steps: AgentStepTrace[]): { tokensIn: number; tokensOut: 
     }
   }
   return { tokensIn, tokensOut };
+}
+
+/** The two mirrored shapes (ApprovalProposalPort's RefundDispositionForAgentRun and AgentRunRepository's own NewAgentRunRefundDisposition) are identical by design - see approval-proposal.port.ts's own doc comment for why they're two separate types rather than one shared import. */
+function toNewAgentRunRefundDisposition(disposition: RefundDispositionForAgentRun): NewAgentRunRefundDisposition {
+  return disposition;
 }
 
 function toNewAgentRunProposedAction(action: ProposedAction | undefined): NewAgentRunProposedAction | undefined {
@@ -182,6 +203,18 @@ export class ChatService {
     @Inject(CUSTOMER_REF_RATE_LIMITER) private readonly customerRefRateLimiter: RateLimiter,
     @Inject(IN_FLIGHT_RUN_LIMITER) private readonly inFlightRunLimiter: InFlightRunLimiter,
     @Inject(CONVERSATION_LOCK) private readonly conversationLock: ConversationLock,
+    /** Stage 5 - tenant-level refund settings (refundCap, approvalThreshold, refundWindowDays, autoExecuteRefunds, dailyRefundCountLimit, approvalExpiryDays) for ApprovalProposalPort.createFromProposal's own input. @Optional() - same "safe to import with no database" reasoning as every other DB-backed dependency above. */
+    @Optional() @Inject(TENANT_REPOSITORY) private readonly tenantRepository: TenantRepository | undefined,
+    /**
+     * Stage 5, amendment G3 - the ONLY thing this service depends on from the approvals module:
+     * a single method, never the whole ApprovalService (which also exposes the admin-decision
+     * surface this chat path has no business touching). @Optional() because ApprovalsModule may
+     * not be wired into every environment that constructs ChatService (e.g. a future standalone
+     * deployment, or today's unit tests, which pass fakes instead) - handled the same "safe to
+     * import, fails at the call site" way the database-backed dependencies above already are:
+     * see persistRefundProposalAndRespond's own NOT_CONFIGURED-style guard.
+     */
+    @Optional() @Inject(APPROVAL_PROPOSAL_PORT) private readonly approvalProposalPort: ApprovalProposalPort | undefined,
     @Optional() clock?: () => Date,
   ) {
     this.clock = clock ?? (() => new Date());
@@ -315,7 +348,17 @@ export class ChatService {
       const latencyMs = this.clock().getTime() - startedAt;
 
       // 12. Persist the run, the agent message, and the message-count increment.
-      return await this.persistRunAndRespond(tenantId, conversation.id, result, trace, latencyMs, agentRunRepository, messageRepository, conversationRepository);
+      return await this.persistRunAndRespond(
+        tenantId,
+        conversation.id,
+        result,
+        trace,
+        latencyMs,
+        verifiedCustomerRef,
+        agentRunRepository,
+        messageRepository,
+        conversationRepository,
+      );
     } finally {
       lock.release();
     }
@@ -325,12 +368,32 @@ export class ChatService {
     tenantId: string,
     conversationId: string,
     result: ChatResult,
-    trace: { steps: AgentStepTrace[]; llmCallCount: number },
+    trace: AgentTrace,
     latencyMs: number,
+    verifiedCustomerRef: string | undefined,
     agentRunRepository: AgentRunRepository,
     messageRepository: MessageRepository,
     conversationRepository: ConversationRepository,
   ): Promise<ChatHandleResult> {
+    // Stage 5 - the ONE new seam. Milestone 3's own proposedAction-carrying 'pending_approval'
+    // means "a candidate proposal survived basic sanity", not "a human will see this" - the
+    // tenant policy gate (ApprovalProposalPort.createFromProposal) runs here, one layer up from
+    // runAgent, which stays exactly as Milestone 3 built it. Every other outcome is completely
+    // unaffected - see persistOrdinaryRunAndRespond below, unchanged from Milestone 3.
+    if (result.outcome === 'pending_approval') {
+      return await this.persistRefundProposalAndRespond(
+        tenantId,
+        conversationId,
+        result,
+        trace,
+        latencyMs,
+        verifiedCustomerRef,
+        agentRunRepository,
+        messageRepository,
+        conversationRepository,
+      );
+    }
+
     const { tokensIn, tokensOut } = sumTokenUsage(trace.steps);
     const newRun: NewAgentRun = {
       tenantId,
@@ -343,21 +406,150 @@ export class ChatService {
       tokensOut,
       latencyMs,
       steps: trace.steps,
-      ...(result.proposedAction ? { proposedAction: toNewAgentRunProposedAction(result.proposedAction) } : {}),
     };
 
+    // Best-effort for every non-proposal outcome - the customer still gets the real result even
+    // if this write fails (Milestone 3's original rule; the mandatory-write path only ever
+    // applied to a proposedAction-carrying run, which can no longer reach this branch at all -
+    // see the pending_approval dispatch above).
     const runWrite = await withOneRetry(() => agentRunRepository.create(newRun));
     if (!runWrite.ok) {
-      if (result.proposedAction) {
-        // Stage 4 amendment C - mandatory: an approval nobody can see in
-        // the admin console must never silently "succeed" for the customer.
-        this.logPersistFailed('agent_run_mandatory', tenantId, conversationId, runWrite.error);
-        return this.error('PENDING_APPROVAL_WRITE_FAILED', 'Unable to record this request. Please try again.');
-      }
-      // Best-effort for every other outcome - the customer still gets the real result.
       this.logPersistFailed('agent_run', tenantId, conversationId, runWrite.error);
     }
 
+    return await this.finalizeResponse(tenantId, conversationId, result, messageRepository, conversationRepository);
+  }
+
+  /**
+   * Stage 5 - runs whenever runAgent proposes a refund. Calls
+   * ApprovalProposalPort.createFromProposal exactly once (amendment C's mandatory-write policy
+   * now covers the WHOLE call, not just the AgentRun piece - see approval.service.ts's own doc
+   * comment on createApprovalRow for why retrying the whole call is safe), maps its disposition
+   * to the real customer-facing outcome, and never calls agentRunRepository.create itself for
+   * this path - the AgentRun write happens INSIDE createFromProposal, in the same transaction as
+   * any Approval row it creates (persistAgentRunForRun below is the callback that performs it).
+   */
+  private async persistRefundProposalAndRespond(
+    tenantId: string,
+    conversationId: string,
+    result: ChatResult,
+    trace: AgentTrace,
+    latencyMs: number,
+    verifiedCustomerRef: string | undefined,
+    agentRunRepository: AgentRunRepository,
+    messageRepository: MessageRepository,
+    conversationRepository: ConversationRepository,
+  ): Promise<ChatHandleResult> {
+    if (!this.approvalProposalPort || !this.tenantRepository) {
+      return this.error('NOT_CONFIGURED', 'The database is not configured.');
+    }
+    // runAgent only ever reaches outcome: 'pending_approval' via validateProposedRefund, which
+    // requires the order id to already be in verifiedOrderIds - itself only ever populated when
+    // the caller has a verified identity. Both are therefore guaranteed present here.
+    const proposedAction = result.proposedAction!;
+    const snapshot = trace.proposedOrderSnapshot!;
+    const customerRef = verifiedCustomerRef!;
+
+    const tenant = await this.tenantRepository.findById(tenantId);
+    if (!tenant) {
+      // Resolved from an already-authenticated API key - should never actually be missing, but
+      // fail safe rather than guess tenant settings if it somehow is.
+      return this.error('INTERNAL_ERROR', GENERIC_INTERNAL_ERROR_MESSAGE);
+    }
+
+    const { tokensIn, tokensOut } = sumTokenUsage(trace.steps);
+    const baseRunFields = {
+      tenantId,
+      conversationId,
+      stepCount: trace.steps.length,
+      llmCallCount: trace.llmCallCount,
+      tokensIn,
+      tokensOut,
+      latencyMs,
+      steps: trace.steps,
+      proposedAction: toNewAgentRunProposedAction(proposedAction),
+    };
+
+    // The AgentRun's own `outcome` reflects what's known at THIS exact write (inside
+    // createFromProposal, before any execution attempt for auto_execute) - 'escalate' for
+    // denied/already_pending (the final answer, already decided), 'pending_approval' for
+    // require_approval/auto_execute (genuinely not yet resolved at write time - Milestone 6
+    // follows refundDisposition.approvalId to the Approval record for the eventual result,
+    // exactly as PROJECT.md's Milestone 4 design documents).
+    const persistAgentRunForRun: PersistAgentRunForProposal = async (disposition, session) => {
+      const outcome: ChatResult['outcome'] = disposition.kind === 'denied' || disposition.kind === 'already_pending' ? 'escalate' : 'pending_approval';
+      const refundDisposition: NewAgentRunRefundDisposition = toNewAgentRunRefundDisposition(disposition);
+      await agentRunRepository.create({ ...baseRunFields, outcome, refundDisposition }, session);
+    };
+
+    const proposalWrite = await withOneRetry(() =>
+      this.approvalProposalPort!.createFromProposal(
+        {
+          tenantId,
+          runId: result.runId,
+          conversationId,
+          orderId: proposedAction.args.order_id,
+          verifiedCustomerRef: customerRef,
+          amountCents: toCents(proposedAction.args.amount),
+          citations: result.citations.map((c) => c.chunkKey),
+          orderSnapshot: {
+            status: snapshot.status,
+            customerRef: snapshot.customerRef,
+            deliveredAt: snapshot.deliveredAt,
+            totalCents: snapshot.totalCents,
+            alreadyRefundedCents: snapshot.alreadyRefundedCents,
+          },
+          tenantSettings: {
+            refundCap: tenant.refundCap ?? 0,
+            approvalThreshold: tenant.approvalThreshold ?? 0,
+            refundWindowDays: tenant.refundWindowDays ?? 0,
+            autoExecuteRefunds: tenant.autoExecuteRefunds ?? false,
+            ...(tenant.dailyRefundCountLimit !== undefined ? { dailyRefundCountLimit: tenant.dailyRefundCountLimit } : {}),
+          },
+          approvalExpiryDays: tenant.approvalExpiryDays ?? 7,
+          now: this.clock(),
+        },
+        persistAgentRunForRun,
+      ),
+    );
+
+    if (!proposalWrite.ok) {
+      // Amendment C, extended to the whole proposal call (Stage 5) - an approval nobody can see,
+      // or an AgentRun with no corresponding real decision, must never silently "succeed" for
+      // the customer. No proposal reaches them at all.
+      this.logPersistFailed('agent_run_mandatory', tenantId, conversationId, proposalWrite.error);
+      return this.error('PENDING_APPROVAL_WRITE_FAILED', 'Unable to record this request. Please try again.');
+    }
+
+    const finalResult = this.buildFinalResultForDisposition(result, proposalWrite.value);
+    return await this.finalizeResponse(tenantId, conversationId, finalResult, messageRepository, conversationRepository);
+  }
+
+  /** Maps createFromProposal's disposition to the real customer-facing ChatResult - never the original runAgent 'pending_approval' result as-is, except for the genuine require_approval case. */
+  private buildFinalResultForDisposition(original: ChatResult, disposition: CreateFromProposalResult): ChatResult {
+    const base = { conversationId: original.conversationId, runId: original.runId, citations: original.citations };
+    switch (disposition.kind) {
+      case 'denied':
+        return { ...base, outcome: 'escalate', message: GENERIC_ESCALATE_MESSAGE };
+      case 'already_pending':
+        return { ...base, outcome: 'escalate', message: disposition.message };
+      case 'pending_approval':
+        return { ...base, outcome: 'pending_approval', message: disposition.message, proposedAction: original.proposedAction };
+      case 'auto_executed':
+        return disposition.success
+          ? { ...base, outcome: 'reply', message: disposition.message }
+          : { ...base, outcome: 'escalate', message: GENERIC_ESCALATE_MESSAGE };
+    }
+  }
+
+  /** Shared tail: best-effort agent message append + message-count increment, same as Milestone 3's original persistRunAndRespond for every outcome. */
+  private async finalizeResponse(
+    tenantId: string,
+    conversationId: string,
+    result: ChatResult,
+    messageRepository: MessageRepository,
+    conversationRepository: ConversationRepository,
+  ): Promise<ChatHandleResult> {
     const messageWrite = await withOneRetry(() => messageRepository.create(tenantId, conversationId, 'agent', result.message));
     if (!messageWrite.ok) {
       this.logPersistFailed('agent_message', tenantId, conversationId, messageWrite.error);

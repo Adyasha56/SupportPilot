@@ -24,12 +24,15 @@ export type ToolRunErrorCode =
   | 'CONFLICT'
   | 'UPSTREAM_AUTH_FAILED'
   | 'UPSTREAM_ERROR'
+  /** Milestone 4 amendment G1 - a 4xx the upstream used to say "this exact request is invalid" (400, 422), distinct from UPSTREAM_ERROR's 5xx/unknown-status bucket. The request was received and definitively rejected - never applied. */
+  | 'UPSTREAM_REJECTED'
   | 'RESPONSE_TOO_LARGE'
   | 'INVALID_RESPONSE';
 
 export type ToolRunResult =
   | { ok: true; data: unknown; riskLevel: 'low' | 'high' }
-  | { ok: false; error: { code: ToolRunErrorCode; message: string } };
+  /** `httpStatus` (amendment G1) - the real upstream HTTP status, present only when a response was actually received (never for TIMEOUT/network-error/etc., which have no status at all). Exposed so a caller can reason about the status class itself, not just the already-bucketed code. */
+  | { ok: false; error: { code: ToolRunErrorCode; message: string; httpStatus?: number } };
 
 const TOOL_OUTPUT_SCHEMAS = {
   get_order: GetOrderOutputSchema,
@@ -69,6 +72,7 @@ const GENERIC_ERROR_MESSAGES: Record<ToolRunErrorCode, string> = {
   CONFLICT: 'Requested action conflicts with the current state.',
   UPSTREAM_AUTH_FAILED: 'Upstream rejected the request credentials.',
   UPSTREAM_ERROR: 'Upstream request failed.',
+  UPSTREAM_REJECTED: 'Upstream rejected the request as invalid.',
   RESPONSE_TOO_LARGE: 'Upstream response exceeded the allowed size.',
   INVALID_RESPONSE: 'Upstream response was not in the expected shape.',
 };
@@ -97,8 +101,8 @@ export async function runTool(params: RunToolParams): Promise<ToolRunResult> {
     logOutcome?.(tenantId, toolName, code, Date.now() - startedAt);
     return result;
   };
-  const fail = (code: ToolRunErrorCode): ToolRunResult =>
-    finish({ ok: false, error: { code, message: GENERIC_ERROR_MESSAGES[code] } });
+  const fail = (code: ToolRunErrorCode, httpStatus?: number): ToolRunResult =>
+    finish({ ok: false, error: { code, message: GENERIC_ERROR_MESSAGES[code], ...(httpStatus !== undefined ? { httpStatus } : {}) } });
 
   // 1. Load the config for THIS tenant only.
   let config: ConnectorConfig;
@@ -209,7 +213,7 @@ export async function runTool(params: RunToolParams): Promise<ToolRunResult> {
 
   const statusErrorCode = mapStatusToErrorCode(outcome.status);
   if (statusErrorCode) {
-    return fail(statusErrorCode);
+    return fail(statusErrorCode, outcome.status);
   }
 
   const contentType = outcome.headers['content-type'];
@@ -239,6 +243,17 @@ export async function runTool(params: RunToolParams): Promise<ToolRunResult> {
   return finish({ ok: true, data: parsedOutput.data, riskLevel: config.riskLevel });
 }
 
+/**
+ * Amendment G1: 400/422 ("this exact request is invalid") get their own
+ * UPSTREAM_REJECTED code, distinct from the 5xx-and-everything-else
+ * UPSTREAM_ERROR bucket they used to share - a 400/422 is a clean,
+ * definitive "no" (the request was received and rejected, never applied),
+ * never worth treating the same as a 5xx the server might have half-applied
+ * before failing. Any OTHER, unlisted status (429, 408, 3xx that somehow
+ * reaches here, a genuine 5xx) deliberately stays UPSTREAM_ERROR - the safe
+ * default for a status this function doesn't have specific evidence about
+ * is "ambiguous", never "definitely fine to treat as rejected".
+ */
 function mapStatusToErrorCode(status: number): ToolRunErrorCode | null {
   if (status >= 200 && status < 300) {
     return null;
@@ -251,6 +266,9 @@ function mapStatusToErrorCode(status: number): ToolRunErrorCode | null {
   }
   if (status === 409) {
     return 'CONFLICT';
+  }
+  if (status === 400 || status === 422) {
+    return 'UPSTREAM_REJECTED';
   }
   return 'UPSTREAM_ERROR';
 }

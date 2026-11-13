@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { InMemoryApprovalRepository } from '../db/test-utils/in-memory-approval.repository';
 import { ApprovalService, CreateFromProposalInput, FetchFreshOrderSnapshot } from './approval.service';
+import { PersistAgentRunForProposal } from './approval-proposal.port';
 import { PrivilegedRefundRunner } from './privileged-refund-runner';
 import { RefundVerifierOrderSnapshot, RefundVerifierTenantSettings } from './refund-verifier';
 import { ToolRunResult } from '../agent/tool-runner/tool-runner';
+import { TransactionRunner } from '../db/transaction-runner';
+import { ApprovalRepository } from './approval.repository';
 
 const NOW = new Date('2026-11-09T00:00:00.000Z');
 
@@ -46,7 +49,6 @@ function proposalInput(overrides: Partial<CreateFromProposalInput> = {}): Create
     orderSnapshot: orderSnapshot(),
     tenantSettings: tenantSettings(),
     approvalExpiryDays: 7,
-    customerDailyRefundCount: 0,
     now: NOW,
     ...overrides,
   };
@@ -61,11 +63,21 @@ function fakeRunner(
 
 const alwaysFreshOrder: FetchFreshOrderSnapshot = async (_tenantId, _orderId) => orderSnapshot();
 
+/**
+ * Stage 5's transactional dual-write hook - these tests only care about ApprovalService's own
+ * outcomes/state, never about the AgentRun side of the write (that's chat.service.spec.ts's and
+ * the Stage 5 integration spec's territory), so a no-op stands in everywhere. No transaction
+ * runner is wired in this file either (every `new ApprovalService(...)` below omits it), so
+ * createApprovalRow's own standalone fallback path - a plain sequential create() then
+ * persistAgentRun() with no shared session - is what every test here actually exercises.
+ */
+const noopPersistAgentRun: PersistAgentRunForProposal = async () => {};
+
 describe('ApprovalService.createFromProposal', () => {
   it('denied: a failed rule never creates an Approval row', async () => {
     const repo = new InMemoryApprovalRepository();
     const service = new ApprovalService(repo, fakeRunner());
-    const result = await service.createFromProposal(proposalInput({ citations: [] }));
+    const result = await service.createFromProposal(proposalInput({ citations: [] }), noopPersistAgentRun);
 
     expect(result.kind).toBe('denied');
     expect(result.kind === 'denied' && result.failedRuleCodes).toEqual(['MISSING_POLICY_CITATION']);
@@ -75,10 +87,10 @@ describe('ApprovalService.createFromProposal', () => {
   it('already_pending: a second proposal for an order with an active approval creates no new row', async () => {
     const repo = new InMemoryApprovalRepository();
     const service = new ApprovalService(repo, fakeRunner());
-    const first = await service.createFromProposal(proposalInput());
+    const first = await service.createFromProposal(proposalInput(), noopPersistAgentRun);
     expect(first.kind).toBe('pending_approval');
 
-    const second = await service.createFromProposal(proposalInput());
+    const second = await service.createFromProposal(proposalInput(), noopPersistAgentRun);
     expect(second.kind).toBe('already_pending');
     expect(second.kind === 'already_pending' && second.approvalId).toBe(first.kind === 'pending_approval' ? first.approvalId : undefined);
     expect((await repo.list('acme', {})).approvals).toHaveLength(1);
@@ -87,7 +99,7 @@ describe('ApprovalService.createFromProposal', () => {
   it('pending_approval: every rule passes, autoExecuteRefunds is off', async () => {
     const repo = new InMemoryApprovalRepository();
     const service = new ApprovalService(repo, fakeRunner());
-    const result = await service.createFromProposal(proposalInput());
+    const result = await service.createFromProposal(proposalInput(), noopPersistAgentRun);
 
     expect(result.kind).toBe('pending_approval');
     expect(result.kind === 'pending_approval' && result.message).toContain('ORD-1001');
@@ -102,6 +114,7 @@ describe('ApprovalService.createFromProposal', () => {
 
     const result = await service.createFromProposal(
       proposalInput({ amountCents: 5000, tenantSettings: tenantSettings({ autoExecuteRefunds: true, approvalThreshold: 250 }) }),
+      noopPersistAgentRun,
     );
 
     expect(result.kind).toBe('auto_executed');
@@ -118,6 +131,7 @@ describe('ApprovalService.createFromProposal', () => {
 
     const result = await service.createFromProposal(
       proposalInput({ amountCents: 5000, tenantSettings: tenantSettings({ autoExecuteRefunds: true, approvalThreshold: 250 }) }),
+      noopPersistAgentRun,
     );
 
     expect(result.kind).toBe('auto_executed');
@@ -135,6 +149,7 @@ describe('ApprovalService.createFromProposal', () => {
 
     const result = await service.createFromProposal(
       proposalInput({ tenantSettings: tenantSettings({ autoExecuteRefunds: true, approvalThreshold: 250 }) }),
+      noopPersistAgentRun,
     );
 
     expect(result.kind).toBe('auto_executed');
@@ -145,11 +160,11 @@ describe('ApprovalService.createFromProposal', () => {
     const repo = new InMemoryApprovalRepository();
     const service = new ApprovalService(repo, fakeRunner());
 
-    const first = await service.createFromProposal(proposalInput({ approvalExpiryDays: 1, now: NOW }));
+    const first = await service.createFromProposal(proposalInput({ approvalExpiryDays: 1, now: NOW }), noopPersistAgentRun);
     expect(first.kind).toBe('pending_approval');
 
     const wellAfterExpiry = new Date(NOW.getTime() + 2 * 24 * 60 * 60 * 1000);
-    const second = await service.createFromProposal(proposalInput({ approvalExpiryDays: 7, now: wellAfterExpiry }));
+    const second = await service.createFromProposal(proposalInput({ approvalExpiryDays: 7, now: wellAfterExpiry }), noopPersistAgentRun);
 
     expect(second.kind).toBe('pending_approval');
     expect((second as { approvalId: string }).approvalId).not.toBe((first as { approvalId: string }).approvalId);
@@ -160,18 +175,113 @@ describe('ApprovalService.createFromProposal', () => {
   it('amendment F2: a genuinely still-active blocking row (not expired) is reported as already_pending, no retry', async () => {
     const repo = new InMemoryApprovalRepository();
     const service = new ApprovalService(repo, fakeRunner());
-    const first = await service.createFromProposal(proposalInput({ approvalExpiryDays: 30 }));
+    const first = await service.createFromProposal(proposalInput({ approvalExpiryDays: 30 }), noopPersistAgentRun);
 
-    const secondAttempt = await service.createFromProposal(proposalInput({ approvalExpiryDays: 30, now: new Date(NOW.getTime() + 1000) }));
+    const secondAttempt = await service.createFromProposal(
+      proposalInput({ approvalExpiryDays: 30, now: new Date(NOW.getTime() + 1000) }),
+      noopPersistAgentRun,
+    );
     expect(secondAttempt.kind).toBe('already_pending');
     expect((secondAttempt as { approvalId: string }).approvalId).toBe((first as { approvalId: string }).approvalId);
+  });
+});
+
+describe('ApprovalService.createFromProposal - transactional dual-write (Stage 5 amendment D/C)', () => {
+  /**
+   * A fake TransactionRunner - just calls the callback with a marker object standing in for a
+   * real Mongoose ClientSession, so tests can assert both writes received the exact SAME one.
+   * Cast through `unknown`, same as `fakeRunner`'s own cast above: TransactionRunner's real
+   * signature is generic over a real `ClientSession`, which this fake deliberately never
+   * constructs (no real Mongo connection in a unit test).
+   */
+  function fakeTransactionRunner(sessionMarker: unknown): TransactionRunner {
+    return { withTransaction: async (fn: (session: unknown) => Promise<unknown>) => fn(sessionMarker) } as unknown as TransactionRunner;
+  }
+
+  it('require_approval: repository.create and persistAgentRun both receive the SAME session from one shared transaction', async () => {
+    const repo: ApprovalRepository = new InMemoryApprovalRepository();
+    const createSpy = vi.spyOn(repo, 'create');
+    const sessionMarker = { fakeSession: true };
+    const service = new ApprovalService(repo, fakeRunner(), undefined, fakeTransactionRunner(sessionMarker));
+
+    const persistCalls: Array<{ session: unknown }> = [];
+    const recordingPersist: PersistAgentRunForProposal = async (_disposition, session) => {
+      persistCalls.push({ session });
+    };
+
+    const result = await service.createFromProposal(proposalInput(), recordingPersist);
+
+    expect(result.kind).toBe('pending_approval');
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(createSpy.mock.calls[0][1]).toBe(sessionMarker);
+    expect(persistCalls).toHaveLength(1);
+    expect(persistCalls[0].session).toBe(sessionMarker);
+  });
+
+  it('auto_execute: the row-creation transaction uses the shared session too, before execution (which happens outside any transaction)', async () => {
+    const repo: ApprovalRepository = new InMemoryApprovalRepository();
+    const createSpy = vi.spyOn(repo, 'create');
+    const sessionMarker = { fakeSession: true };
+    const run = vi.fn(async () => ({ ok: true as const, data: { status: 'refunded' }, riskLevel: 'high' as const }));
+    const service = new ApprovalService(repo, fakeRunner(run), undefined, fakeTransactionRunner(sessionMarker));
+
+    const persistCalls: Array<{ disposition: { kind: string }; session: unknown }> = [];
+    const recordingPersist: PersistAgentRunForProposal = async (disposition, session) => {
+      persistCalls.push({ disposition, session });
+    };
+
+    const result = await service.createFromProposal(
+      proposalInput({ tenantSettings: tenantSettings({ autoExecuteRefunds: true, approvalThreshold: 250 }) }),
+      recordingPersist,
+    );
+
+    expect(result.kind).toBe('auto_executed');
+    expect(createSpy.mock.calls[0][1]).toBe(sessionMarker);
+    expect(persistCalls).toHaveLength(1);
+    expect(persistCalls[0].disposition.kind).toBe('auto_executed');
+    expect(persistCalls[0].session).toBe(sessionMarker);
+    expect(run).toHaveBeenCalledTimes(1); // the privileged call happened AFTER the transaction committed, never inside it
+  });
+
+  it('a transaction failure (neither write committed) propagates to the caller rather than being swallowed', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const failingTransactionRunner = {
+      withTransaction: async () => Promise.reject(new Error('simulated transaction failure')),
+    } as unknown as TransactionRunner;
+    const service = new ApprovalService(repo, fakeRunner(), undefined, failingTransactionRunner);
+
+    await expect(service.createFromProposal(proposalInput(), noopPersistAgentRun)).rejects.toThrow('simulated transaction failure');
+    expect((await repo.list('acme', {})).approvals).toHaveLength(0); // no partial row left behind
+  });
+
+  it('denied and already_pending dispositions use a plain standalone write - no transactionRunner call at all', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const transactionRunner = {
+      withTransaction: vi.fn(async (fn: (session: unknown) => Promise<unknown>) => fn(undefined)),
+    } as unknown as TransactionRunner;
+    const service = new ApprovalService(repo, fakeRunner(), undefined, transactionRunner);
+
+    const deniedCalls: string[] = [];
+    const recordingPersist: PersistAgentRunForProposal = async (disposition) => {
+      deniedCalls.push(disposition.kind);
+    };
+
+    const denied = await service.createFromProposal(proposalInput({ citations: [] }), recordingPersist);
+    expect(denied.kind).toBe('denied');
+    expect(transactionRunner.withTransaction).not.toHaveBeenCalled();
+    expect(deniedCalls).toEqual(['denied']);
+
+    await service.createFromProposal(proposalInput(), recordingPersist); // creates the real pending row (uses the transaction)
+    const alreadyPending = await service.createFromProposal(proposalInput(), recordingPersist);
+    expect(alreadyPending.kind).toBe('already_pending');
+    expect(deniedCalls).toEqual(['denied', 'pending_approval', 'already_pending']);
   });
 });
 
 describe('ApprovalService.decide - approve', () => {
   async function proposeAndApprove(repo: InMemoryApprovalRepository, runner: PrivilegedRefundRunner, overrides: Partial<CreateFromProposalInput> = {}) {
     const service = new ApprovalService(repo, runner);
-    const proposed = await service.createFromProposal(proposalInput(overrides));
+    const proposed = await service.createFromProposal(proposalInput(overrides), noopPersistAgentRun);
     const approvalId = (proposed as { approvalId: string }).approvalId;
     return { service, approvalId };
   }
@@ -340,7 +450,7 @@ describe('ApprovalService.getById / list - lazy expiry (amendment F2)', () => {
   it('getById on a stale pending row actually writes the expiry, not just displays it', async () => {
     const repo = new InMemoryApprovalRepository();
     const service = new ApprovalService(repo, fakeRunner());
-    const proposed = await service.createFromProposal(proposalInput({ approvalExpiryDays: 1 }));
+    const proposed = await service.createFromProposal(proposalInput({ approvalExpiryDays: 1 }), noopPersistAgentRun);
     const approvalId = (proposed as { approvalId: string }).approvalId;
 
     const wellAfterExpiry = new Date(NOW.getTime() + 2 * 24 * 60 * 60 * 1000);
@@ -354,7 +464,7 @@ describe('ApprovalService.getById / list - lazy expiry (amendment F2)', () => {
   it('list() also lazily expires stale pending rows it returns', async () => {
     const repo = new InMemoryApprovalRepository();
     const service = new ApprovalService(repo, fakeRunner());
-    await service.createFromProposal(proposalInput({ orderId: 'ORD-1001', approvalExpiryDays: 1 }));
+    await service.createFromProposal(proposalInput({ orderId: 'ORD-1001', approvalExpiryDays: 1 }), noopPersistAgentRun);
 
     const wellAfterExpiry = new Date(NOW.getTime() + 2 * 24 * 60 * 60 * 1000);
     const { approvals } = await service.list('acme', {}, wellAfterExpiry);

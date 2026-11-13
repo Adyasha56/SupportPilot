@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { VerifierFailureCode } from '@supportpilot/shared';
 import { buildPendingApprovalMessage } from '../agent/loop/build-pending-approval-message';
-import { ToolRunErrorCode } from '../agent/tool-runner/tool-runner';
+import { ApprovalProposalPort, PersistAgentRunForProposal } from './approval-proposal.port';
 import {
   buildAlreadyUnderReviewMessage,
   buildApprovedAndExecutedMessage,
@@ -13,9 +13,11 @@ import { APPROVAL_REPOSITORY, ApprovalListQuery, ApprovalListResult, ApprovalRec
 import { PrivilegedRefundRunner } from './privileged-refund-runner';
 import { classifyRefundExecutionFailure } from './refund-execution-classification';
 import { RefundVerifierOrderSnapshot, RefundVerifierTenantSettings, verifyRefundProposal } from './refund-verifier';
+import { TRANSACTION_RUNNER, TransactionRunner } from '../db/transaction-runner';
 
 export const APPROVAL_EXECUTION_LEASE_MS_DEFAULT = 60_000;
 export const AUTO_EXECUTE_TIMEOUT_MS_DEFAULT = 15_000;
+export const APPROVAL_SERVICE_SETTINGS = Symbol('APPROVAL_SERVICE_SETTINGS');
 
 export interface ApprovalServiceSettings {
   /** Amendment B - how long an `executing` row blocks a second decision attempt before a takeover is allowed. */
@@ -40,7 +42,6 @@ export interface CreateFromProposalInput {
   orderSnapshot: RefundVerifierOrderSnapshot;
   tenantSettings: RefundVerifierTenantSettings;
   approvalExpiryDays: number;
-  customerDailyRefundCount: number;
   now: Date;
 }
 
@@ -82,7 +83,7 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout:
 }
 
 @Injectable()
-export class ApprovalService {
+export class ApprovalService implements ApprovalProposalPort {
   private readonly logger = new Logger(ApprovalService.name);
   private readonly settings: ApprovalServiceSettings;
   // Not a parameter property (a definite-assignment `!` assertion isn't valid on one) - assigned
@@ -100,11 +101,17 @@ export class ApprovalService {
   constructor(
     @Optional() @Inject(APPROVAL_REPOSITORY) repository: ApprovalRepository,
     private readonly privilegedRefundRunner: PrivilegedRefundRunner,
-    // @Optional() - a plain object type has no runtime token Nest's DI could ever resolve on its
-    // own; without this, real DI wiring (ApprovalsModule) would throw trying to inject it.
-    // Tests construct this class directly (`new ApprovalService(...)`), bypassing DI entirely,
-    // and pass overrides there instead.
-    @Optional() settings?: Partial<ApprovalServiceSettings>,
+    // Stage 5 follow-up - now a real, env-var-driven provider (approval-service.settings.ts +
+    // approvals.module.ts), not silently ignored the way it was through Stage 4 (the module never
+    // actually provided a value for this parameter, so production always ran on DEFAULT_SETTINGS
+    // regardless of any env var). @Optional() so direct `new ApprovalService(...)` construction
+    // (every existing unit test in this file) keeps working unchanged, falling back to
+    // DEFAULT_SETTINGS exactly as before.
+    @Optional() @Inject(APPROVAL_SERVICE_SETTINGS) settings?: Partial<ApprovalServiceSettings>,
+    // Stage 5 - @Optional() same reasoning as `repository` above: absent with no database wired,
+    // and in every existing unit test in this file (none of which pass a 4th constructor arg) -
+    // see createApprovalRow's own doc comment for the standalone fallback this enables.
+    @Optional() @Inject(TRANSACTION_RUNNER) private readonly transactionRunner?: TransactionRunner,
   ) {
     this.repository = repository;
     this.settings = { ...DEFAULT_SETTINGS, ...settings };
@@ -114,25 +121,40 @@ export class ApprovalService {
    * Called whenever runAgent returns `pending_approval` with a validated
    * proposal. Resolves to one of four dispositions (amendment D) - never
    * throws for a business outcome, only for genuine infrastructure
-   * failures the caller (chat.service.ts, a later stage) must still
-   * handle via its own mandatory-write retry.
+   * failures the caller (chat.service.ts) must still handle via its own
+   * mandatory-write retry (Stage 5 amendment C's extension: the whole call
+   * is safe to retry from scratch - see createApprovalRow's own doc
+   * comment on why).
    */
-  async createFromProposal(input: CreateFromProposalInput, appendCustomerMessage?: AppendCustomerMessage): Promise<CreateFromProposalResult> {
+  async createFromProposal(
+    input: CreateFromProposalInput,
+    persistAgentRun: PersistAgentRunForProposal,
+    appendCustomerMessage?: AppendCustomerMessage,
+  ): Promise<CreateFromProposalResult> {
+    // Stage 5 - computed here, not caller-supplied (amendment G3: chat.service.ts depends only on
+    // the narrow ApprovalProposalPort, never on ApprovalRepository directly - this is the one
+    // piece of verifier input that would otherwise have forced that dependency).
+    const customerDailyRefundCount = await this.repository.countForCustomerToday(input.tenantId, input.verifiedCustomerRef, input.now);
+
     const verifierResult = verifyRefundProposal({
       proposedAmountCents: input.amountCents,
       order: input.orderSnapshot,
       verifiedCustomerRef: input.verifiedCustomerRef,
       citations: input.citations,
       tenantSettings: input.tenantSettings,
-      customerDailyRefundCount: input.customerDailyRefundCount,
+      customerDailyRefundCount,
       clock: () => input.now,
     });
 
     if (verifierResult.decision === 'deny') {
+      // No Approval row at all - a single, standalone AgentRun write, nothing else to keep
+      // atomic with it.
+      await persistAgentRun({ kind: 'denied', failedRuleCodes: verifierResult.failedRuleCodes });
       return { kind: 'denied', failedRuleCodes: verifierResult.failedRuleCodes };
     }
 
-    const created = await this.createApprovalRow(input, verifierResult.verdicts);
+    const dispositionKind = verifierResult.decision === 'auto_execute' ? 'auto_executed' : 'pending_approval';
+    const created = await this.createApprovalRow(input, verifierResult.verdicts, dispositionKind, persistAgentRun);
     if (created.kind === 'already_pending') {
       const message = buildAlreadyUnderReviewMessage(input.orderId);
       await this.safeAppend(appendCustomerMessage, input.tenantId, input.conversationId, message);
@@ -145,7 +167,11 @@ export class ApprovalService {
       return { kind: 'pending_approval', approvalId: approval.id, message };
     }
 
-    // decision === 'auto_execute' - bounded, own timeout, strictly inside the remaining HTTP deadline.
+    // decision === 'auto_execute' - bounded, own timeout, strictly inside the remaining HTTP
+    // deadline. Deliberately OUTSIDE the transaction that created the row above: an external
+    // HTTP call (the privileged refund runner) must never happen while holding a Mongo
+    // transaction open. beginExecution (pending -> executing) is its own separate atomic write,
+    // exactly like every other state transition in this service.
     const beganApproval = await this.repository.beginExecution(input.tenantId, approval.id, verifierResult.verdicts, input.now);
     if (!beganApproval) {
       // Structurally shouldn't happen (nothing else has touched this brand-new row yet), but
@@ -167,26 +193,66 @@ export class ApprovalService {
     return { kind: 'auto_executed', approvalId: approval.id, success: false };
   }
 
+  /**
+   * Stage 5 amendment D/C: the Approval row and the AgentRun that references it must either
+   * both exist or neither does - `attemptTransactional` wraps exactly those two writes (never
+   * the privileged refund call itself - that happens later, outside any transaction, in
+   * createFromProposal above) in one Mongo session via `this.transactionRunner`.
+   *
+   * The duplicate-key retry dance below (amendment F2: a stale pending row blocking a new
+   * proposal) stays OUTSIDE any transaction on purpose - MongoDB aborts a transaction on the
+   * first operation error, so "catch a duplicate key error and keep going in the SAME
+   * transaction" isn't something the driver supports; each attempt is its own fresh,
+   * independent transaction, and the exploratory reads/expire() in between are plain standalone
+   * writes, same as every other edge-case recovery path in this service already is. If
+   * `attemptTransactional` throws for a reason OTHER than DuplicateActiveApprovalError (e.g. a
+   * genuine transaction failure), it propagates to the caller (chat.service.ts), which is where
+   * amendment C's mandatory-write retry policy already lives - retrying this WHOLE call from
+   * scratch is safe: either nothing committed (fine to retry) or everything committed despite
+   * the client-side error being reported (the retry's own insert then hits the SAME
+   * active-per-order unique index and gracefully resolves to `already_pending` instead of a
+   * duplicate - see docs/known-limitations.md for the one known, accepted wrinkle this still
+   * leaves: a second AgentRun document for the same run in that specific rare case).
+   *
+   * No `transactionRunner` wired (no database, or a direct `new ApprovalService(...)` in a unit
+   * test) - falls back to a plain sequential create() then persistAgentRun(), no shared
+   * session. Acceptable only because nothing reaches this code path in production without both
+   * wired together (see approvals.module.ts).
+   */
   private async createApprovalRow(
     input: CreateFromProposalInput,
     verifierVerdictAtProposal: ApprovalRecord['verifierVerdictAtProposal'],
+    dispositionKind: 'pending_approval' | 'auto_executed',
+    persistAgentRun: PersistAgentRunForProposal,
   ): Promise<{ kind: 'created'; approval: ApprovalRecord } | { kind: 'already_pending'; approvalId: string }> {
-    const attempt = () =>
-      this.repository.create({
-        tenantId: input.tenantId,
-        runId: input.runId,
-        conversationId: input.conversationId,
-        orderId: input.orderId,
-        customerRef: input.verifiedCustomerRef,
-        amountCents: input.amountCents,
-        citations: input.citations,
-        verifierVerdictAtProposal,
-        now: input.now,
-        approvalExpiryDays: input.approvalExpiryDays,
+    const newApprovalFields = {
+      tenantId: input.tenantId,
+      runId: input.runId,
+      conversationId: input.conversationId,
+      orderId: input.orderId,
+      customerRef: input.verifiedCustomerRef,
+      amountCents: input.amountCents,
+      citations: input.citations,
+      verifierVerdictAtProposal,
+      now: input.now,
+      approvalExpiryDays: input.approvalExpiryDays,
+    };
+
+    const attemptTransactional = async (): Promise<ApprovalRecord> => {
+      if (!this.transactionRunner) {
+        const approval = await this.repository.create(newApprovalFields);
+        await persistAgentRun({ kind: dispositionKind, approvalId: approval.id });
+        return approval;
+      }
+      return this.transactionRunner.withTransaction(async (session) => {
+        const approval = await this.repository.create(newApprovalFields, session);
+        await persistAgentRun({ kind: dispositionKind, approvalId: approval.id }, session);
+        return approval;
       });
+    };
 
     try {
-      return { kind: 'created', approval: await attempt() };
+      return { kind: 'created', approval: await attemptTransactional() };
     } catch (err) {
       if (!(err instanceof DuplicateActiveApprovalError)) {
         throw err;
@@ -195,12 +261,14 @@ export class ApprovalService {
       const blocking = await this.repository.findActiveByOrder(input.tenantId, input.orderId);
       const blockingIsStalePending = blocking && blocking.status === 'pending' && blocking.expiresAt.getTime() <= input.now.getTime();
       if (!blockingIsStalePending) {
-        return { kind: 'already_pending', approvalId: blocking?.id ?? '' };
+        const approvalId = blocking?.id ?? '';
+        await persistAgentRun({ kind: 'already_pending', approvalId });
+        return { kind: 'already_pending', approvalId };
       }
 
       await this.repository.expire(input.tenantId, blocking.id, input.now);
       try {
-        return { kind: 'created', approval: await attempt() };
+        return { kind: 'created', approval: await attemptTransactional() };
       } catch (retryErr) {
         if (!(retryErr instanceof DuplicateActiveApprovalError)) {
           throw retryErr;
@@ -208,7 +276,9 @@ export class ApprovalService {
         // Lost the race to someone else proposing for this order right after we expired the
         // stale one - give up, report whatever is active now.
         const nowBlocking = await this.repository.findActiveByOrder(input.tenantId, input.orderId);
-        return { kind: 'already_pending', approvalId: nowBlocking?.id ?? blocking.id };
+        const approvalId = nowBlocking?.id ?? blocking.id;
+        await persistAgentRun({ kind: 'already_pending', approvalId });
+        return { kind: 'already_pending', approvalId };
       }
     }
   }
@@ -425,7 +495,12 @@ export class ApprovalService {
       return { ok: true, status: 'executed', message };
     }
 
-    const classification = classifyRefundExecutionFailure(result.error.code as ToolRunErrorCode, approval.attemptCount > 1);
+    // Amendment G2: NOT "is this a retry" (attemptCount > 1) - specifically whether a PRIOR
+    // attempt of our own may already have reached the upstream (the approval's own
+    // already-stored upstreamMaybeReceived, read before this call was ever made). A retry that
+    // only ever followed NOT_SENT failures so far still has upstreamMaybeReceived: false/null,
+    // so a 409 there is correctly DEFINITIVE, not NEEDS_RECONCILIATION.
+    const classification = classifyRefundExecutionFailure(result.error.code, approval.upstreamMaybeReceived === true);
     const failed = await this.repository.markFailed(
       tenantId,
       approval.id,

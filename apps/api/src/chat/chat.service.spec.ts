@@ -19,6 +19,13 @@ import { InMemoryAgentRunRepository } from '../db/test-utils/in-memory-agent-run
 import { InMemoryCustomerPublicKeyRepository } from '../db/test-utils/in-memory-customer-public-key.repository';
 import { signCustomerToken } from '../agent/identity/customer-token';
 import { RateLimiter } from '../auth/rate-limiter';
+import { Tenant, TenantRepository } from '../db/tenant.repository';
+import {
+  ApprovalProposalPort,
+  CreateFromProposalInput,
+  CreateFromProposalResult,
+  PersistAgentRunForProposal,
+} from '../approvals/approval-proposal.port';
 import { ConversationLock } from './conversation-lock';
 import { InFlightRunLimiter } from './in-flight-run-limiter';
 import { ChatSettings } from './chat.settings';
@@ -77,6 +84,51 @@ function okTool(data: unknown, riskLevel: 'low' | 'high' = 'low'): ToolRunResult
 
 function alwaysAllowBudget(): DailyGenerateBudgetGuard {
   return { tryConsume: () => true, release: () => {} };
+}
+
+function makeTenant(overrides: Partial<Tenant> = {}): Tenant {
+  return {
+    id: 'acme',
+    name: 'Acme',
+    refundCap: 2000,
+    approvalThreshold: 250,
+    refundWindowDays: 30,
+    autoExecuteRefunds: false,
+    approvalExpiryDays: 7,
+    ...overrides,
+  };
+}
+
+function fakeTenantRepository(overrides: Partial<Tenant> = {}): TenantRepository {
+  const tenant = makeTenant(overrides);
+  return {
+    findById: async (tenantId: string) => (tenantId === tenant.id ? tenant : null),
+  } as unknown as TenantRepository;
+}
+
+/**
+ * Stage 5 - a scriptable fake for the one method chat.service.ts depends on from the approvals
+ * module. `behavior` decides the disposition (default: a realistic `pending_approval`, matching
+ * what most existing proposal-path tests actually exercise); this fake ALWAYS calls the real
+ * `persistAgentRun` callback it's given, exactly like the real ApprovalService would, so tests
+ * that mock `agentRunRepository.create` to fail still see that failure propagate correctly.
+ */
+class FakeApprovalProposalPort implements ApprovalProposalPort {
+  constructor(
+    private readonly behavior: (input: CreateFromProposalInput) => CreateFromProposalResult = () => ({
+      kind: 'pending_approval',
+      approvalId: 'appr_1',
+      message: 'Your refund request is pending approval.',
+    }),
+  ) {}
+
+  async createFromProposal(input: CreateFromProposalInput, persistAgentRun: PersistAgentRunForProposal): Promise<CreateFromProposalResult> {
+    const result = this.behavior(input);
+    const disposition =
+      result.kind === 'denied' ? { kind: 'denied' as const, failedRuleCodes: result.failedRuleCodes } : { kind: result.kind, approvalId: result.approvalId };
+    await persistAgentRun(disposition);
+    return result;
+  }
 }
 
 function makeSettings(overrides: Partial<ChatSettings> = {}): ChatSettings {
@@ -140,6 +192,8 @@ interface ServiceOverrides {
   customerRefRateLimiter?: RateLimiter;
   inFlightRunLimiter?: InFlightRunLimiter;
   conversationLock?: ConversationLock;
+  tenantRepository?: TenantRepository | undefined;
+  approvalProposalPort?: ApprovalProposalPort | undefined;
   clock?: () => Date;
 }
 
@@ -182,6 +236,8 @@ function makeService(overrides: ServiceOverrides = {}): {
     overrides.customerRefRateLimiter ?? new RateLimiter({ maxRequests: 1000, windowMs: 60_000, maxEntries: 1000 }, clock),
     overrides.inFlightRunLimiter ?? new InFlightRunLimiter({ maxInFlight: 3, maxQueued: 2, retryAfterSeconds: 5 }),
     overrides.conversationLock ?? new ConversationLock({ ttlMs: 35_000, maxEntries: 1000 }, clock),
+    'tenantRepository' in overrides ? overrides.tenantRepository : fakeTenantRepository(),
+    'approvalProposalPort' in overrides ? overrides.approvalProposalPort : new FakeApprovalProposalPort(),
     clock,
   );
 
