@@ -321,9 +321,13 @@ describe.skipIf(!integrationTestsEnabled())('Chat + Approvals (integration, real
     const second = await send(tenant.publicKey, { message: 'refund please again', customerToken: token, conversationId: first.body.conversationId });
 
     expect(second.body.outcome).toBe('pending_approval');
-    const secondApprovalId = (await repos().agentRun.findByConversation(tenant.tenantId, second.body.conversationId as string)).find(
-      (r) => r.refundDisposition?.kind === 'pending_approval',
-    )?.refundDisposition?.approvalId;
+    // Same conversation as `first`, so this now holds BOTH runs, in ascending createdAt order -
+    // refundDisposition.kind is written once and immutable, so the FIRST run still reads
+    // 'pending_approval' too (expiring its Approval afterward never rewrites it). The run this
+    // SECOND request actually produced is the last one, not the first match.
+    const conversationRuns = await repos().agentRun.findByConversation(tenant.tenantId, second.body.conversationId as string);
+    expect(conversationRuns).toHaveLength(2);
+    const secondApprovalId = conversationRuns[conversationRuns.length - 1].refundDisposition?.approvalId;
     expect(secondApprovalId).not.toBe(firstApprovalId);
   });
 
