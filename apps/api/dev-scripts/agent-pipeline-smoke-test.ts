@@ -269,6 +269,13 @@ function buildScenarios(): Scenario[] {
       // outcome is acknowledging an investigation (reply/clarify), never
       // an automatic refund proposal. pending_approval here would mean the
       // model (or a future regression) skipped the investigation step.
+      // Milestone 4 update: this script calls runAgent directly, never
+      // through the refund-verifier (that only runs inside
+      // chat.service.ts) - but even if this scenario regressed and the
+      // model DID attempt propose_refund, ORD-1003's status ('delayed',
+      // never 'delivered') would be structurally denied by the verifier's
+      // rule 3 (ORDER_STATUS_INELIGIBLE) in the real app anyway. Two
+      // independent reasons pending_approval is wrong here, not one.
       name: '2. Late shipment refund for the owner of ORD-1003',
       customerMessage: "My order ORD-1003 is really late - it's been delayed for over a week. Can I get a refund?",
       customerRef: 'cust_2',
