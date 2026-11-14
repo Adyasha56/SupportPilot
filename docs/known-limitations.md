@@ -186,29 +186,14 @@ around with idempotency bookkeeping on the AgentRun write itself, which
 this project's own `AgentRun` schema doesn't currently support (no unique
 constraint ties a run id to "at most one refund-disposition write").
 
-## Two real-world failure modes still untested at the integration level
+## Admin decision retry still has no HTTP route (Stage 6 gap)
 
-Two scenarios the Milestone 4 Stage 5 plan called for remain unverified
-against a real database/real upstream, though each has unit-level coverage
-of the same invariant against fakes:
-
-- **An ambiguous upstream failure (timeout/5xx) during auto-execute,
-  inside a real live chat request.** `approval.service.spec.ts`'s own
-  "AMBIGUOUS failure never claims success" tests prove this against a
-  scripted `PrivilegedRefundRunner`; simulating a genuinely slow/failing
-  mock-store endpoint through the full HTTP integration harness (same
-  pattern `chat-limits.integration-spec.ts` already uses for the LLM
-  provider, not yet adapted for the connector side) was not built this
-  stage.
-- **The Approval+AgentRun dual-write transaction genuinely failing against
-  a real Mongo session**, proving "neither document exists" against the
-  real cluster rather than the in-memory fakes. `approval.service.spec.ts`'s
-  own transactional unit tests (a fake `TransactionRunner` that rejects)
-  prove the invariant at the service layer; a second, differently-overridden
-  `TestingModule` would be needed to reproduce it against a real
-  connection, which this suite's single-shared-app-boot performance
-  rationale argues against adding lightly.
-
-Neither is silently assumed to work - both are named here so they're a
-visible gap, not a quiet one, until a future pass builds the harness for
-them.
+`approvals-auto-execute-timeout.integration-spec.ts`'s own retry step calls
+`app.get(ApprovalService).decide(...)` directly rather than through an HTTP
+request, because `POST /v1/approvals/:id/decision` does not exist yet - the
+admin API (Stage 6: the controller, the `admin` scope, the decision-flow
+error codes) is still unbuilt. The underlying `ApprovalService.decide()`
+behavior this exercises (a retryable `failed` row, re-approved with no
+re-verification, reusing the same idempotency key) is real and proven
+against a real database; only the HTTP surface for an admin to trigger it
+is missing. Resolved once Stage 6 ships.
