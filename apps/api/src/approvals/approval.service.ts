@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
-import { VerifierFailureCode } from '@supportpilot/shared';
+import { AdminDecisionReasonCode, VerifierFailureCode } from '@supportpilot/shared';
 import { buildPendingApprovalMessage } from '../agent/loop/build-pending-approval-message';
 import { ApprovalProposalPort, PersistAgentRunForProposal } from './approval-proposal.port';
 import {
@@ -9,10 +9,19 @@ import {
   buildRejectedMessage,
   buildTerminalDenialMessage,
 } from './approval-message';
-import { APPROVAL_REPOSITORY, ApprovalListQuery, ApprovalListResult, ApprovalRecord, ApprovalRepository, DuplicateActiveApprovalError } from './approval.repository';
+import {
+  APPROVAL_REPOSITORY,
+  ApprovalListQuery,
+  ApprovalListResult,
+  ApprovalRecord,
+  ApprovalRepository,
+  DuplicateActiveApprovalError,
+  DuplicateRunApprovalError,
+} from './approval.repository';
+import { DuplicateAgentRunError } from '../db/agent-run.repository';
 import { PrivilegedRefundRunner } from './privileged-refund-runner';
 import { classifyRefundExecutionFailure } from './refund-execution-classification';
-import { RefundVerifierOrderSnapshot, RefundVerifierTenantSettings, verifyRefundProposal } from './refund-verifier';
+import { RefundVerifierOrderSnapshot, RefundVerifierTenantSettings, RuleVerdict, verifyRefundProposal } from './refund-verifier';
 import { TRANSACTION_RUNNER, TransactionRunner } from '../db/transaction-runner';
 
 export const APPROVAL_EXECUTION_LEASE_MS_DEFAULT = 60_000;
@@ -52,7 +61,15 @@ export type CreateFromProposalResult =
   | { kind: 'auto_executed'; approvalId: string; success: true; message: string }
   | { kind: 'auto_executed'; approvalId: string; success: false };
 
-export type DecideErrorCode = 'NOT_FOUND' | 'EXPIRED' | 'IN_PROGRESS' | 'AMBIGUOUS_RETRY_REQUIRED' | 'ALREADY_DECIDED' | 'VERIFIER_DENIED';
+export type DecideErrorCode =
+  | 'NOT_FOUND'
+  | 'EXPIRED'
+  | 'IN_PROGRESS'
+  | 'AMBIGUOUS_RETRY_REQUIRED'
+  | 'ALREADY_DECIDED'
+  | 'VERIFIER_DENIED'
+  /** Stage 6 - the fresh-order fetch itself failed (connector down, timeout) - distinct from the order genuinely not existing/being ineligible. No state change at all; the approval is left exactly as it was, still pending, decidable again later. */
+  | 'ORDER_FETCH_FAILED';
 
 export type DecideResult =
   | { ok: true; status: 'executed'; message: string }
@@ -60,8 +77,21 @@ export type DecideResult =
   | { ok: true; status: 'rejected'; message: string }
   | { ok: false; code: DecideErrorCode; failedRuleCodes?: VerifierFailureCode[] };
 
-/** Re-fetches live order facts for the decision-time verifier re-check (amendment A) - injected so ApprovalService never hard-wires a specific tool-runner call. Returns null if the order can no longer be found/read at all. */
-export type FetchFreshOrderSnapshot = (tenantId: string, orderId: string) => Promise<RefundVerifierOrderSnapshot | null>;
+/**
+ * Re-fetches live order facts for the decision-time verifier re-check (amendment A) - injected so
+ * ApprovalService never hard-wires a specific tool-runner call. Stage 6 - a discriminated result,
+ * not a plain nullable: `NOT_FOUND` means the order genuinely can't be matched to this
+ * tenant/customer (deleted, ownership changed) - a real, structural ineligibility, still routed
+ * to denyAtDecisionTime with a real state change. `FETCH_FAILED` means the ATTEMPT to read it
+ * failed (the connector is down, timed out) - nothing is actually known about the order, so this
+ * must NEVER be treated the same way; `approveFromPending` returns `ORDER_FETCH_FAILED` with no
+ * state change at all, leaving the approval exactly as it was for a later retry.
+ */
+export type FetchFreshOrderSnapshotResult =
+  | { ok: true; snapshot: RefundVerifierOrderSnapshot }
+  | { ok: false; reason: 'NOT_FOUND' }
+  | { ok: false; reason: 'FETCH_FAILED' };
+export type FetchFreshOrderSnapshot = (tenantId: string, orderId: string) => Promise<FetchFreshOrderSnapshotResult>;
 
 /** Amendment K - best-effort; a failure here never changes a decision already recorded. Optional - omitted entirely until the chat/conversation wiring stage exists. */
 export type AppendCustomerMessage = (tenantId: string, conversationId: string, message: string) => Promise<void>;
@@ -120,11 +150,35 @@ export class ApprovalService implements ApprovalProposalPort {
   /**
    * Called whenever runAgent returns `pending_approval` with a validated
    * proposal. Resolves to one of four dispositions (amendment D) - never
-   * throws for a business outcome, only for genuine infrastructure
-   * failures the caller (chat.service.ts) must still handle via its own
-   * mandatory-write retry (Stage 5 amendment C's extension: the whole call
-   * is safe to retry from scratch - see createApprovalRow's own doc
-   * comment on why).
+   * throws for a business outcome, only for a genuine infrastructure
+   * failure in the PERSISTENCE phase (verify + write the Approval/AgentRun
+   * pair) that even this method's OWN one internal retry couldn't get
+   * past - the caller (chat.service.ts) maps that to a 503, with no
+   * further retry of its own.
+   *
+   * Stage 5 follow-up I1(a) - the critical invariant this method (and
+   * everything it calls) must hold: retrying can ONLY ever mean retrying
+   * the persistence phase above (createApprovalRowWithRetry /
+   * persistStandaloneAgentRunWithRetry), NEVER anything from
+   * `beginExecution` onward. Once an Approval is actually committed, the
+   * ONLY way it ever moves again is through the state machine
+   * (beginExecution -> executeApproval -> markExecuted/markFailed) -
+   * never by this function (or anything it calls) being re-invoked from
+   * scratch. The old design retried this ENTIRE method, including the
+   * auto-execute continuation; that was unsafe - a failure AFTER a real
+   * refund was issued (but before the write recording that fact landed)
+   * would re-run the verifier against this run's own STALE
+   * `orderSnapshot` (captured at the START of the request, never
+   * re-fetched), which would not yet reflect the refund that just
+   * happened - for a PARTIAL amount in particular, the stale snapshot's
+   * `remainingRefundable` would still look large enough to pass rule 5
+   * again, and a second Approval (with its own, different idempotency
+   * key) could be created and auto-executed, issuing a SECOND real
+   * refund. Fixed by never retrying past this point (`runAutoExecute`'s
+   * own try/catch below) and by making the persistence phase itself
+   * idempotent per run (I1(b) - see `DuplicateRunApprovalError`/
+   * `DuplicateAgentRunError` and this file's own README-style comments
+   * on `createApprovalRow`).
    */
   async createFromProposal(
     input: CreateFromProposalInput,
@@ -148,13 +202,15 @@ export class ApprovalService implements ApprovalProposalPort {
 
     if (verifierResult.decision === 'deny') {
       // No Approval row at all - a single, standalone AgentRun write, nothing else to keep
-      // atomic with it.
-      await persistAgentRun({ kind: 'denied', failedRuleCodes: verifierResult.failedRuleCodes });
+      // atomic with it. Still idempotent-per-run (I1(b)) and still retried exactly once on a
+      // genuine infra failure - never anything more, since there is nothing more to do here.
+      await this.persistStandaloneAgentRunWithRetry(persistAgentRun, { kind: 'denied', failedRuleCodes: verifierResult.failedRuleCodes });
       return { kind: 'denied', failedRuleCodes: verifierResult.failedRuleCodes };
     }
 
     const dispositionKind = verifierResult.decision === 'auto_execute' ? 'auto_executed' : 'pending_approval';
-    const created = await this.createApprovalRow(input, verifierResult.verdicts, dispositionKind, persistAgentRun);
+    // THE ONLY RETRIED STEP (amendment I1(a)) - never anything below this point.
+    const created = await this.createApprovalRowWithRetry(input, verifierResult.verdicts, dispositionKind, persistAgentRun);
     if (created.kind === 'already_pending') {
       const message = buildAlreadyUnderReviewMessage(input.orderId);
       await this.safeAppend(appendCustomerMessage, input.tenantId, input.conversationId, message);
@@ -167,58 +223,140 @@ export class ApprovalService implements ApprovalProposalPort {
       return { kind: 'pending_approval', approvalId: approval.id, message };
     }
 
-    // decision === 'auto_execute' - bounded, own timeout, strictly inside the remaining HTTP
-    // deadline. Deliberately OUTSIDE the transaction that created the row above: an external
-    // HTTP call (the privileged refund runner) must never happen while holding a Mongo
-    // transaction open. beginExecution (pending -> executing) is its own separate atomic write,
-    // exactly like every other state transition in this service.
-    const beganApproval = await this.repository.beginExecution(input.tenantId, approval.id, verifierResult.verdicts, input.now, 'system:auto_execute');
-    if (!beganApproval) {
-      // Structurally shouldn't happen (nothing else has touched this brand-new row yet), but
-      // fail closed rather than claim success if it somehow does.
-      return { kind: 'auto_executed', approvalId: approval.id, success: false };
-    }
-
-    const executed = await withTimeout(
-      this.executeApproval(beganApproval, input.tenantId, input.conversationId, input.now, appendCustomerMessage),
-      this.settings.autoExecuteTimeoutMs,
-      () => ({ ok: false as const, code: 'IN_PROGRESS' as DecideErrorCode }),
-    );
-
-    if (executed.ok && executed.status === 'executed') {
-      const message = buildAutoExecutedMessage(input.orderId, amountDollars(input.amountCents));
-      return { kind: 'auto_executed', approvalId: approval.id, success: true, message };
-    }
-    // Any failure - definitive, ambiguous, or the bounded timeout firing - NEVER claims success.
-    return { kind: 'auto_executed', approvalId: approval.id, success: false };
+    // decision === 'auto_execute'. From this point on, createFromProposal may NEVER throw and
+    // may NEVER be meaningfully retried from scratch - see this method's own doc comment above.
+    return this.runAutoExecute(approval, verifierResult.verdicts, input, appendCustomerMessage);
   }
 
   /**
-   * Stage 5 amendment D/C: the Approval row and the AgentRun that references it must either
-   * both exist or neither does - `attemptTransactional` wraps exactly those two writes (never
-   * the privileged refund call itself - that happens later, outside any transaction, in
-   * createFromProposal above) in one Mongo session via `this.transactionRunner`.
+   * Stage 5 follow-up I1(a) - bounded, own timeout, strictly inside the remaining HTTP deadline.
+   * Deliberately outside any transaction: an external HTTP call (the privileged refund runner)
+   * must never happen while holding a Mongo transaction open. `beginExecution` (pending ->
+   * executing) is its own separate atomic write, exactly like every other state transition in
+   * this service.
    *
-   * The duplicate-key retry dance below (amendment F2: a stale pending row blocking a new
-   * proposal) stays OUTSIDE any transaction on purpose - MongoDB aborts a transaction on the
-   * first operation error, so "catch a duplicate key error and keep going in the SAME
-   * transaction" isn't something the driver supports; each attempt is its own fresh,
-   * independent transaction, and the exploratory reads/expire() in between are plain standalone
-   * writes, same as every other edge-case recovery path in this service already is. If
-   * `attemptTransactional` throws for a reason OTHER than DuplicateActiveApprovalError (e.g. a
-   * genuine transaction failure), it propagates to the caller (chat.service.ts), which is where
-   * amendment C's mandatory-write retry policy already lives - retrying this WHOLE call from
-   * scratch is safe: either nothing committed (fine to retry) or everything committed despite
-   * the client-side error being reported (the retry's own insert then hits the SAME
-   * active-per-order unique index and gracefully resolves to `already_pending` instead of a
-   * duplicate - see docs/known-limitations.md for the one known, accepted wrinkle this still
-   * leaves: a second AgentRun document for the same run in that specific rare case).
+   * The try/catch around the WHOLE continuation is the actual safety fix: ANY exception here -
+   * from `beginExecution`, from the privileged call, or from `markExecuted`/`markFailed`'s own
+   * writes, including one that fires AFTER a real refund was already issued - is caught and
+   * reported as `success: false`, NEVER re-thrown, NEVER triggering a retry of this run's
+   * proposal from scratch. The approval may be left in whatever state it reached (`pending` if
+   * `beginExecution` itself never landed, `executing` if it did but nothing after that could be
+   * confirmed) - resolving it from there is the state machine's job (a later `decide()` call,
+   * i.e. the admin retry path, Stage 6), never a fresh `createFromProposal` call re-verifying
+   * against this run's own stale snapshot.
+   */
+  private async runAutoExecute(
+    approval: ApprovalRecord,
+    verifierVerdicts: RuleVerdict[],
+    input: CreateFromProposalInput,
+    appendCustomerMessage?: AppendCustomerMessage,
+  ): Promise<CreateFromProposalResult> {
+    try {
+      const beganApproval = await this.repository.beginExecution(input.tenantId, approval.id, verifierVerdicts, input.now, 'system:auto_execute');
+      if (!beganApproval) {
+        // Structurally shouldn't happen (nothing else has touched this brand-new row yet), but
+        // fail closed rather than claim success if it somehow does.
+        return { kind: 'auto_executed', approvalId: approval.id, success: false };
+      }
+
+      const executed = await withTimeout(
+        this.executeApproval(beganApproval, input.tenantId, input.conversationId, input.now, appendCustomerMessage),
+        this.settings.autoExecuteTimeoutMs,
+        () => ({ ok: false as const, code: 'IN_PROGRESS' as DecideErrorCode }),
+      );
+
+      if (executed.ok && executed.status === 'executed') {
+        const message = buildAutoExecutedMessage(input.orderId, amountDollars(input.amountCents));
+        return { kind: 'auto_executed', approvalId: approval.id, success: true, message };
+      }
+      // Any failure - definitive, ambiguous, or the bounded timeout firing - NEVER claims success.
+      return { kind: 'auto_executed', approvalId: approval.id, success: false };
+    } catch (err) {
+      this.logger.error(
+        JSON.stringify({
+          event: 'auto_execute_unexpected_error',
+          tenantId: input.tenantId,
+          approvalId: approval.id,
+          error: err instanceof Error ? err.message : 'unknown',
+        }),
+      );
+      // NEVER re-thrown - see this method's own doc comment. The approval is left exactly where
+      // this exception found it; only the state machine (a later decide() call) moves it further.
+      return { kind: 'auto_executed', approvalId: approval.id, success: false };
+    }
+  }
+
+  /**
+   * Stage 5 follow-up I1(b) - the standalone (no Approval row, nothing to keep atomic with)
+   * version of the same idempotent-retry-once policy `createApprovalRowWithRetry` implements
+   * for the transactional case. `DuplicateAgentRunError` means a PRIOR attempt's write already
+   * landed (an ambiguous failure the caller never saw confirmation of) - nothing more to do.
+   */
+  private async persistStandaloneAgentRunWithRetry(
+    persistAgentRun: PersistAgentRunForProposal,
+    disposition: Parameters<PersistAgentRunForProposal>[0],
+  ): Promise<void> {
+    const attempt = async (): Promise<void> => {
+      try {
+        await persistAgentRun(disposition);
+      } catch (err) {
+        if (err instanceof DuplicateAgentRunError) {
+          return; // already recorded by a prior attempt - idempotent no-op.
+        }
+        throw err;
+      }
+    };
+    try {
+      await attempt();
+    } catch {
+      await attempt(); // one retry, safe because of the runId-based idempotency above.
+    }
+  }
+
+  /**
+   * Stage 5 amendment D/C (and follow-up I1): the Approval row and the AgentRun that references
+   * it must either both exist or neither does - `attemptTransactional` wraps exactly those two
+   * writes (never the privileged refund call itself - that happens later, outside any
+   * transaction, in `runAutoExecute`) in one Mongo session via `this.transactionRunner`.
+   *
+   * `createApprovalRowWithRetry` (the only entry point `createFromProposal` calls) retries this
+   * WHOLE persistence attempt exactly ONCE, on any failure other than
+   * `DuplicateActiveApprovalError` (which `createApprovalRow` below already resolves on its
+   * own, via amendment F2's stale-row dance) - safe to retry from scratch specifically because
+   * BOTH unique indexes involved (`{tenantId, orderId}` where active, and the newer
+   * `{tenantId, runId}`) make the retry idempotent: if the first attempt's write actually landed
+   * despite an ambiguous client-side error, the retry's own insert collides with the runId index
+   * and `attemptTransactional` reads the already-committed row back instead of creating a
+   * second one (I1(b)) - never a duplicate, and never anything executed twice, because nothing
+   * downstream of this persistence step is ever re-run by a retry (I1(a) - see
+   * `createFromProposal`'s own doc comment).
+   *
+   * The duplicate-key retry dance for `DuplicateActiveApprovalError` stays OUTSIDE any
+   * transaction on purpose - MongoDB aborts a transaction on the first operation error, so
+   * "catch a duplicate key error and keep going in the SAME transaction" isn't something the
+   * driver supports; each attempt is its own fresh, independent transaction, and the exploratory
+   * reads/expire() in between are plain standalone writes, same as every other edge-case
+   * recovery path in this service already is.
    *
    * No `transactionRunner` wired (no database, or a direct `new ApprovalService(...)` in a unit
    * test) - falls back to a plain sequential create() then persistAgentRun(), no shared
    * session. Acceptable only because nothing reaches this code path in production without both
    * wired together (see approvals.module.ts).
    */
+  private async createApprovalRowWithRetry(
+    input: CreateFromProposalInput,
+    verifierVerdictAtProposal: ApprovalRecord['verifierVerdictAtProposal'],
+    dispositionKind: 'pending_approval' | 'auto_executed',
+    persistAgentRun: PersistAgentRunForProposal,
+  ): Promise<{ kind: 'created'; approval: ApprovalRecord } | { kind: 'already_pending'; approvalId: string }> {
+    try {
+      return await this.createApprovalRow(input, verifierVerdictAtProposal, dispositionKind, persistAgentRun);
+    } catch {
+      // One retry, safe per this method's own doc comment above.
+      return await this.createApprovalRow(input, verifierVerdictAtProposal, dispositionKind, persistAgentRun);
+    }
+  }
+
   private async createApprovalRow(
     input: CreateFromProposalInput,
     verifierVerdictAtProposal: ApprovalRecord['verifierVerdictAtProposal'],
@@ -239,16 +377,34 @@ export class ApprovalService implements ApprovalProposalPort {
     };
 
     const attemptTransactional = async (): Promise<ApprovalRecord> => {
-      if (!this.transactionRunner) {
-        const approval = await this.repository.create(newApprovalFields);
-        await persistAgentRun({ kind: dispositionKind, approvalId: approval.id });
-        return approval;
+      try {
+        if (!this.transactionRunner) {
+          const approval = await this.repository.create(newApprovalFields);
+          await persistAgentRun({ kind: dispositionKind, approvalId: approval.id });
+          return approval;
+        }
+        return await this.transactionRunner.withTransaction(async (session) => {
+          const approval = await this.repository.create(newApprovalFields, session);
+          await persistAgentRun({ kind: dispositionKind, approvalId: approval.id }, session);
+          return approval;
+        });
+      } catch (err) {
+        if (err instanceof DuplicateRunApprovalError || err instanceof DuplicateAgentRunError) {
+          // I1(b) - this exact run's Approval+AgentRun pair was already committed by a PRIOR
+          // attempt whose own result we never saw confirmation of (an ambiguous failure) - by
+          // the transaction's own atomicity, if ONE of the pair exists, so does the other. Read
+          // the Approval back and treat it as a successful "create", never a fresh failure.
+          const existing = await this.repository.findByRunId(input.tenantId, input.runId);
+          if (existing) {
+            return existing;
+          }
+          // Structurally shouldn't happen (the error just told us it exists), but fail closed
+          // rather than silently swallow a real problem if the row vanished between the write
+          // and this read.
+          throw err;
+        }
+        throw err;
       }
-      return this.transactionRunner.withTransaction(async (session) => {
-        const approval = await this.repository.create(newApprovalFields, session);
-        await persistAgentRun({ kind: dispositionKind, approvalId: approval.id }, session);
-        return approval;
-      });
     };
 
     try {
@@ -262,7 +418,7 @@ export class ApprovalService implements ApprovalProposalPort {
       const blockingIsStalePending = blocking && blocking.status === 'pending' && blocking.expiresAt.getTime() <= input.now.getTime();
       if (!blockingIsStalePending) {
         const approvalId = blocking?.id ?? '';
-        await persistAgentRun({ kind: 'already_pending', approvalId });
+        await this.persistStandaloneAgentRunWithRetry(persistAgentRun, { kind: 'already_pending', approvalId });
         return { kind: 'already_pending', approvalId };
       }
 
@@ -277,7 +433,7 @@ export class ApprovalService implements ApprovalProposalPort {
         // stale one - give up, report whatever is active now.
         const nowBlocking = await this.repository.findActiveByOrder(input.tenantId, input.orderId);
         const approvalId = nowBlocking?.id ?? blocking.id;
-        await persistAgentRun({ kind: 'already_pending', approvalId });
+        await this.persistStandaloneAgentRunWithRetry(persistAgentRun, { kind: 'already_pending', approvalId });
         return { kind: 'already_pending', approvalId };
       }
     }
@@ -321,6 +477,8 @@ export class ApprovalService implements ApprovalProposalPort {
     now: Date,
     tenantSettings: RefundVerifierTenantSettings,
     fetchFreshOrderSnapshot: FetchFreshOrderSnapshot,
+    /** Stage 6, amendment I - only meaningful for decision: 'reject'. Validated (a closed enum, never free text) at the HTTP boundary (ApprovalDecisionRequestSchema), not re-validated here - this layer just records whatever it's given. */
+    adminReasonCode?: AdminDecisionReasonCode,
     appendCustomerMessage?: AppendCustomerMessage,
   ): Promise<DecideResult> {
     // Deliberately the PLAIN repository read here, not this.getById() - decide() needs to tell
@@ -335,7 +493,7 @@ export class ApprovalService implements ApprovalProposalPort {
     }
 
     if (decision === 'reject') {
-      return this.reject(tenantId, approval, decidedBy, now, appendCustomerMessage);
+      return this.reject(tenantId, approval, decidedBy, now, adminReasonCode, appendCustomerMessage);
     }
 
     switch (approval.status) {
@@ -386,12 +544,20 @@ export class ApprovalService implements ApprovalProposalPort {
       return { ok: false, code: 'EXPIRED' };
     }
 
-    const freshOrder = await fetchFreshOrderSnapshot(tenantId, approval.orderId);
-    if (!freshOrder) {
-      // The order can no longer be read at all (deleted, connector down, etc.) - treated as a
-      // structural ineligibility, never guessed as "fine, proceed anyway".
+    const fetchResult = await fetchFreshOrderSnapshot(tenantId, approval.orderId);
+    if (!fetchResult.ok) {
+      if (fetchResult.reason === 'FETCH_FAILED') {
+        // Stage 6 - the ATTEMPT to read the order failed (connector down, timeout) - nothing is
+        // actually known about it, so this must NEVER be treated as ineligibility. No state
+        // change at all: the approval is left exactly as it was, still pending, for the admin to
+        // simply try the decision again later.
+        return { ok: false, code: 'ORDER_FETCH_FAILED' };
+      }
+      // NOT_FOUND - the order genuinely can't be matched to this tenant/customer (deleted,
+      // ownership changed) - a real structural ineligibility, never guessed as "fine, proceed anyway".
       return this.denyAtDecisionTime(tenantId, approval, now, ['ORDER_STATUS_INELIGIBLE'], [{ code: 'ORDER_STATUS_INELIGIBLE', passed: false }], appendCustomerMessage);
     }
+    const freshOrder = fetchResult.snapshot;
 
     // Amendment A: the full verifier re-check runs exactly here - once, before the first
     // execution attempt, never again on any later retry.
@@ -443,9 +609,10 @@ export class ApprovalService implements ApprovalProposalPort {
     approval: ApprovalRecord,
     decidedBy: string,
     now: Date,
+    adminReasonCode?: AdminDecisionReasonCode,
     appendCustomerMessage?: AppendCustomerMessage,
   ): Promise<DecideResult> {
-    const rejected = await this.repository.reject(tenantId, approval.id, decidedBy, now);
+    const rejected = await this.repository.reject(tenantId, approval.id, decidedBy, now, adminReasonCode);
     if (!rejected) {
       // Reject is blocked for BOTH ambiguous classes (amendment A's own AMBIGUOUS, and F4's
       // NEEDS_RECONCILIATION) - the repository's own query already enforces this; here we just

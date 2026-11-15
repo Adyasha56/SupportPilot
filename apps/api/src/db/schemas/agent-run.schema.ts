@@ -72,6 +72,16 @@ export interface RefundDispositionSubdocument {
 export interface AgentRunDocument {
   _id: Types.ObjectId;
   tenantId: string;
+  /**
+   * Stage 5 follow-up I1(b) - the SAME runId chat.service.ts generates per
+   * request (run-id.ts's generateRunId()) and already returns to the
+   * customer as ChatResult.runId; now also stored here so a run's own
+   * AgentRun write is idempotent (see the unique index below). Required
+   * going forward, but NOT backfilled onto historical documents created
+   * before this field existed - see the sparse index's own doc comment for
+   * why that's safe.
+   */
+  runId: string;
   /** The Conversation's own _id (an app-generated string, not an ObjectId - see conversation.schema.ts). */
   conversationId: string;
   outcome: (typeof AGENT_RUN_OUTCOMES)[number];
@@ -125,6 +135,10 @@ const RefundDispositionSchema = new Schema<RefundDispositionSubdocument>(
 export const AgentRunSchema = new Schema<AgentRunDocument>(
   {
     tenantId: { type: String, required: true, index: true },
+    // required at the schema level for every NEW document - deliberately not backfilled onto
+    // historical documents (see the sparse unique index below), since Mongoose's own `required`
+    // only governs writes made through it, never retroactively validates existing data.
+    runId: { type: String, required: true },
     conversationId: { type: String, required: true },
     outcome: { type: String, required: true, enum: AGENT_RUN_OUTCOMES },
     degraded: { type: String, enum: AGENT_RUN_DEGRADED_REASONS, default: null },
@@ -142,3 +156,27 @@ export const AgentRunSchema = new Schema<AgentRunDocument>(
 
 AgentRunSchema.index({ tenantId: 1, conversationId: 1 });
 AgentRunSchema.index({ tenantId: 1, createdAt: -1 });
+
+/**
+ * Stage 5 follow-up I1(b) - one AgentRun document per run, period; a
+ * retry that re-attempts the same run's insert (because the first
+ * attempt's own result was ambiguous) hits this index and the repository
+ * reads back the already-committed document instead of creating a
+ * second one - this is what makes `ApprovalService.createFromProposal`'s
+ * persistence retry safe to re-run from scratch.
+ *
+ * SPARSE, unlike Approval's own `{tenantId, runId}` unique index
+ * (approval.schema.ts) - `runId` did not exist on this schema until this
+ * change, so any document created before it would have no value for the
+ * field at all (not even `null` - the key is simply absent). A sparse
+ * index never indexes a document missing the field, so any number of
+ * historical documents can coexist safely; uniqueness is enforced only
+ * among documents that DO have a `runId`, which is every document from
+ * this point forward (the field is `required` above). db-ensure-indexes.ts's
+ * own pre-check (`checkNoDuplicateRunIds`) still refuses to create this if
+ * two documents already share a `runId` - a sparse index does not protect
+ * against that, only against a MISSING field colliding with another
+ * missing field.
+ */
+export const AGENT_RUN_RUN_UNIQUE_INDEX_NAME = 'agent_run_run_unique';
+AgentRunSchema.index({ tenantId: 1, runId: 1 }, { unique: true, sparse: true, name: AGENT_RUN_RUN_UNIQUE_INDEX_NAME });

@@ -164,28 +164,6 @@ flagged as a real, surfaced product question with a concrete example
 resolved on the strength of one person's intuition about what "should"
 happen.
 
-## A rare, accepted AgentRun duplication on an ambiguous proposal retry
-
-`chat.service.ts` retries the WHOLE `ApprovalProposalPort.createFromProposal`
-call once on failure (Stage 5's extension of Milestone 3's own amendment C
-mandatory-write policy) before giving the customer a `503
-PENDING_APPROVAL_WRITE_FAILED`. This retry is safe for the common case -
-either the first attempt's transaction never committed (nothing to lose by
-retrying) or it fully committed and the client-side error was itself the
-ambiguous part, in which case the retry's own insert correctly collides
-with the real Approval row's active-per-order unique index and resolves to
-`already_pending` instead of a duplicate refund request. The ONE thing
-this does NOT prevent: if the first attempt's transaction genuinely
-committed (Approval `pending` + AgentRun `refundDisposition: pending_approval`)
-but the client never found out, the retry's `already_pending` branch
-writes a SECOND, distinct AgentRun document for the same `runId` (one
-record for each resolution). No duplicate Approval, no duplicate refund,
-no customer-visible inconsistency - just one extra audit-trail row for an
-already-rare, already-ambiguous case. Accepted rather than engineered
-around with idempotency bookkeeping on the AgentRun write itself, which
-this project's own `AgentRun` schema doesn't currently support (no unique
-constraint ties a run id to "at most one refund-disposition write").
-
 ## Admin decision retry still has no HTTP route (Stage 6 gap)
 
 `approvals-auto-execute-timeout.integration-spec.ts`'s own retry step calls

@@ -37,6 +37,13 @@ class TestController {
     return { resolvedTenantId: tenantId };
   }
 
+  @Post('admin-only')
+  @UseGuards(ApiKeyGuard)
+  @RequireScope('admin')
+  adminOnly(@CurrentTenant() tenantId: string) {
+    return { resolvedTenantId: tenantId };
+  }
+
   @Post('whoami')
   @UseGuards(ApiKeyGuard)
   whoami(@CurrentApiKeyScope() matchedScope: ApiKeyScope, @CurrentApiKeyId() apiKeyId: string) {
@@ -76,7 +83,7 @@ describe('ApiKeyGuard', () => {
     await app.close();
   });
 
-  async function createKey(tenantId: string, scope: 'public' | 'secret' = 'secret') {
+  async function createKey(tenantId: string, scope: ApiKeyScope = 'secret') {
     const rawKey = generateRawApiKey();
     const hash = hashApiKey(rawKey);
     const id = await repository.create(tenantId, hash, getKeyPrefix(rawKey), [scope]);
@@ -229,6 +236,52 @@ describe('ApiKeyGuard', () => {
       const res = await request(app.getHttpServer()).post('/test/whoami').set('Authorization', `Bearer ${rawKey}`).send({});
       expect(res.body.matchedScope).toBe('public');
       expect(res.body.apiKeyId).toBe(id);
+    });
+  });
+
+  // Stage 6, amendment E - admin is a THIRD rank, strictly above secret, which is strictly
+  // above public. A secret-scope key, already trusted on every other /v1/* route, gets the
+  // exact SAME generic rejection a public key does here.
+  describe('the admin scope lattice (Stage 6, amendment E)', () => {
+    it('a secret-scope key does NOT satisfy an admin-only route - the identical generic 401', async () => {
+      const { rawKey } = await createKey('acme', 'secret');
+      const res = await request(app.getHttpServer()).post('/test/admin-only').set('Authorization', `Bearer ${rawKey}`).send({});
+      expect(res.status).toBe(401);
+      expect(res.body).toMatchObject({ statusCode: 401, message: 'Unauthorized' });
+    });
+
+    it('a public-scope key does NOT satisfy an admin-only route - the identical generic 401', async () => {
+      const { rawKey } = await createKey('acme', 'public');
+      const res = await request(app.getHttpServer()).post('/test/admin-only').set('Authorization', `Bearer ${rawKey}`).send({});
+      expect(res.status).toBe(401);
+      expect(res.body).toMatchObject({ statusCode: 401, message: 'Unauthorized' });
+    });
+
+    it('an admin-scope key satisfies the admin-only route (its own scope)', async () => {
+      const { rawKey } = await createKey('acme', 'admin');
+      const res = await request(app.getHttpServer()).post('/test/admin-only').set('Authorization', `Bearer ${rawKey}`).send({});
+      expect(res.status).toBe(201);
+      expect(res.body.resolvedTenantId).toBe('acme');
+    });
+
+    it('an admin-scope key ALSO satisfies secret-only and public-only routes (rank, not a flag)', async () => {
+      const { rawKey } = await createKey('acme', 'admin');
+      const secretRes = await request(app.getHttpServer()).post('/test/secret-only').set('Authorization', `Bearer ${rawKey}`).send({});
+      const publicRes = await request(app.getHttpServer()).post('/test/public-only').set('Authorization', `Bearer ${rawKey}`).send({});
+      expect(secretRes.status).toBe(201);
+      expect(publicRes.status).toBe(201);
+    });
+
+    it('matchedScope reports admin (the key\'s own highest capability) even on a public-only route', async () => {
+      const { rawKey } = await createKey('acme', 'admin');
+      const res = await request(app.getHttpServer()).post('/test/whoami').set('Authorization', `Bearer ${rawKey}`).send({});
+      expect(res.body.matchedScope).toBe('admin');
+    });
+
+    it('no key at all gets the identical generic 401 on the admin-only route too', async () => {
+      const res = await request(app.getHttpServer()).post('/test/admin-only').send({});
+      expect(res.status).toBe(401);
+      expect(res.body).toMatchObject({ statusCode: 401, message: 'Unauthorized' });
     });
   });
 });

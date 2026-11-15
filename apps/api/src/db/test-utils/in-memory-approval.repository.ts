@@ -1,10 +1,12 @@
 import { randomBytes } from 'node:crypto';
+import { AdminDecisionReasonCode } from '@supportpilot/shared';
 import {
   ApprovalListQuery,
   ApprovalListResult,
   ApprovalRecord,
   ApprovalRepository,
   DuplicateActiveApprovalError,
+  DuplicateRunApprovalError,
   encodeCursor,
   endOfUtcDay,
   MarkFailedParams,
@@ -28,6 +30,14 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
   private readonly approvals = new Map<string, ApprovalRecord>();
 
   async create(input: NewApproval): Promise<ApprovalRecord> {
+    // Checked FIRST, same priority a real unique-index violation would surface in - this exact
+    // run already having an Approval is a DIFFERENT fact than some OTHER proposal blocking the
+    // order (Stage 5 follow-up I1(b)).
+    const existingForRun = [...this.approvals.values()].find((a) => a.tenantId === input.tenantId && a.runId === input.runId);
+    if (existingForRun) {
+      throw new DuplicateRunApprovalError(input.runId);
+    }
+
     const existingActive = [...this.approvals.values()].find((a) => a.tenantId === input.tenantId && a.orderId === input.orderId && a.active);
     if (existingActive) {
       throw new DuplicateActiveApprovalError(input.orderId);
@@ -59,6 +69,7 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
       decidedBy: null,
       decidedAt: null,
       reasonCode: null,
+      adminReasonCode: null,
       executionResultCode: null,
       expiresAt,
       createdAt: input.now,
@@ -78,6 +89,11 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
 
   async findActiveByOrder(tenantId: string, orderId: string): Promise<ApprovalRecord | null> {
     const record = [...this.approvals.values()].find((a) => a.tenantId === tenantId && a.orderId === orderId && a.active);
+    return record ? { ...record } : null;
+  }
+
+  async findByRunId(tenantId: string, runId: string): Promise<ApprovalRecord | null> {
+    const record = [...this.approvals.values()].find((a) => a.tenantId === tenantId && a.runId === runId);
     return record ? { ...record } : null;
   }
 
@@ -190,7 +206,7 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
     return { ...record };
   }
 
-  async reject(tenantId: string, id: string, decidedBy: string, now: Date): Promise<ApprovalRecord | null> {
+  async reject(tenantId: string, id: string, decidedBy: string, now: Date, adminReasonCode?: AdminDecisionReasonCode): Promise<ApprovalRecord | null> {
     const record = this.get(tenantId, id);
     if (!record) {
       return null;
@@ -204,6 +220,9 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
     record.active = false;
     record.decidedBy = decidedBy;
     record.decidedAt = now;
+    if (adminReasonCode !== undefined) {
+      record.adminReasonCode = adminReasonCode;
+    }
     record.updatedAt = now;
     return { ...record };
   }

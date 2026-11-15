@@ -1,5 +1,7 @@
 import { Schema, Types } from 'mongoose';
 import {
+  ADMIN_DECISION_REASON_CODES,
+  AdminDecisionReasonCode,
   ApprovalStatusSchema,
   ExecutionResultCode,
   REFUND_EXECUTION_FAILURE_CLASSES,
@@ -42,12 +44,9 @@ const RuleVerdictSchema = new Schema<RuleVerdictSubdocument>(
  * one rule every field below must satisfy): every string field is either
  * an id (tenantId/runId/conversationId/orderId/customerRef/idempotencyKey,
  * all already validated elsewhere before an Approval is ever created) or a
- * validated enum (status/reasonCode/executionResultCode/the rule verdict
- * codes). `decidedBy` is an id too - either a real apiKeyId or the fixed
- * literal "system:auto_execute", never admin-entered text (amendment I's
- * own adminReasonCode enum is Stage 6 work, once the decision endpoint
- * that actually needs it exists - not added here as unused schema surface
- * ahead of that).
+ * validated enum (status/reasonCode/executionResultCode/adminReasonCode/the
+ * rule verdict codes). `decidedBy` is an id too - either a real apiKeyId or
+ * the fixed literal "system:auto_execute", never admin-entered text.
  */
 export interface ApprovalDocument {
   _id: Types.ObjectId;
@@ -85,6 +84,8 @@ export interface ApprovalDocument {
   decidedBy: string | null;
   decidedAt: Date | null;
   reasonCode: VerifierFailureCode | null;
+  /** Stage 6, amendment I - only present on a rejected approval; the admin's own validated reason, distinct from `reasonCode` above (the verifier's own denial vocabulary). */
+  adminReasonCode: AdminDecisionReasonCode | null;
   executionResultCode: ExecutionResultCode | null;
   expiresAt: Date;
   createdAt: Date;
@@ -114,6 +115,7 @@ const ApprovalSchema = new Schema<ApprovalDocument>(
     decidedBy: { type: String, default: null },
     decidedAt: { type: Date, default: null },
     reasonCode: { type: String, enum: VERIFIER_FAILURE_CODES, default: null },
+    adminReasonCode: { type: String, enum: ADMIN_DECISION_REASON_CODES, default: null },
     executionResultCode: { type: String, enum: EXECUTION_RESULT_CODE_VALUES, default: null },
     expiresAt: { type: Date, required: true },
   },
@@ -139,6 +141,26 @@ ApprovalSchema.index(
   { tenantId: 1, orderId: 1 },
   { unique: true, partialFilterExpression: { active: true }, name: APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME },
 );
+
+/**
+ * Stage 5 follow-up I1(b) - a run never proposes more than one refund
+ * (compose returns at most one `proposedRefund` per turn), so at most one
+ * Approval may ever exist per (tenantId, runId). This is what makes
+ * `createFromProposal`'s own persistence retry safe: a retry that
+ * re-attempts the SAME run's insert (because the first attempt's result was
+ * ambiguous - e.g. the write may have actually landed before the client
+ * saw an error) hits THIS index, not a fresh insert, and the repository
+ * reads back the already-committed row instead of creating a second one.
+ * `runId` has been a required field on this schema since it was first
+ * created (Stage 3) - no historical document can have a missing/null
+ * value, so this index is NOT sparse (unlike AgentRun's own, see
+ * agent-run.schema.ts). db-ensure-indexes.ts's own pre-check
+ * (`checkNoDuplicateRunIds`) refuses to create this index at all if any
+ * tenant already has two Approvals sharing a runId - a real possibility
+ * on a database that predates this fix, never silently papered over.
+ */
+export const APPROVAL_RUN_UNIQUE_INDEX_NAME = 'approval_run_unique';
+ApprovalSchema.index({ tenantId: 1, runId: 1 }, { unique: true, name: APPROVAL_RUN_UNIQUE_INDEX_NAME });
 
 /**
  * TTL (createdAt, APPROVAL_RETENTION_DAYS) is deliberately NOT declared

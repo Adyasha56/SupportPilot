@@ -1,7 +1,11 @@
 import { Module } from '@nestjs/common';
+import { ConnectorsModule } from '../connectors/connectors.module';
 import { ToolRunnerModule } from '../agent/tool-runner/tool-runner.module';
 import { DatabaseModule } from '../db/database.module';
 import { APPROVAL_PROPOSAL_PORT } from './approval-proposal.port';
+import { approvalDecisionRateLimiterProvider } from './approval-decision-rate-limiter.provider';
+import { approvalsReadOnlyToolRunnerProvider } from './approvals-read-only-tool-runner.provider';
+import { ApprovalsController } from './approvals.controller';
 import { ApprovalService } from './approval.service';
 import { approvalServiceSettingsProvider } from './approval-service-settings.provider';
 import { PrivilegedRefundRunner } from './privileged-refund-runner';
@@ -36,13 +40,28 @@ export function approvalsDatabaseImportsFor(env: NodeJS.ProcessEnv): [typeof Dat
  *
  * Imported by ChatModule (Stage 5) for exactly that one port token - see
  * chat.module.ts's own doc comment.
+ *
+ * Stage 6 - `ApprovalsController` (GET /v1/approvals, GET /v1/approvals/:id,
+ * POST /v1/approvals/:id/decision) lives in THIS module's own `controllers`,
+ * not some other module importing ApprovalService from outside - amendment
+ * G3 above is exactly why: the admin surface needs the full service, which
+ * is never exported. `ConnectorsModule` is imported directly (not only via
+ * `ToolRunnerModule`, which imports it too but does not re-export
+ * `CONNECTOR_CONFIG_REPOSITORY` in its own `exports` - confirmed by reading
+ * tool-runner.module.ts) because `approvalsReadOnlyToolRunnerProvider`
+ * needs that token for its own `ReadOnlyToolRunner` construction, the same
+ * dependency chat.module.ts separately satisfies for its own sibling
+ * provider.
  */
 @Module({
-  imports: [ToolRunnerModule, ...approvalsDatabaseImportsFor(process.env)],
+  imports: [ToolRunnerModule, ConnectorsModule, ...approvalsDatabaseImportsFor(process.env)],
+  controllers: [ApprovalsController],
   providers: [
     ApprovalService,
     PrivilegedRefundRunner,
     approvalServiceSettingsProvider,
+    approvalDecisionRateLimiterProvider,
+    approvalsReadOnlyToolRunnerProvider,
     { provide: APPROVAL_PROPOSAL_PORT, useExisting: ApprovalService },
   ],
   exports: [APPROVAL_PROPOSAL_PORT],

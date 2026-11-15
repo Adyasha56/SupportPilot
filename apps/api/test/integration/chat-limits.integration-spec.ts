@@ -518,6 +518,9 @@ class FailingCreateAgentRunRepository implements AgentRunRepository {
   findByConversation(tenantId: string, conversationId: string): Promise<AgentRunRecord[]> {
     return this.real.findByConversation(tenantId, conversationId);
   }
+  findByRunId(tenantId: string, runId: string): Promise<AgentRunRecord | null> {
+    return this.real.findByRunId(tenantId, runId);
+  }
   deleteForTenant(tenantId: string): Promise<void> {
     return this.real.deleteForTenant(tenantId);
   }

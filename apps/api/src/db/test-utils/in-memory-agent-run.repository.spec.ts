@@ -1,10 +1,16 @@
+import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { NewAgentRun } from '../agent-run.repository';
+import { DuplicateAgentRunError, NewAgentRun } from '../agent-run.repository';
 import { InMemoryAgentRunRepository } from './in-memory-agent-run.repository';
 
+// A fresh runId per call by default - most tests here don't care about runId uniqueness at all,
+// and reusing one fixed literal would collide with the new {tenantId, runId} uniqueness
+// constraint (Stage 5 follow-up I1(b)) the moment more than one run is created for the same
+// tenant. Tests that DO care about the duplicate/idempotency behavior pass an explicit runId.
 function makeRun(overrides: Partial<NewAgentRun> = {}): NewAgentRun {
   return {
     tenantId: 'acme',
+    runId: `run_${randomUUID()}`,
     conversationId: 'conv_1',
     outcome: 'reply',
     stepCount: 2,
@@ -81,5 +87,31 @@ describe('InMemoryAgentRunRepository', () => {
 
     expect(await repo.findByConversation('acme', 'conv_1')).toEqual([]);
     expect(await repo.findByConversation('widgetco', 'conv_1')).toHaveLength(1);
+  });
+
+  // Stage 5 follow-up I1(b)
+  describe('runId uniqueness (amendment I1b)', () => {
+    it('throws DuplicateAgentRunError on a second create() for the same (tenantId, runId)', async () => {
+      const repo = new InMemoryAgentRunRepository();
+      await repo.create(makeRun({ runId: 'run_dup' }));
+
+      await expect(repo.create(makeRun({ runId: 'run_dup' }))).rejects.toThrow(DuplicateAgentRunError);
+    });
+
+    it('the SAME runId is allowed again for a DIFFERENT tenant', async () => {
+      const repo = new InMemoryAgentRunRepository();
+      await repo.create(makeRun({ tenantId: 'acme', runId: 'run_shared' }));
+
+      await expect(repo.create(makeRun({ tenantId: 'widgetco', runId: 'run_shared' }))).resolves.toBeTruthy();
+    });
+
+    it('findByRunId returns the existing record, scoped by tenant', async () => {
+      const repo = new InMemoryAgentRunRepository();
+      const created = await repo.create(makeRun({ tenantId: 'acme', runId: 'run_lookup' }));
+
+      expect(await repo.findByRunId('acme', 'run_lookup')).toEqual(created);
+      expect(await repo.findByRunId('widgetco', 'run_lookup')).toBeNull();
+      expect(await repo.findByRunId('acme', 'run_nonexistent')).toBeNull();
+    });
   });
 });

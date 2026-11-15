@@ -72,6 +72,9 @@ class FailingCreateAgentRunRepository implements AgentRunRepository {
   findByConversation(tenantId: string, conversationId: string): Promise<AgentRunRecord[]> {
     return this.real.findByConversation(tenantId, conversationId);
   }
+  findByRunId(tenantId: string, runId: string): Promise<AgentRunRecord | null> {
+    return this.real.findByRunId(tenantId, runId);
+  }
   deleteForTenant(tenantId: string): Promise<void> {
     return this.real.deleteForTenant(tenantId);
   }
@@ -88,6 +91,9 @@ class FailingCreateApprovalRepository implements ApprovalRepository {
   }
   findActiveByOrder(tenantId: string, orderId: string): Promise<ApprovalRecord | null> {
     return this.real.findActiveByOrder(tenantId, orderId);
+  }
+  findByRunId(tenantId: string, runId: string): Promise<ApprovalRecord | null> {
+    return this.real.findByRunId(tenantId, runId);
   }
   list(tenantId: string, query: ApprovalListQuery): Promise<ApprovalListResult> {
     return this.real.list(tenantId, query);

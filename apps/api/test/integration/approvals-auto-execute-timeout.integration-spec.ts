@@ -8,11 +8,10 @@
  * track_shipment, escalate_to_human) stays pointed at the real in-process
  * mock store.
  *
- * `ApprovalService` is reached directly via `app.get(ApprovalService)`
- * (Nest's own non-strict `get()` ignores module export boundaries - the
- * same convenience this suite already relies on for `PolicyRetrievalService`
- * etc.) to perform the retry decision, standing in for the admin
- * `POST /v1/approvals/:id/decision` route Stage 6 has not built yet.
+ * Stage 6 - the retry decision now goes through the real admin
+ * `POST /v1/approvals/:id/decision` route (an admin-scoped key, minted via
+ * createApiKeyFixture), replacing the `app.get(ApprovalService)` stand-in
+ * this file used before that route existed.
  */
 import './test-env';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -27,11 +26,10 @@ import { LLM_PROVIDER } from '../../src/llm/llm.module';
 import { GenerateOutcome } from '../../src/llm/llm-provider.interface';
 import { PolicyRetrievalService } from '../../src/retrieval/policy-retrieval.service';
 import { GENERIC_ESCALATE_MESSAGE } from '../../src/agent/loop/run-agent';
-import { ApprovalService } from '../../src/approvals/approval.service';
 import { APPROVAL_REPOSITORY, ApprovalRepository } from '../../src/approvals/approval.repository';
 import { AGENT_RUN_REPOSITORY, AgentRunRepository } from '../../src/db/agent-run.repository';
 import { TENANT_REPOSITORY, TenantRepository } from '../../src/db/tenant.repository';
-import { cleanupTenant, createTenantFixture, disconnectFixtureConnection } from './tenant-fixture';
+import { cleanupTenant, createApiKeyFixture, createTenantFixture, disconnectFixtureConnection } from './tenant-fixture';
 import { getTestMongoUri, integrationTestsEnabled } from './test-env';
 import { pollUntil } from './poll';
 import { startStubServer, StubServer } from '../../src/agent/tool-runner/test-utils/stub-server';
@@ -121,6 +119,7 @@ describe.skipIf(!integrationTestsEnabled())('Auto-execute timeout: an ambiguous 
   it('customer gets the generic escalate message (never a success claim); Approval is failed+retryable+upstreamMaybeReceived; a later retry against a healthy upstream reuses the SAME idempotency key and issues exactly one refund', async () => {
     const tenant = await createTenantFixture(uri);
     createdTenants.push(tenant.tenantId);
+    const adminKey = (await createApiKeyFixture(uri, tenant.tenantId, 'admin')).rawKey;
     await writeAcmeConnectorFixtures(tempConnectorRoot, tenant.tenantId, mockStore.baseUrl);
     await pointIssueRefundAt(tempConnectorRoot, tenant.tenantId, stub.url); // issue_refund ONLY now points at the hanging stub
 
@@ -179,22 +178,15 @@ describe.skipIf(!integrationTestsEnabled())('Auto-execute timeout: an ambiguous 
     // call, so this takes effect on the very next tool call, no app restart needed.
     await pointIssueRefundAt(tempConnectorRoot, tenant.tenantId, mockStore.baseUrl);
 
-    // Stand-in for the admin POST /v1/approvals/:id/decision route (Stage 6, not built yet) -
-    // app.get() ignores module export boundaries (the same convenience this suite already uses
-    // for PolicyRetrievalService), so this reaches the real ApprovalService directly.
-    const approvalService = app.get(ApprovalService);
-    const retryResult = await approvalService.decide(
-      tenant.tenantId,
-      approvalId,
-      'approve',
-      'test-harness-retry',
-      new Date(),
-      { refundCap: 2000, approvalThreshold: 100, refundWindowDays: 30, autoExecuteRefunds: true }, // unused on a retry (amendment A - no re-verification)
-      async () => null, // unused on a retry, same reason
-    );
+    // Stage 6 - the real admin route. No re-verification happens on this retry (amendment A), so
+    // the fresh-order-snapshot fetch is never actually invoked either way.
+    const retryResult = await request(app.getHttpServer())
+      .post(`/v1/approvals/${approvalId}/decision`)
+      .set('Authorization', `Bearer ${adminKey}`)
+      .send({ decision: 'approve' });
 
-    expect(retryResult.ok).toBe(true);
-    expect(retryResult.ok && retryResult.status).toBe('executed');
+    expect(retryResult.status).toBe(200);
+    expect(retryResult.body.status).toBe('executed');
 
     const executedApproval = await approvalRepo.findById(tenant.tenantId, approvalId);
     expect(executedApproval).toMatchObject({ status: 'executed', active: false });

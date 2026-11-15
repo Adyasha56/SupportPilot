@@ -156,13 +156,12 @@ export class ApiKeyGuard implements CanActivate {
 
     this.limiter.recordSuccess(clientKey);
 
-    // Stage 3 - secret is a strict superset of public (see scopeSatisfies),
-    // so matchedScope reports the key's OWN highest capability, not merely
-    // "whatever the route happened to require." A later stage (e.g. the
-    // chat controller deciding whether to honor a request-supplied
-    // customerRef) needs to know the key is REALLY secret-scope, even on a
-    // route whose own requirement is only @RequireScope('public').
-    const matchedScope: ApiKeyScope = record!.scopes.includes('secret') ? 'secret' : 'public';
+    // Stage 3 (extended Stage 6 for the new 'admin' rank) - matchedScope reports the key's OWN
+    // highest capability, not merely "whatever the route happened to require" (see
+    // scopeSatisfies' own rank comparison above). A later stage (e.g. the chat controller
+    // deciding whether to honor a request-supplied customerRef) needs to know the key is REALLY
+    // secret-or-higher scope, even on a route whose own requirement is only @RequireScope('public').
+    const matchedScope: ApiKeyScope = record!.scopes.includes('admin') ? 'admin' : record!.scopes.includes('secret') ? 'secret' : 'public';
     (request as AuthenticatedRequest)[TENANT_REQUEST_KEY] = record!.tenantId;
     (request as AuthenticatedRequest)[MATCHED_SCOPE_REQUEST_KEY] = matchedScope;
     (request as AuthenticatedRequest)[API_KEY_ID_REQUEST_KEY] = record!.id;
@@ -226,18 +225,24 @@ export class ApiKeyGuard implements CanActivate {
 }
 
 /**
- * `secret` is a strict superset of `public` - a secret-scope (server-to-
- * server) key is trusted for everything a public (widget) key is, plus
- * everything else (PROJECT.md section 6: "a separate secretKey... authorizes
- * all other /v1/* endpoints", which includes the public-only /v1/chat
- * route - Stage 4 amendment I). The reverse never holds: a public-scope key
- * must never satisfy a route that specifically requires secret, however it
- * satisfies its OWN scope's requirement as before. No requirement
- * (`required` undefined) always passes, unchanged from before this stage.
+ * A RANK comparison, not a set of independent flags (Stage 6, amendment E):
+ * `public` = 0, `secret` = 1, `admin` = 2. A key satisfies a route's required scope iff its own
+ * highest rank is >= the required rank - `secret` is a strict superset of `public` (PROJECT.md
+ * section 6: "a separate secretKey... authorizes all other /v1/* endpoints", which includes the
+ * public-only /v1/chat route - Stage 4 amendment I), and `admin` is a strict superset of both
+ * (it satisfies every other route too, same as `secret` already does, PLUS the `/v1/approvals*`
+ * routes that specifically require it). The reverse never holds in either direction: a
+ * `public`-scope key never satisfies `secret` or `admin`, and a `secret`-scope key - despite
+ * already working on every OTHER `/v1/*` endpoint - never satisfies `admin`, getting the exact
+ * same generic rejection a `public` key does on `/v1/approvals*`. No requirement (`required`
+ * undefined) always passes, unchanged from before this stage.
  */
+const SCOPE_RANK: Record<ApiKeyScope, number> = { public: 0, secret: 1, admin: 2 };
+
+function highestScopeRank(keyScopes: ApiKeyScope[]): number {
+  return keyScopes.reduce((max, scope) => Math.max(max, SCOPE_RANK[scope]), 0);
+}
+
 function scopeSatisfies(keyScopes: ApiKeyScope[], required: ApiKeyScope): boolean {
-  if (keyScopes.includes('secret')) {
-    return true;
-  }
-  return keyScopes.includes(required);
+  return highestScopeRank(keyScopes) >= SCOPE_RANK[required];
 }
