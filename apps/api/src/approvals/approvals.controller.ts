@@ -15,7 +15,7 @@ import { ConversationRepository, CONVERSATION_REPOSITORY } from '../db/conversat
 import { MessageRepository, MESSAGE_REPOSITORY } from '../db/message.repository';
 import { TenantRepository, TENANT_REPOSITORY } from '../db/tenant.repository';
 import { approvalHttpError } from './approval-http-error';
-import { ApprovalRecord } from './approval.repository';
+import { ApprovalRecord, ApprovalRepository, APPROVAL_REPOSITORY } from './approval.repository';
 import { ApprovalService, DecideResult } from './approval.service';
 import { APPROVAL_DECISION_RATE_LIMITER } from './approval-decision-rate-limiter.provider';
 import { APPROVALS_READ_ONLY_TOOL_RUNNER } from './approvals-read-only-tool-runner.provider';
@@ -69,6 +69,7 @@ export class ApprovalsController {
 
   constructor(
     private readonly approvalService: ApprovalService,
+    @Optional() @Inject(APPROVAL_REPOSITORY) private readonly approvalRepository: ApprovalRepository | undefined,
     @Optional() @Inject(TENANT_REPOSITORY) private readonly tenantRepository: TenantRepository | undefined,
     @Optional() @Inject(MESSAGE_REPOSITORY) private readonly messageRepository: MessageRepository | undefined,
     @Optional() @Inject(CONVERSATION_REPOSITORY) private readonly conversationRepository: ConversationRepository | undefined,
@@ -122,7 +123,13 @@ export class ApprovalsController {
     }
     const { decision, reasonCode } = parsed.data;
 
-    const before = await this.approvalService.getById(tenantId, id, this.clock());
+    // Deliberately the PLAIN repository read here, never approvalService.getById() - that method
+    // performs lazy expiry as a side effect (amendment F2, for the admin GET routes), which would
+    // silently flip a pending-but-past-expiry row to 'expired' BEFORE decide() ever runs,
+    // masking the real "decide on an expired row" outcome (EXPIRED, written by decide() itself)
+    // behind a stale-seeming ALREADY_DECIDED instead. findById() has no side effects, so this
+    // pre-check can never change what decide() is about to see.
+    const before = this.approvalRepository ? await this.approvalRepository.findById(tenantId, id) : null;
     if (!before) {
       throw new NotFoundException();
     }

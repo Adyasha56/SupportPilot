@@ -31,6 +31,8 @@ import { AppModule } from '../../src/app.module';
 import { LLM_PROVIDER } from '../../src/llm/llm.module';
 import { GenerateOutcome } from '../../src/llm/llm-provider.interface';
 import { PolicyRetrievalService } from '../../src/retrieval/policy-retrieval.service';
+import { RateLimiter } from '../../src/auth/rate-limiter';
+import { CUSTOMER_REF_RATE_LIMITER } from '../../src/chat/rate-limiters.provider';
 import { AGENT_RUN_REPOSITORY, AgentRunRepository } from '../../src/db/agent-run.repository';
 import { APPROVAL_REPOSITORY, ApprovalRepository } from '../../src/approvals/approval.repository';
 import { ApprovalDocument } from '../../src/approvals/schemas/approval.schema';
@@ -115,6 +117,14 @@ describe.skipIf(!integrationTestsEnabled())('Admin approvals API (integration, r
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(LLM_PROVIDER)
       .useValue(scriptableLlm)
+      // This file's seeded orders fix their owner's customerRef (ORD-1001 -> cust_1), and
+      // CUSTOMER_REF_RATE_LIMITER buckets by that raw string GLOBALLY, not scoped per tenant
+      // (chat.service.ts's own design, PROJECT.md amendment B) - reusing cust_1 across this
+      // file's many non-consuming scenarios would otherwise exhaust the real 10-per-60s default
+      // well before the file finishes, same reasoning chat.controller.spec.ts's own override
+      // already documents for its unit tests.
+      .overrideProvider(CUSTOMER_REF_RATE_LIMITER)
+      .useValue(new RateLimiter({ maxRequests: 1000, windowMs: 60_000, maxEntries: 1000 }, () => new Date()))
       .compile();
     app = moduleRef.createNestApplication();
     await app.init();
@@ -223,13 +233,16 @@ describe.skipIf(!integrationTestsEnabled())('Admin approvals API (integration, r
       const adminKey = (await createApiKeyFixture(uri, tenant.tenantId, 'admin')).rawKey;
       const { approvalId } = await proposeRefund(tenant, 'ORD-1001', 10);
 
+      // A missing key and a present-but-insufficient-scope key both produce the SAME generic 401
+      // (api-key.guard.ts's own documented design - never a 403, so a probing caller can never
+      // distinguish "wrong scope" from "no key at all").
       for (const key of [tenant.secretKey, tenant.publicKey]) {
         const listRes = await request(app.getHttpServer()).get('/v1/approvals').set('Authorization', `Bearer ${key}`);
         const getRes = await request(app.getHttpServer()).get(`/v1/approvals/${approvalId}`).set('Authorization', `Bearer ${key}`);
         const decisionRes = await decide(key, approvalId, { decision: 'approve' });
-        expect(listRes.status).toBe(403);
-        expect(getRes.status).toBe(403);
-        expect(decisionRes.status).toBe(403);
+        expect(listRes.status).toBe(401);
+        expect(getRes.status).toBe(401);
+        expect(decisionRes.status).toBe(401);
       }
 
       const noKeyRes = await request(app.getHttpServer()).get('/v1/approvals');

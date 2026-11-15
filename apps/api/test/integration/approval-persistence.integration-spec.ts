@@ -19,6 +19,7 @@
  * as skipped, not passed.
  */
 import './test-env';
+import { randomUUID } from 'node:crypto';
 import { describe, expect, it, afterAll } from 'vitest';
 import mongoose, { Model, Types } from 'mongoose';
 import { cleanupTenant, disconnectFixtureConnection, randomTenantId } from './tenant-fixture';
@@ -57,7 +58,12 @@ describe.skipIf(!integrationTestsEnabled())('Approval persistence (integration, 
   function input(tenantId: string, overrides: Partial<NewApproval> = {}): NewApproval {
     return {
       tenantId,
-      runId: 'run_1',
+      // A fresh runId per call, not a fixed literal - several tests in this file call
+      // repository.create() more than once for the SAME tenant (to exercise the
+      // active-per-order partial unique index), which would otherwise also collide on the
+      // {tenantId, runId} unique index (Stage 5 follow-up I1) and mask the error this file
+      // is actually testing for behind a DuplicateRunApprovalError instead.
+      runId: `run_${randomUUID()}`,
       conversationId: 'conv_1',
       orderId: 'ORD-1001',
       customerRef: 'cust_1',
