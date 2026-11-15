@@ -345,13 +345,19 @@ describe.skipIf(!integrationTestsEnabled())('Admin approvals API (integration, r
     const canary = canaryString();
     const { kid, privateKey } = await registerCustomerKeyFixture(uri, tenant.tenantId);
     const token = mintCustomerToken(tenant.tenantId, 'cust_1', kid, privateKey);
-    const { chunkKey } = await seedCitableChunk(tenant, 'A delivered order that arrived damaged can be refunded.');
+    const { chunkKey, uniqueWord } = await seedCitableChunk(tenant, 'A delivered order that arrived damaged can be refunded.');
 
     scriptableLlm.setScript([
-      planOutput({ reasoning: `about ${canary}`, toolRequests: [{ tool: 'get_order', order_id: 'ORD-1001' }] }),
+      // needsPolicy/searchQuery must be set, same as every other test's planOutput() - without a
+      // real retrieve step, citedChunkKeys below is re-checked against an EMPTY actually-retrieved
+      // set and dropped (never trusted at face value), failing the verifier's citation rule and
+      // producing a 'denied' disposition with no approvalId at all - a silent cause of the 404
+      // this test originally failed with, not a product bug.
+      planOutput({ reasoning: `about ${canary}`, needsPolicy: true, searchQuery: uniqueWord, toolRequests: [{ tool: 'get_order', order_id: 'ORD-1001' }] }),
       composeOutput({ outcome: 'propose_refund', message: `Refunding you, re: ${canary}.`, citedChunkKeys: [chunkKey], proposedRefund: { order_id: 'ORD-1001', amount: 10 } }),
     ]);
     const chatRes = await request(app.getHttpServer()).post('/v1/chat').set('Authorization', `Bearer ${tenant.publicKey}`).send({ message: `refund me, ${canary}`, customerToken: token });
+    expect(chatRes.body.outcome).toBe('pending_approval');
     const runs = await repos().agentRun.findByConversation(tenant.tenantId, chatRes.body.conversationId as string);
     const approvalId = runs[0].refundDisposition!.approvalId!;
 
