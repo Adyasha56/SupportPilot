@@ -3,8 +3,12 @@
  * (decorators and constructor parameter properties aren't supported by
  * Node's native TypeScript type stripping - see that script's header).
  *
- *   pnpm run create-api-key -- --tenantId=acme --name="Acme Inc" [--scope=secret]
+ *   pnpm run create-api-key -- --tenantId=acme --name="Acme Inc" [--scope=secret|public|admin]
  *   pnpm run create-api-key -- --revoke=<apiKeyId>
+ *
+ * --scope=admin (Stage 6, amendment E) is the interim way to mint a key that can call
+ * /v1/approvals* - Milestone 5's admin console login eventually replaces standing admin API
+ * keys, the same way --scope=secret is an interim mechanism for policies/connectors today.
  *
  * Refuses to run against what looks like the shared test database unless
  * --allow-test-db is passed, same as db-ensure-indexes.
@@ -35,7 +39,7 @@ async function runCreate(args: Record<string, string | boolean>): Promise<void> 
     );
   }
   const name = typeof args.name === 'string' ? args.name : tenantId;
-  const scope: ApiKeyScope = args.scope === 'public' ? 'public' : 'secret';
+  const scope: ApiKeyScope = args.scope === 'public' ? 'public' : args.scope === 'admin' ? 'admin' : 'secret';
 
   const TenantModel = mongoose.model('Tenant', TenantSchema);
   const ApiKeyModel = mongoose.model('ApiKey', ApiKeySchema);

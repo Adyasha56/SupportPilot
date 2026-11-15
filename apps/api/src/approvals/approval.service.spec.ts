@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { InMemoryApprovalRepository } from '../db/test-utils/in-memory-approval.repository';
 import { ApprovalService, CreateFromProposalInput, FetchFreshOrderSnapshot } from './approval.service';
@@ -37,10 +38,16 @@ function tenantSettings(overrides: Partial<RefundVerifierTenantSettings> = {}): 
   };
 }
 
+// A fresh runId per call by default - most tests here are about independent proposals (two
+// different chat turns), not the {tenantId, runId} idempotency behavior itself (Stage 5
+// follow-up I1(b)); reusing one fixed literal would make every "second proposal" collide with
+// the newer runId-uniqueness constraint before ever reaching the one it's actually testing
+// (e.g. the active-per-order one). Tests that DO care about the idempotent-retry behavior pass
+// an explicit, SHARED runId across both calls.
 function proposalInput(overrides: Partial<CreateFromProposalInput> = {}): CreateFromProposalInput {
   return {
     tenantId: 'acme',
-    runId: 'run_1',
+    runId: `run_${randomUUID()}`,
     conversationId: 'conv_1',
     orderId: 'ORD-1001',
     verifiedCustomerRef: 'cust_1',
@@ -61,7 +68,7 @@ function fakeRunner(
   return { execute } as unknown as PrivilegedRefundRunner;
 }
 
-const alwaysFreshOrder: FetchFreshOrderSnapshot = async (_tenantId, _orderId) => orderSnapshot();
+const alwaysFreshOrder: FetchFreshOrderSnapshot = async (_tenantId, _orderId) => ({ ok: true, snapshot: orderSnapshot() });
 
 /**
  * Stage 5's transactional dual-write hook - these tests only care about ApprovalService's own
@@ -292,7 +299,7 @@ describe('ApprovalService.decide - approve', () => {
     const { service, approvalId } = await proposeAndApprove(repo, fakeRunner(run));
 
     // The order is now cancelled by the time an admin looks at it.
-    const fetchChangedOrder: FetchFreshOrderSnapshot = async () => orderSnapshot({ status: 'cancelled' });
+    const fetchChangedOrder: FetchFreshOrderSnapshot = async () => ({ ok: true, snapshot: orderSnapshot({ status: 'cancelled' }) });
     const result = await service.decide('acme', approvalId, 'approve', 'key_1', NOW, tenantSettings(), fetchChangedOrder);
 
     expect(result.ok).toBe(false);
@@ -301,6 +308,45 @@ describe('ApprovalService.decide - approve', () => {
     const stored = await repo.findById('acme', approvalId);
     expect(stored?.status).toBe('failed');
     expect(stored?.retryable).toBe(false);
+  });
+
+  // Stage 6 - the fetch itself failing must NEVER be treated as the order being ineligible.
+  it('a FETCH_FAILED order lookup leaves the approval exactly as it was - still pending, no state change, ORDER_FETCH_FAILED', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const run = vi.fn(async () => ({ ok: true as const, data: {}, riskLevel: 'high' as const }));
+    const { service, approvalId } = await proposeAndApprove(repo, fakeRunner(run));
+
+    const fetchFails: FetchFreshOrderSnapshot = async () => ({ ok: false, reason: 'FETCH_FAILED' });
+    const result = await service.decide('acme', approvalId, 'approve', 'key_1', NOW, tenantSettings(), fetchFails);
+
+    expect(result).toEqual({ ok: false, code: 'ORDER_FETCH_FAILED' });
+    expect(run).not.toHaveBeenCalled();
+    const stored = await repo.findById('acme', approvalId);
+    expect(stored?.status).toBe('pending'); // untouched - no state change at all
+    expect(stored?.attemptCount).toBe(0);
+
+    // A later retry with a HEALTHY fetch succeeds normally - nothing about the failed attempt
+    // above left this approval in a worse state than before.
+    const retry = await service.decide('acme', approvalId, 'approve', 'key_1', NOW, tenantSettings(), alwaysFreshOrder);
+    expect(retry.ok).toBe(true);
+    expect(retry.ok && retry.status).toBe('executed');
+  });
+
+  it('a NOT_FOUND order lookup (genuinely deleted/ineligible) denies with a real state change, distinct from FETCH_FAILED', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const run = vi.fn(async () => ({ ok: true as const, data: {}, riskLevel: 'high' as const }));
+    const { service, approvalId } = await proposeAndApprove(repo, fakeRunner(run));
+
+    const fetchNotFound: FetchFreshOrderSnapshot = async () => ({ ok: false, reason: 'NOT_FOUND' });
+    const result = await service.decide('acme', approvalId, 'approve', 'key_1', NOW, tenantSettings(), fetchNotFound);
+
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.code).toBe('VERIFIER_DENIED');
+    expect(run).not.toHaveBeenCalled();
+    const stored = await repo.findById('acme', approvalId);
+    expect(stored?.status).toBe('failed');
+    expect(stored?.retryable).toBe(false);
+    expect(stored?.reasonCode).toBe('ORDER_STATUS_INELIGIBLE');
   });
 
   it('approve succeeds: executes exactly once, attemptCount 1', async () => {
@@ -469,5 +515,147 @@ describe('ApprovalService.getById / list - lazy expiry (amendment F2)', () => {
     const wellAfterExpiry = new Date(NOW.getTime() + 2 * 24 * 60 * 60 * 1000);
     const { approvals } = await service.list('acme', {}, wellAfterExpiry);
     expect(approvals[0].status).toBe('expired');
+  });
+});
+
+describe('Stage 5 follow-up I1: retrying past the persistence phase is unsafe, and is now structurally impossible', () => {
+  /** Intercepts exactly ONE method call on a real ApprovalRepository, delegating everything else - avoids hand-writing a dozen passthrough methods for each narrow fault-injection test below. */
+  function interceptOnce<K extends keyof ApprovalRepository>(
+    real: ApprovalRepository,
+    method: K,
+    onFirstCall: () => never,
+  ): ApprovalRepository {
+    let intercepted = false;
+    return new Proxy(real, {
+      get(target, prop, receiver) {
+        if (prop === method && !intercepted) {
+          intercepted = true;
+          return onFirstCall;
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+  }
+
+  it('an exception during execution (e.g. a markExecuted write failure AFTER the real refund already succeeded) never claims success and is NEVER retried via a fresh createFromProposal call', async () => {
+    const realRepo = new InMemoryApprovalRepository();
+    const repo = interceptOnce(realRepo, 'markExecuted', () => {
+      throw new Error('simulated markExecuted persistence failure (the refund itself already succeeded)');
+    });
+    const run = vi.fn(async () => ({ ok: true as const, data: { status: 'refunded' }, riskLevel: 'high' as const }));
+    const service = new ApprovalService(repo, fakeRunner(run));
+
+    const result = await service.createFromProposal(
+      proposalInput({ amountCents: 5000, tenantSettings: tenantSettings({ autoExecuteRefunds: true, approvalThreshold: 250 }) }),
+      noopPersistAgentRun,
+    );
+
+    // Never claims success - the exception is caught and reported as a plain failure, never
+    // re-thrown out of createFromProposal (amendment I1(a)).
+    expect(result.kind).toBe('auto_executed');
+    expect(result.kind === 'auto_executed' && result.success).toBe(false);
+    // The privileged runner (the thing that actually moves money) was called EXACTLY once -
+    // the failure happened AFTER that call, recording it is what failed, and nothing in
+    // createFromProposal re-attempts the call itself in response.
+    expect(run).toHaveBeenCalledTimes(1);
+    // Exactly one Approval row exists - no second row was created by this failure.
+    expect((await realRepo.list('acme', {})).approvals).toHaveLength(1);
+  });
+
+  it('a partial-amount refund: a second createFromProposal call for the SAME run, after the first already fully executed, issues NO second refund and creates NO second Approval - even though the stale orderSnapshot would otherwise still pass the verifier', async () => {
+    // The order has $100.00 remaining refundable per the (never re-fetched) orderSnapshot this
+    // run captured at the START of the request - a $40.00 partial refund leaves $60.00 looking
+    // "still refundable" by that same stale snapshot, forever, no matter how many times a
+    // caller re-proposes using it. This is exactly the dangerous case amendment I1 closes: the
+    // snapshot never updates, so the ONLY thing standing between this and a double refund is
+    // the approval's own state machine, not re-verification.
+    const repo = new InMemoryApprovalRepository();
+    const run = vi.fn(async () => ({ ok: true as const, data: { status: 'refunded' }, riskLevel: 'high' as const }));
+    const service = new ApprovalService(repo, fakeRunner(run));
+
+    const sharedInput = proposalInput({
+      runId: 'run_partial_retry',
+      amountCents: 4000, // $40.00 of a $100.00 order (orderSnapshot's default totalCents is 10000, alreadyRefundedCents 0)
+      tenantSettings: tenantSettings({ autoExecuteRefunds: true, approvalThreshold: 250 }),
+    });
+
+    const first = await service.createFromProposal(sharedInput, noopPersistAgentRun);
+    expect(first.kind).toBe('auto_executed');
+    expect(first.kind === 'auto_executed' && first.success).toBe(true);
+    expect(run).toHaveBeenCalledTimes(1);
+
+    // Simulate the exact scenario the old design made dangerous: something calls
+    // createFromProposal AGAIN for the same run (the SAME stale snapshot, which still claims
+    // $100.00 remaining) - e.g. an outer caller mistakenly retrying the whole proposal, not
+    // just its persistence phase.
+    const second = await service.createFromProposal(sharedInput, noopPersistAgentRun);
+
+    // No second refund - the runner was never called again.
+    expect(run).toHaveBeenCalledTimes(1);
+    // No second Approval row - the SAME run still maps to exactly one.
+    expect((await repo.list('acme', {})).approvals).toHaveLength(1);
+    // The second call's own persistence phase read back the SAME (already-executed) approval
+    // rather than creating a new one, and runAutoExecute's beginExecution correctly refused to
+    // re-begin execution on a row that is no longer 'pending' - never claims success either.
+    expect(second.kind).toBe('auto_executed');
+    expect(second.kind === 'auto_executed' && second.success).toBe(false);
+    const stored = (await repo.list('acme', {})).approvals[0];
+    expect(stored.status).toBe('executed');
+    expect(stored.amountCents).toBe(4000); // the ORIGINAL amount - never overwritten or duplicated
+  });
+
+  it('createApprovalRowWithRetry (the ONLY retried step) never touches beginExecution/the privileged runner - it wraps exactly the persistence transaction', async () => {
+    const repo = new InMemoryApprovalRepository();
+    const beginExecutionSpy = vi.spyOn(repo, 'beginExecution');
+    const run = vi.fn(async () => ({ ok: true as const, data: { status: 'refunded' }, riskLevel: 'high' as const }));
+
+    // Force the FIRST persistence attempt to fail with a genuine (non-duplicate-key) infra
+    // error, so createApprovalRowWithRetry's own one retry actually fires.
+    let createCalls = 0;
+    const realCreate = repo.create.bind(repo);
+    repo.create = async (input) => {
+      createCalls += 1;
+      if (createCalls === 1) {
+        throw new Error('simulated transient infra failure on the first persistence attempt');
+      }
+      return realCreate(input);
+    };
+
+    const service = new ApprovalService(repo, fakeRunner(run), undefined, undefined); // no TransactionRunner - standalone fallback path
+
+    const result = await service.createFromProposal(
+      proposalInput({ tenantSettings: tenantSettings({ autoExecuteRefunds: true, approvalThreshold: 250 }) }),
+      noopPersistAgentRun,
+    );
+
+    expect(createCalls).toBe(2); // the persistence phase really did retry once
+    expect(result.kind).toBe('auto_executed');
+    // beginExecution (the first step PAST the persistence phase) was called exactly once -
+    // the retry above happened entirely BEFORE this, never re-triggering execution.
+    expect(beginExecutionSpy).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it('a genuine infra failure during the standalone (denied) AgentRun write is retried once, idempotently, via DuplicateAgentRunError - never by re-running the verifier', async () => {
+    const calls: unknown[] = [];
+    let attempt = 0;
+    const flakyPersistAgentRun: PersistAgentRunForProposal = async (disposition) => {
+      attempt += 1;
+      calls.push(disposition);
+      if (attempt === 1) {
+        throw new Error('simulated transient infra failure');
+      }
+      // second attempt succeeds - nothing more to assert here since this fake doesn't model
+      // DuplicateAgentRunError itself; approval.service.ts's own standalone-write test above
+      // already covers the "already recorded" branch via the real repository.
+    };
+    const repo = new InMemoryApprovalRepository();
+    const service = new ApprovalService(repo, fakeRunner());
+
+    const result = await service.createFromProposal(proposalInput({ citations: [] }), flakyPersistAgentRun);
+
+    expect(result.kind).toBe('denied');
+    expect(calls).toHaveLength(2); // retried exactly once
+    expect(calls[0]).toEqual(calls[1]); // the SAME disposition both times - never re-verified
   });
 });

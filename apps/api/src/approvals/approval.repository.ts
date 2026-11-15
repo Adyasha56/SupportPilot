@@ -2,13 +2,19 @@ import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import {
+  AdminDecisionReasonCode,
   DEFAULT_APPROVAL_LIST_LIMIT,
   ExecutionResultCode,
   MAX_APPROVAL_LIST_LIMIT,
   RefundExecutionFailureClass,
   VerifierFailureCode,
 } from '@supportpilot/shared';
-import { ApprovalDocument, ApprovalStatusValue, RuleVerdictSubdocument } from './schemas/approval.schema';
+import {
+  APPROVAL_RUN_UNIQUE_INDEX_NAME,
+  ApprovalDocument,
+  ApprovalStatusValue,
+  RuleVerdictSubdocument,
+} from './schemas/approval.schema';
 
 export interface ApprovalRecord {
   id: string;
@@ -33,6 +39,8 @@ export interface ApprovalRecord {
   decidedBy: string | null;
   decidedAt: Date | null;
   reasonCode: VerifierFailureCode | null;
+  /** Stage 6, amendment I - only present on a rejected approval. */
+  adminReasonCode: AdminDecisionReasonCode | null;
   executionResultCode: ExecutionResultCode | null;
   expiresAt: Date;
   createdAt: Date;
@@ -73,6 +81,13 @@ export class DuplicateActiveApprovalError extends Error {
   }
 }
 
+/** Stage 5 follow-up I1(b) - thrown instead of DuplicateActiveApprovalError when the SAME run's own insert collides with the {tenantId, runId} unique index (approval_run_unique) rather than the active-per-order one - meaning this exact run already has an Approval (an idempotent retry), not that some OTHER proposal is blocking it. */
+export class DuplicateRunApprovalError extends Error {
+  constructor(public readonly runId: string) {
+    super(`An Approval already exists for runId "${runId}".`);
+  }
+}
+
 /** amendment F4 - params a failed execution attempt (or a pending-time verifier denial) is recorded with. `active`/`retryable` are independent (NEEDS_RECONCILIATION sets retryable: false but active: true). */
 export interface MarkFailedParams {
   retryable: boolean;
@@ -108,13 +123,18 @@ export interface ApprovalRepository {
    * ClientSession and have this insert participate in that transaction;
    * omitted, it's a plain standalone insert. Throws DuplicateActiveApprovalError
    * (amendment F2) when the active-per-order partial unique index rejects
-   * the insert - never a raw Mongo E11000 error - so ApprovalService can
-   * react without inspecting driver-specific error shapes.
+   * the insert, or DuplicateRunApprovalError (Stage 5 follow-up I1(b)) when
+   * the {tenantId, runId} unique index rejects it instead (this exact run
+   * already has an Approval) - never a raw Mongo E11000 error either way,
+   * so ApprovalService can react without inspecting driver-specific error
+   * shapes.
    */
   create(input: NewApproval, session?: unknown): Promise<ApprovalRecord>;
   findById(tenantId: string, id: string): Promise<ApprovalRecord | null>;
   /** amendment F2 - the row (if any) currently blocking a new proposal for this order, so the caller can decide whether it's actually still active or just a stale pending row past its expiry. */
   findActiveByOrder(tenantId: string, orderId: string): Promise<ApprovalRecord | null>;
+  /** Stage 5 follow-up I1(b) - the read-back half of create()'s idempotency contract (DuplicateRunApprovalError). Null if no Approval exists yet for this runId. */
+  findByRunId(tenantId: string, runId: string): Promise<ApprovalRecord | null>;
   list(tenantId: string, query: ApprovalListQuery): Promise<ApprovalListResult>;
   /** UTC calendar day containing `now` - see startOfUtcDay's own doc comment for why UTC, not server-local or the customer's own timezone. */
   countForCustomerToday(tenantId: string, customerRef: string, now: Date): Promise<number>;
@@ -149,8 +169,15 @@ export interface ApprovalRepository {
    * is `retryable: false, active: true`.
    */
   markFailed(tenantId: string, id: string, expectedAttemptCount: number, params: MarkFailedParams, now: Date): Promise<ApprovalRecord | null>;
-  /** pending, OR failed+(DEFINITIVE or NOT_SENT) -> rejected. Blocked for AMBIGUOUS and NEEDS_RECONCILIATION regardless of `retryable` (NOT_SENT is retryable AND rejectable at once - amendment F4). */
-  reject(tenantId: string, id: string, decidedBy: string, now: Date): Promise<ApprovalRecord | null>;
+  /**
+   * pending, OR failed+(DEFINITIVE or NOT_SENT) -> rejected. Blocked for AMBIGUOUS and
+   * NEEDS_RECONCILIATION regardless of `retryable` (NOT_SENT is retryable AND rejectable at
+   * once - amendment F4). `adminReasonCode` (Stage 6, amendment I) is optional and appended
+   * LAST, same reasoning as `decidedBy` on beginExecution/etc. - every pre-existing 4-arg call
+   * keeps compiling and keeps its exact prior behavior (adminReasonCode left null); only the
+   * real admin decision route passes it.
+   */
+  reject(tenantId: string, id: string, decidedBy: string, now: Date, adminReasonCode?: AdminDecisionReasonCode): Promise<ApprovalRecord | null>;
   /** pending (and already past expiresAt) -> expired. */
   expire(tenantId: string, id: string, now: Date): Promise<ApprovalRecord | null>;
 }
@@ -248,6 +275,7 @@ function toApprovalRecord(doc: ApprovalDocument): ApprovalRecord {
     decidedBy: doc.decidedBy,
     decidedAt: doc.decidedAt,
     reasonCode: doc.reasonCode,
+    adminReasonCode: doc.adminReasonCode,
     executionResultCode: doc.executionResultCode,
     expiresAt: doc.expiresAt,
     createdAt: doc.createdAt,
@@ -257,6 +285,20 @@ function toApprovalRecord(doc: ApprovalDocument): ApprovalRecord {
 
 function isDuplicateKeyError(err: unknown): boolean {
   return typeof err === 'object' && err !== null && 'code' in err && (err as { code: unknown }).code === 11000;
+}
+
+/**
+ * Stage 5 follow-up I1(b) - a duplicate-key error on this collection can mean one of TWO
+ * different unique indexes was violated (the active-per-order one, amendment F1/C, or the
+ * {tenantId, runId} one). MongoDB's own E11000 error always names the violated index in its
+ * message (confirmed against this project's own driver version, same as every other
+ * index-name-sniffing check already in this codebase - see db-ensure-indexes.ts's own patterns)
+ * - checked by substring, not parsed structurally, since the index name is a fixed, known
+ * string and a substring check is simpler and just as reliable here.
+ */
+function violatedIndexIsRunUnique(err: unknown): boolean {
+  const message = typeof err === 'object' && err !== null && 'message' in err ? String((err as { message: unknown }).message) : '';
+  return message.includes(APPROVAL_RUN_UNIQUE_INDEX_NAME);
 }
 
 @Injectable()
@@ -294,6 +336,7 @@ export class MongooseApprovalRepository implements ApprovalRepository {
             decidedBy: null,
             decidedAt: null,
             reasonCode: null,
+            adminReasonCode: null,
             executionResultCode: null,
             expiresAt,
           },
@@ -303,10 +346,15 @@ export class MongooseApprovalRepository implements ApprovalRepository {
       return toApprovalRecord(doc);
     } catch (err) {
       if (isDuplicateKeyError(err)) {
-        throw new DuplicateActiveApprovalError(input.orderId);
+        throw violatedIndexIsRunUnique(err) ? new DuplicateRunApprovalError(input.runId) : new DuplicateActiveApprovalError(input.orderId);
       }
       throw err;
     }
+  }
+
+  async findByRunId(tenantId: string, runId: string): Promise<ApprovalRecord | null> {
+    const doc = await this.model.findOne({ tenantId, runId }).lean();
+    return doc ? toApprovalRecord(doc as unknown as ApprovalDocument) : null;
   }
 
   async findById(tenantId: string, id: string): Promise<ApprovalRecord | null> {
@@ -464,9 +512,13 @@ export class MongooseApprovalRepository implements ApprovalRepository {
     return doc ? toApprovalRecord(doc as unknown as ApprovalDocument) : null;
   }
 
-  async reject(tenantId: string, id: string, decidedBy: string, now: Date): Promise<ApprovalRecord | null> {
+  async reject(tenantId: string, id: string, decidedBy: string, now: Date, adminReasonCode?: AdminDecisionReasonCode): Promise<ApprovalRecord | null> {
     if (!Types.ObjectId.isValid(id)) {
       return null;
+    }
+    const $set: Record<string, unknown> = { status: 'rejected', active: false, decidedBy, decidedAt: now };
+    if (adminReasonCode !== undefined) {
+      $set.adminReasonCode = adminReasonCode;
     }
     const doc = await this.model
       .findOneAndUpdate(
@@ -475,7 +527,7 @@ export class MongooseApprovalRepository implements ApprovalRepository {
           tenantId,
           $or: [{ status: 'pending' }, { status: 'failed', failureClass: { $nin: ['AMBIGUOUS', 'NEEDS_RECONCILIATION'] } }],
         },
-        { $set: { status: 'rejected', active: false, decidedBy, decidedAt: now } },
+        { $set },
         { new: true },
       )
       .lean();

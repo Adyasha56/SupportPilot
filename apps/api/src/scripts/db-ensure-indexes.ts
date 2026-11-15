@@ -52,7 +52,8 @@ import { ConversationSchema } from '../db/schemas/conversation.schema';
 import { MessageSchema } from '../db/schemas/message.schema';
 import { AgentRunSchema } from '../db/schemas/agent-run.schema';
 import { CustomerPublicKeySchema } from '../db/schemas/customer-public-key.schema';
-import { APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME, ApprovalSchema } from '../approvals/schemas/approval.schema';
+import { APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME, APPROVAL_RUN_UNIQUE_INDEX_NAME, ApprovalSchema } from '../approvals/schemas/approval.schema';
+import { AGENT_RUN_RUN_UNIQUE_INDEX_NAME } from '../db/schemas/agent-run.schema';
 
 export const COLLECTION_NAME = 'policyChunks';
 export const POLL_INTERVAL_MS = 10_000;
@@ -336,6 +337,20 @@ export interface CollectionIndexDeps {
   };
   /** Milestone 4 amendment C - indexes that must error rather than be auto-dropped-and-recreated on a mismatch. See checkProtectedIndexes' own doc comment. */
   protectedIndexes?: ProtectedIndexSpec[];
+  /**
+   * Stage 5 follow-up I1(c) - a NEW unique index this run is about to create for the first time
+   * (`{tenantId, runId}`, on Approval and AgentRun) must never be attempted against existing
+   * data that already violates it - see `checkNoDuplicateRunIdGroups`'s own doc comment for the
+   * full reasoning. Only set for the two collections that declare this index; `countDuplicateGroups`
+   * only needs to run (and only runs) when `indexName` is actually present in this collection's
+   * own `toCreate` plan this run - once the index exists, MongoDB itself is already the ongoing
+   * enforcement, and re-running an aggregation over the whole collection every single run would
+   * be pure overhead.
+   */
+  runIdUniqueness?: {
+    indexName: string;
+    countDuplicateGroups(): Promise<number>;
+  };
 }
 
 export function findSingleFieldTtlIndex(indexes: ExistingIndexInfo[], field: string): ExistingIndexInfo | undefined {
@@ -425,6 +440,39 @@ export function checkProtectedIndexes(existingIndexes: ExistingIndexInfo[], prot
           'on a collection with live data needs a careful, deliberate migration, never an automated drop+recreate).',
       );
     }
+  }
+}
+
+/**
+ * Stage 5 follow-up I1(c) - run ONLY when the collection's `{tenantId, runId}` unique index is
+ * actually in `toCreate` (i.e. about to be created for the first time against possibly-live
+ * data). MongoDB itself WOULD refuse to build a unique index over data that already violates
+ * it - this check exists to surface that as a clear, actionable error BEFORE the attempt, dry-run
+ * or not, rather than a raw duplicate-key error from the index build itself. Never auto-fixes
+ * anything (same discipline as `checkProtectedIndexes` above) - a tenant with two Approvals (or
+ * two AgentRuns) sharing a runId is exactly the race this project's own Stage 5 fix closes going
+ * forward, but resolving ALREADY-existing duplicates (which run is the "real" one, whether a
+ * refund was actually issued twice) needs a human looking at the specific rows, never a script
+ * guessing.
+ */
+export async function checkNoDuplicateRunIdGroups(
+  toCreate: RegularIndexSpec[],
+  runIdUniqueness: NonNullable<CollectionIndexDeps['runIdUniqueness']>,
+  label: string,
+): Promise<void> {
+  const aboutToCreateIt = toCreate.some(([, options]) => options.name === runIdUniqueness.indexName);
+  if (!aboutToCreateIt) {
+    return;
+  }
+  const duplicateGroups = await runIdUniqueness.countDuplicateGroups();
+  if (duplicateGroups > 0) {
+    throw new Error(
+      `${label}: cannot create index "${runIdUniqueness.indexName}" - ${duplicateGroups} tenant(s) already have more ` +
+        'than one document sharing the same runId. This index is not auto-created over data that already violates ' +
+        'it. Investigate these specific documents by hand (which one is the real one; whether a refund was ever ' +
+        'actually issued twice) before resolving the duplicates and re-running this script - never guessed or ' +
+        'auto-fixed.',
+    );
   }
 }
 
@@ -586,6 +634,13 @@ export async function ensureCollectionIndexes(
 
   const { toDrop: rawToDrop, toCreate } = await deps.diffSchemaIndexes();
 
+  // Stage 5 follow-up I1(c) - checked unconditionally, dry-run or not, and BEFORE any index is
+  // actually created, same priority as checkProtectedIndexes above (and for the same reason: a
+  // validation finding this script stops on, never something it works around automatically).
+  if (deps.runIdUniqueness) {
+    await checkNoDuplicateRunIdGroups(toCreate, deps.runIdUniqueness, deps.label);
+  }
+
   // Never let the regular-index diff drop the TTL-managed index, or a protected index (Milestone
   // 4 amendment C) - this is the fix for the bug described in the module doc comment above,
   // extended to cover the second kind of index this script must never auto-drop-and-recreate.
@@ -663,11 +718,34 @@ function makeCollectionDeps(
   ttlField?: string,
   protectedIndexes?: ProtectedIndexSpec[],
   ttlOptions?: MakeCollectionDepsTtlOptions,
+  runIdUniqueIndexName?: string,
 ): CollectionIndexDeps {
   return {
     label,
     collectionName,
     protectedIndexes,
+    runIdUniqueness: runIdUniqueIndexName
+      ? {
+          indexName: runIdUniqueIndexName,
+          // $match on runId existing FIRST - a sparse index (AgentRun) never indexes a document
+          // missing the field at all, so grouping those together would be a false positive
+          // (every historical document predating this field would collide as one giant "group").
+          // Approval's own runId has been required since the field was introduced, so this
+          // $match is a no-op there, but harmless and kept for symmetry/clarity.
+          countDuplicateGroups: async () => {
+            const result = await mongoose.connection
+              .db!.collection(collectionName)
+              .aggregate([
+                { $match: { runId: { $exists: true } } },
+                { $group: { _id: { tenantId: '$tenantId', runId: '$runId' }, count: { $sum: 1 } } },
+                { $match: { count: { $gt: 1 } } },
+                { $count: 'duplicateGroups' },
+              ])
+              .toArray();
+            return (result[0] as { duplicateGroups?: number } | undefined)?.duplicateGroups ?? 0;
+          },
+        }
+      : undefined,
     listCollectionNames: async () => {
       const collections = await mongoose.connection.db!.listCollections({ name: collectionName }).toArray();
       return collections.map((c) => c.name);
@@ -774,7 +852,10 @@ export function buildIndexPlans(
     // Deliberately updatedAt, not createdAt - see the module doc comment above ensureCollectionIndexes.
     makeCollectionDeps('Conversation', conversationModel, 'conversations', expireAfterSeconds, 'updatedAt'),
     makeCollectionDeps('Message', messageModel, 'messages', expireAfterSeconds, 'createdAt'),
-    makeCollectionDeps('AgentRun', agentRunModel, 'agentRuns', expireAfterSeconds, 'createdAt'),
+    // Stage 5 follow-up I1(c) - runIdUniqueIndexName gates the pre-check (checkNoDuplicateRunIdGroups)
+    // that refuses to create the NEW {tenantId, runId} unique index over data that already
+    // violates it - see agent-run.schema.ts's own doc comment for why this one is sparse.
+    makeCollectionDeps('AgentRun', agentRunModel, 'agentRuns', expireAfterSeconds, 'createdAt', undefined, undefined, AGENT_RUN_RUN_UNIQUE_INDEX_NAME),
     makeCollectionDeps('CustomerPublicKey', customerPublicKeyModel, 'customerPublicKeys', expireAfterSeconds),
     // Milestone 4 amendment C - its own retention period (APPROVAL_RETENTION_DAYS, default 90,
     // longer than CHAT_RETENTION_DAYS - an approval is an audit/compliance record), and the
@@ -797,6 +878,12 @@ export function buildIndexPlans(
         },
       ],
       { partialFilterExpression: { active: false } },
+      // Stage 5 follow-up I1(c) - see the AgentRun plan's own comment above; this index is NOT
+      // sparse here (Approval.runId has been required since the schema was first created), but
+      // the pre-check still runs - a duplicate pair here would mean this project's own
+      // pre-fix race (I1(a)) already happened for real, which is exactly worth surfacing, not
+      // assuming away.
+      APPROVAL_RUN_UNIQUE_INDEX_NAME,
     ),
   ];
 

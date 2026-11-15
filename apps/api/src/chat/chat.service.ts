@@ -168,13 +168,19 @@ async function raceTimeout<T>(promise: Promise<T>, ms: number): Promise<{ timedO
  *       eventual result is never persisted.
  *   12. persist the AgentRun, then the agent's reply message, then
  *       increment the conversation's messageCount by 2 (atomically bumping
- *       updatedAt too - the TTL clock). Stage 4 amendment C: when the
- *       result carries a proposedAction, the AgentRun write is retried
- *       once and, if it still fails, the customer gets a generic 503 and
- *       NO proposal at all - an approval nobody can see in the admin
- *       console must never silently "succeed". Every other write here
- *       (a non-proposal AgentRun, the agent message, the message-count
- *       increment) is best-effort: retried once, a distinct
+ *       updatedAt too - the TTL clock). Stage 4 amendment C, Stage 5 follow-up
+ *       I1(a): when the result carries a proposedAction, the single,
+ *       UNWRAPPED call to ApprovalProposalPort.createFromProposal already
+ *       owns its own one internal retry, scoped strictly to the persistence
+ *       phase (never anything after an Approval is committed - see
+ *       ApprovalService.createFromProposal's own doc comment for why
+ *       retrying more than that would be unsafe); if even that fails, the
+ *       customer gets a generic 503 and NO proposal at all - an approval
+ *       nobody can see in the admin console must never silently "succeed".
+ *       Every other write here (a non-proposal AgentRun, the agent message,
+ *       the message-count increment) is best-effort: retried once AT THIS
+ *       LAYER (chat.service.ts's own withOneRetry, safe here because none
+ *       of these writes can ever trigger a second refund), a distinct
  *       chat_persist_failed event logged (ids/codes only) on a second
  *       failure, but the real ChatResult is still returned to the customer.
  *   13. respond with the real ChatResult (including degraded, when set).
@@ -397,6 +403,7 @@ export class ChatService {
     const { tokensIn, tokensOut } = sumTokenUsage(trace.steps);
     const newRun: NewAgentRun = {
       tenantId,
+      runId: result.runId,
       conversationId,
       outcome: result.outcome,
       ...(result.degraded ? { degraded: result.degraded } : {}),
@@ -421,13 +428,14 @@ export class ChatService {
   }
 
   /**
-   * Stage 5 - runs whenever runAgent proposes a refund. Calls
-   * ApprovalProposalPort.createFromProposal exactly once (amendment C's mandatory-write policy
-   * now covers the WHOLE call, not just the AgentRun piece - see approval.service.ts's own doc
-   * comment on createApprovalRow for why retrying the whole call is safe), maps its disposition
-   * to the real customer-facing outcome, and never calls agentRunRepository.create itself for
-   * this path - the AgentRun write happens INSIDE createFromProposal, in the same transaction as
-   * any Approval row it creates (persistAgentRunForRun below is the callback that performs it).
+   * Stage 5 (follow-up I1(a)) - runs whenever runAgent proposes a refund. Calls
+   * ApprovalProposalPort.createFromProposal exactly ONCE, never wrapped in a retry at this
+   * layer - ApprovalService itself owns the one safe retry, scoped strictly to the persistence
+   * phase (see that method's own doc comment for why retrying anything past that point, from
+   * out here, would be unsafe). Maps the disposition it returns to the real customer-facing
+   * outcome, and never calls agentRunRepository.create itself for this path - the AgentRun
+   * write happens INSIDE createFromProposal, in the same transaction as any Approval row it
+   * creates (persistAgentRunForRun below is the callback that performs it).
    */
   private async persistRefundProposalAndRespond(
     tenantId: string,
@@ -460,6 +468,7 @@ export class ChatService {
     const { tokensIn, tokensOut } = sumTokenUsage(trace.steps);
     const baseRunFields = {
       tenantId,
+      runId: result.runId,
       conversationId,
       stepCount: trace.steps.length,
       llmCallCount: trace.llmCallCount,
@@ -482,8 +491,18 @@ export class ChatService {
       await agentRunRepository.create({ ...baseRunFields, outcome, refundDisposition }, session);
     };
 
-    const proposalWrite = await withOneRetry(() =>
-      this.approvalProposalPort!.createFromProposal(
+    // Stage 5 follow-up I1(a) - deliberately a single, UNWRAPPED call, never retried here.
+    // ApprovalService.createFromProposal owns its own one internal retry, scoped strictly to the
+    // persistence phase (the Approval+AgentRun write) - it already returns a safe, non-throwing
+    // result for every outcome past that point (including every auto-execute failure mode), so
+    // the only thing this call can still throw for is a persistence failure that survived its
+    // own internal retry too. Retrying THAT again from here would re-run the verifier against
+    // this run's own stale orderSnapshot after the persistence phase might have already
+    // committed - exactly the unsafe double-execution path this fix closes. See
+    // ApprovalService.createFromProposal's own doc comment for the full reasoning.
+    let proposalResult: CreateFromProposalResult;
+    try {
+      proposalResult = await this.approvalProposalPort.createFromProposal(
         {
           tenantId,
           runId: result.runId,
@@ -510,18 +529,17 @@ export class ChatService {
           now: this.clock(),
         },
         persistAgentRunForRun,
-      ),
-    );
-
-    if (!proposalWrite.ok) {
-      // Amendment C, extended to the whole proposal call (Stage 5) - an approval nobody can see,
-      // or an AgentRun with no corresponding real decision, must never silently "succeed" for
-      // the customer. No proposal reaches them at all.
-      this.logPersistFailed('agent_run_mandatory', tenantId, conversationId, proposalWrite.error);
+      );
+    } catch (err) {
+      // Amendment C, extended to the persistence phase of the proposal call (Stage 5) - an
+      // approval nobody can see, or an AgentRun with no corresponding real decision, must never
+      // silently "succeed" for the customer. No proposal reaches them at all. No retry here -
+      // ApprovalService already retried its own persistence phase once internally.
+      this.logPersistFailed('agent_run_mandatory', tenantId, conversationId, err);
       return this.error('PENDING_APPROVAL_WRITE_FAILED', 'Unable to record this request. Please try again.');
     }
 
-    const finalResult = this.buildFinalResultForDisposition(result, proposalWrite.value);
+    const finalResult = this.buildFinalResultForDisposition(result, proposalResult);
     return await this.finalizeResponse(tenantId, conversationId, finalResult, messageRepository, conversationRepository);
   }
 

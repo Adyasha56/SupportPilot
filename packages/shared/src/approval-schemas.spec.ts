@@ -106,18 +106,29 @@ describe('VerifierFailureCodeSchema', () => {
   });
 });
 
-describe('ApprovalDecisionRequestSchema', () => {
-  it('accepts approve/reject with an optional reasonCode', () => {
+describe('ApprovalDecisionRequestSchema (Stage 6, amendment I - a validated enum, never free text)', () => {
+  it('accepts approve with no reasonCode', () => {
     expect(ApprovalDecisionRequestSchema.safeParse({ decision: 'approve' }).success).toBe(true);
-    expect(ApprovalDecisionRequestSchema.safeParse({ decision: 'reject', reasonCode: 'policy mismatch' }).success).toBe(true);
+  });
+
+  it('accepts reject with a valid reasonCode', () => {
+    expect(ApprovalDecisionRequestSchema.safeParse({ decision: 'reject', reasonCode: 'POLICY_VIOLATION' }).success).toBe(true);
   });
 
   it('rejects a decision outside approve/reject', () => {
     expect(ApprovalDecisionRequestSchema.safeParse({ decision: 'maybe' }).success).toBe(false);
   });
 
-  it('rejects an overlong reasonCode', () => {
-    expect(ApprovalDecisionRequestSchema.safeParse({ decision: 'reject', reasonCode: 'x'.repeat(201) }).success).toBe(false);
+  it('rejects reject with NO reasonCode - it is required, not optional, for this decision', () => {
+    expect(ApprovalDecisionRequestSchema.safeParse({ decision: 'reject' }).success).toBe(false);
+  });
+
+  it('rejects approve WITH a reasonCode - there is nothing to justify approving', () => {
+    expect(ApprovalDecisionRequestSchema.safeParse({ decision: 'approve', reasonCode: 'OTHER' }).success).toBe(false);
+  });
+
+  it('rejects free text - reasonCode must be one of the validated enum values', () => {
+    expect(ApprovalDecisionRequestSchema.safeParse({ decision: 'reject', reasonCode: 'policy mismatch' }).success).toBe(false);
   });
 });
 

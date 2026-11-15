@@ -1,13 +1,18 @@
+import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { DuplicateActiveApprovalError, NewApproval } from '../../approvals/approval.repository';
+import { DuplicateActiveApprovalError, DuplicateRunApprovalError, NewApproval } from '../../approvals/approval.repository';
 import { InMemoryApprovalRepository } from './in-memory-approval.repository';
 
 const NOW = new Date('2026-11-09T00:00:00.000Z');
 
+// A fresh runId per call by default - most tests here are about the active-per-order
+// constraint, not the {tenantId, runId} one (Stage 5 follow-up I1(b)), and reusing one fixed
+// literal would collide with the NEWER constraint before the test ever reaches the one it's
+// actually exercising. Tests that DO care about the runId behavior pass an explicit runId.
 function newApproval(overrides: Partial<NewApproval> = {}): NewApproval {
   return {
     tenantId: 'acme',
-    runId: 'run_1',
+    runId: `run_${randomUUID()}`,
     conversationId: 'conv_1',
     orderId: 'ORD-1001',
     customerRef: 'cust_1',
@@ -48,6 +53,34 @@ describe('InMemoryApprovalRepository.create', () => {
     await repo.reject('acme', first.id, 'key_1', NOW);
     const second = await createPending(repo, { orderId: 'ORD-1001' });
     expect(second.id).not.toBe(first.id);
+  });
+
+  // Stage 5 follow-up I1(b)
+  describe('runId uniqueness', () => {
+    it('throws DuplicateRunApprovalError (never DuplicateActiveApprovalError) on a second create() for the same (tenantId, runId)', async () => {
+      const repo = new InMemoryApprovalRepository();
+      await createPending(repo, { runId: 'run_dup', orderId: 'ORD-1001' });
+
+      // A DIFFERENT order too - proves this is keyed on runId, not a side effect of the
+      // active-order check (which this wouldn't otherwise even trip, different orderId).
+      await expect(createPending(repo, { runId: 'run_dup', orderId: 'ORD-1002' })).rejects.toBeInstanceOf(DuplicateRunApprovalError);
+    });
+
+    it('the SAME runId is allowed again for a DIFFERENT tenant', async () => {
+      const repo = new InMemoryApprovalRepository();
+      await createPending(repo, { tenantId: 'acme', runId: 'run_shared', orderId: 'ORD-1001' });
+
+      await expect(createPending(repo, { tenantId: 'widgetco', runId: 'run_shared', orderId: 'ORD-1001' })).resolves.toBeTruthy();
+    });
+
+    it('findByRunId returns the existing record, scoped by tenant', async () => {
+      const repo = new InMemoryApprovalRepository();
+      const created = await createPending(repo, { tenantId: 'acme', runId: 'run_lookup' });
+
+      expect(await repo.findByRunId('acme', 'run_lookup')).toEqual(created);
+      expect(await repo.findByRunId('widgetco', 'run_lookup')).toBeNull();
+      expect(await repo.findByRunId('acme', 'run_nonexistent')).toBeNull();
+    });
   });
 });
 

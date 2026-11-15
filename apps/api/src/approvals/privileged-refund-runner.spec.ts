@@ -34,6 +34,7 @@ function approval(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
     decidedBy: null,
     decidedAt: null,
     reasonCode: null,
+    adminReasonCode: null,
     executionResultCode: null,
     expiresAt: new Date(),
     createdAt: new Date(),

@@ -15,8 +15,13 @@ describe('ApiKeySchema', () => {
     expect(doc.revokedAt).toBeNull();
   });
 
-  it('rejects a scope outside public/secret', async () => {
+  it('accepts the admin scope (Stage 6, amendment E)', async () => {
     const doc = new ApiKeyModel(validKeyData({ scopes: ['admin'] }));
+    await expect(doc.validate()).resolves.toBeUndefined();
+  });
+
+  it('rejects a scope outside public/secret/admin', async () => {
+    const doc = new ApiKeyModel(validKeyData({ scopes: ['superadmin'] }));
     const err = (await doc.validate().catch((e: mongoose.Error.ValidationError) => e)) as mongoose.Error.ValidationError;
     expect(err.errors['scopes.0']).toBeDefined();
   });

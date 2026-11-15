@@ -101,15 +101,42 @@ export const ApprovalDecisionSchema = z.enum(['approve', 'reject']);
 export type ApprovalDecision = z.infer<typeof ApprovalDecisionSchema>;
 
 /**
- * POST /v1/approvals/:id/decision's request body. `reasonCode` is a short,
- * free-text-ish note for the audit trail only (e.g. "customer called in") -
- * never shown to the customer, never interpreted by any code path, which is
- * why it's capped short rather than treated as a real message field.
+ * Milestone 4 Stage 6, amendment I - a validated enum, never free text, same discipline the
+ * approval entity itself already holds every other string field to (no free-text fields
+ * anywhere - see approval.schema.ts's own doc comment). An admin's reject reason is for the
+ * audit trail only; it is never shown to the customer and never interpreted by any code path
+ * beyond being recorded, but it is still a closed, reviewable vocabulary rather than an
+ * arbitrary string an admin UI could otherwise be tempted to echo back somewhere.
  */
-export const ApprovalDecisionRequestSchema = z.object({
-  decision: ApprovalDecisionSchema,
-  reasonCode: z.string().max(200).optional(),
-});
+export const ADMIN_DECISION_REASON_CODES = [
+  'CUSTOMER_WITHDREW_REQUEST',
+  'ALREADY_RESOLVED_OFFLINE',
+  'POLICY_VIOLATION',
+  'SUSPECTED_FRAUD',
+  'OTHER',
+] as const;
+export const AdminDecisionReasonCodeSchema = z.enum(ADMIN_DECISION_REASON_CODES);
+export type AdminDecisionReasonCode = z.infer<typeof AdminDecisionReasonCodeSchema>;
+
+/**
+ * POST /v1/approvals/:id/decision's request body. `reasonCode` is REQUIRED for `reject` (an
+ * admin must always record why) and must be OMITTED for `approve` (there is no "reason" to
+ * approve something - the verifier's own re-check is what actually decides whether an approval
+ * is allowed to proceed). Enforced below, not left to the controller to check by hand.
+ */
+export const ApprovalDecisionRequestSchema = z
+  .object({
+    decision: ApprovalDecisionSchema,
+    reasonCode: AdminDecisionReasonCodeSchema.optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.decision === 'reject' && value.reasonCode === undefined) {
+      ctx.addIssue({ code: 'custom', message: 'reasonCode is required when decision is reject', path: ['reasonCode'] });
+    }
+    if (value.decision === 'approve' && value.reasonCode !== undefined) {
+      ctx.addIssue({ code: 'custom', message: 'reasonCode must be omitted when decision is approve', path: ['reasonCode'] });
+    }
+  });
 export type ApprovalDecisionRequest = z.infer<typeof ApprovalDecisionRequestSchema>;
 
 /**
@@ -149,6 +176,8 @@ export const ApprovalRecordSchema = z.object({
   citations: z.array(z.string()),
   status: ApprovalStatusSchema,
   reasonCode: VerifierFailureCodeSchema.optional(),
+  /** Stage 6, amendment I - only present on a rejected approval; the admin's own validated reason, distinct from `reasonCode` above (the verifier's own denial vocabulary). */
+  adminReasonCode: AdminDecisionReasonCodeSchema.optional(),
   executionResultCode: ExecutionResultCodeSchema.optional(),
   failureClass: RefundExecutionFailureClassSchema.optional(),
   /** F4 - whether the refund might actually have been applied upstream, independent of whether WE can retry it. */

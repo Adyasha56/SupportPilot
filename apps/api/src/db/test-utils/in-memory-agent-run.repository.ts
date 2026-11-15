@@ -1,10 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { AgentRunRecord, AgentRunRepository, NewAgentRun } from '../agent-run.repository';
+import { AgentRunRecord, AgentRunRepository, DuplicateAgentRunError, NewAgentRun } from '../agent-run.repository';
 
 export class InMemoryAgentRunRepository implements AgentRunRepository {
   private readonly runs: AgentRunRecord[] = [];
 
   async create(run: NewAgentRun): Promise<AgentRunRecord> {
+    if (this.runs.some((r) => r.tenantId === run.tenantId && r.runId === run.runId)) {
+      throw new DuplicateAgentRunError(run.runId);
+    }
     const record: AgentRunRecord = {
       id: randomUUID(),
       ...run,
@@ -21,6 +24,10 @@ export class InMemoryAgentRunRepository implements AgentRunRepository {
     return this.runs
       .filter((r) => r.tenantId === tenantId && r.conversationId === conversationId)
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  }
+
+  async findByRunId(tenantId: string, runId: string): Promise<AgentRunRecord | null> {
+    return this.runs.find((r) => r.tenantId === tenantId && r.runId === runId) ?? null;
   }
 
   async deleteForTenant(tenantId: string): Promise<void> {
