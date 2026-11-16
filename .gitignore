@@ -40,6 +40,10 @@ coverage/
 # mint-customer-token's local throwaway Ed25519 private keys - never committed
 .customer-keys/
 
+# docs/manual-testing.md section 2's own local connector-fixture copies (tenantId/baseUrl
+# rewritten to point at a developer's own localhost mock store) - machine-local, never committed
+.manual-connectors/
+
 # Local-only project docs (kept in codebase, never pushed)
 /CLAUDE.md
 /PROJECT.md
