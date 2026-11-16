@@ -263,7 +263,35 @@ $env:SP_ADMIN_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.
 
 Every command below reads `$env:SP_ADMIN_KEY` - the raw value never appears in any command.
 
-### 8b. List approvals
+### 8b. (demo-only) Seed a pending approval without the model
+
+Section 4d needs the real model to propose a refund - useful when it's working, useless when it
+isn't (no key, offline, free-tier quota used up). `seed-demo-approval` is a **demo-only developer
+helper**, never shipped in the production image (it lives under `dev-scripts/`, compiled
+separately via `build:dev-scripts`, excluded from `nest build`'s own output entirely), that gets
+you the same real `pending_approval` row a chat turn would, without the model: it fetches the
+order through the exact same `ReadOnlyToolRunner` the real admin route uses, then calls the REAL
+`ApprovalService.createFromProposal` - the verifier, the active-per-order unique index, and the
+real transaction all run exactly as they would from a genuine chat turn. It is not a shortcut that
+writes fake data directly to the database.
+
+It needs a real citation `chunkKey` as an argument (copy one from the policy you uploaded in
+section 3c - the verifier's own citation rule requires at least one, and this tool has no
+retrieval step of its own to produce one):
+
+```powershell
+pnpm --filter @supportpilot/api run build:dev-scripts
+pnpm --filter @supportpilot/api run seed-demo-approval -- --tenantId=smoke-local --customerRef=cust_1 --orderId=ORD-1001 --amount=49.99 --chunkKey=<a real chunkKey from your uploaded policy>
+```
+
+It prints exactly three lines - the new approval's id, the disposition (`pending_approval`,
+`denied`, `already_pending`, or `auto_executed`), and any failed rule codes - nothing else. Copy
+the printed `approvalId` into `$env:SP_APPROVAL_ID` and continue with section 8c below exactly as
+if section 4d had produced it, because as far as the database is concerned, it did: the
+`AgentRun` this writes is clearly marked as synthetic too (`runId` prefixed `demo_seed_`), so it
+can never be mistaken for a real customer interaction in the database or a future admin console.
+
+### 8c. List approvals
 
 ```powershell
 Invoke-RestMethod -Uri "http://localhost:3000/v1/approvals" -Headers @{ Authorization = "Bearer $env:SP_ADMIN_KEY" } -Method Get | ConvertTo-Json -Depth 6
@@ -276,13 +304,13 @@ Filter by status (`pending`, `executing`, `executed`, `failed`, `rejected`, or t
 Invoke-RestMethod -Uri "http://localhost:3000/v1/approvals?status=pending&limit=10" -Headers @{ Authorization = "Bearer $env:SP_ADMIN_KEY" } -Method Get | ConvertTo-Json -Depth 6
 ```
 
-Copy the `id` of the approval section 4d's refund request created:
+Copy the `id` of the approval section 4d's refund request (or section 8b's seeded one) created:
 
 ```powershell
 $env:SP_APPROVAL_ID = "<paste the id here>"
 ```
 
-### 8c. Get one approval
+### 8d. Get one approval
 
 ```powershell
 Invoke-RestMethod -Uri "http://localhost:3000/v1/approvals/$env:SP_APPROVAL_ID" -Headers @{ Authorization = "Bearer $env:SP_ADMIN_KEY" } -Method Get | ConvertTo-Json -Depth 6
@@ -291,7 +319,7 @@ Invoke-RestMethod -Uri "http://localhost:3000/v1/approvals/$env:SP_APPROVAL_ID" 
 A 404 here means either the id doesn't exist at all, or it belongs to a different tenant than
 this key - the response body is deliberately identical either way.
 
-### 8d. Approve
+### 8e. Approve
 
 ```powershell
 Invoke-RestMethod -Uri "http://localhost:3000/v1/approvals/$env:SP_APPROVAL_ID/decision" -Headers @{ Authorization = "Bearer $env:SP_ADMIN_KEY" } -Method Post -ContentType "application/json" -Body (@{ decision = "approve" } | ConvertTo-Json)
@@ -304,7 +332,7 @@ with `status: "failed"` and a `reasonCode` instead means the decision-time re-ch
 (e.g. the order changed since it was proposed) - this is a successfully processed decision, not
 an error.
 
-### 8e. Reject
+### 8f. Reject
 
 `reasonCode` is required and must be one of the fixed enum values - never free text:
 
@@ -315,9 +343,9 @@ Invoke-RestMethod -Uri "http://localhost:3000/v1/approvals/$env:SP_APPROVAL_ID/d
 Valid `reasonCode` values: `CUSTOMER_WITHDREW_REQUEST`, `ALREADY_RESOLVED_OFFLINE`,
 `POLICY_VIOLATION`, `SUSPECTED_FRAUD`, `OTHER`. A `409 AMBIGUOUS_RETRY_REQUIRED` here means the
 last execution attempt was ambiguous (it may have already succeeded upstream) - rejecting would
-falsely claim "we decided not to" when it might have already happened. Retry (8f) instead.
+falsely claim "we decided not to" when it might have already happened. Retry (8g) instead.
 
-### 8f. Retry
+### 8g. Retry
 
 A retry is just another `approve` call on the same id - no separate endpoint. It is safe to run
 as many times as needed: a `failed`-but-`retryable` row reuses the exact same idempotency key on
@@ -331,14 +359,14 @@ If you instead get `409 IN_PROGRESS`, another attempt is still within its execut
 (`APPROVAL_EXECUTION_LEASE_MS`, 60s by default) - wait for it to pass and try again; the lease
 expiring is what allows this same call to take the row over.
 
-### 8g. Other response codes you may see
+### 8h. Other response codes you may see
 
 | Status | Code | What it means |
 |---|---|---|
 | 400 | `INVALID_REQUEST` | Malformed body - an unrecognized `reasonCode`, or `reasonCode` sent with `decision: "approve"` |
 | 401 | (uniform, no code distinction) | Missing key, invalid key, or a key without the `admin` scope - all three look identical on purpose |
 | 404 | (no body code) | The id doesn't exist for this tenant |
-| 409 | `ALREADY_DECIDED` | The row already reached a terminal state since you last looked - re-run 8b or 8c |
+| 409 | `ALREADY_DECIDED` | The row already reached a terminal state since you last looked - re-run 8c or 8d |
 | 409 | `EXPIRED` | Was still `pending` but past its own `expiresAt` - now written to `expired` as a result of this call |
 | 429 | `RATE_LIMITED` | Too many decision attempts from this key too quickly - `retryAfterSeconds` says how long to wait |
 | 502 | `ORDER_FETCH_FAILED` | The decision-time order re-check itself couldn't complete (connector down/timed out) - **no state changed**, just try again shortly |
