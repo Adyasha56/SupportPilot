@@ -1,5 +1,103 @@
 # Learning notes
 
+## Milestone 4, Stage 6 — the admin decision API, and five real CI-round bugs caught by actually running it (2026-11-15)
+
+**What was built**: `ApprovalsController` (`GET /v1/approvals`, `GET /v1/approvals/:id`,
+`POST /v1/approvals/:id/decision`), gated by a new `admin` scope strictly above `secret`/`public`
+(`ApiKeyGuard`'s `scopeSatisfies` became a rank comparison - `public=0, secret=1, admin=2` - rather
+than a two-way hardcoded check). The decision route wires the real `ApprovalService.decide()` with
+a fresh-order re-fetch through the already risk-gated `ReadOnlyToolRunner`, a per-apiKeyId rate
+limiter, ids-and-codes-only audit logging, and a best-effort customer follow-up message append.
+`create-api-key.ts --scope=admin` is the interim way to mint one, same role `--scope=secret`
+already played for policies/connectors before a real login existed.
+
+### Five real bugs, found only once this actually ran against Atlas Local, not from reading the code
+
+A static review (typecheck, lint, careful reading) of every new file passed clean before any of
+this ran against a real database. None of the five bugs below were visible from that review alone
+- each needed the real control flow or real request timing to surface, which is the whole reason
+this project insists on a real-database CI job rather than trusting unit tests (fakes) alone for
+this kind of work.
+
+1. **A pre-existing Stage 3 file never updated for the Stage 5 `{tenantId, runId}` unique index.**
+   `approval-persistence.integration-spec.ts`'s own fixture helper used a fixed `runId: 'run_1'`
+   literal across MULTIPLE `repository.create()` calls for the same tenant (deliberately, to
+   exercise the ACTIVE-order index) - which now also collided with the newer run-uniqueness index,
+   masking the real `DuplicateActiveApprovalError` the test was actually checking for behind an
+   unrelated `DuplicateRunApprovalError`. This is the same class of regression already fixed in
+   three OTHER fixtures during the I1 work (see the entry below) - this file was simply missed,
+   because it predates this session and nothing flagged it until CI actually ran it. Fixed the
+   same way: a fresh `randomUUID()`-based runId per call, not a literal.
+2. **A wrong assumption about the guard's own status code.** A new scope-matrix test assumed a
+   `secret`-scope key hitting an `admin`-only route would get `403`. The guard's own design (and
+   its own doc comment) deliberately collapses EVERY auth failure - missing key, invalid key,
+   insufficient scope - into one generic `401`, specifically so a probing caller can never tell
+   "wrong scope" apart from "no key at all." The test was wrong, not the guard; fixed the
+   assertion, not the code.
+3. **A genuine controller bug: a read with a side effect, used where a pure read was needed.**
+   `ApprovalsController.decide()` pre-fetched the row via `approvalService.getById()` to build the
+   audit log's `fromStatus` - but that method performs LAZY EXPIRY as a side effect, by design, for
+   the admin GET routes (amendment F2: a stale pending-but-past-`expiresAt` row self-heals the
+   moment anyone looks at it). Calling it from INSIDE `decide()`, before `decide()` itself ever ran,
+   silently flipped the row to `'expired'` first - so the real `decide()` call then saw an
+   already-terminal row and returned `ALREADY_DECIDED` instead of performing the real
+   pending-expiry transition and returning `EXPIRED`. Fixed by using the plain,
+   side-effect-free `ApprovalRepository.findById()` for that one pre-check instead - re-adding the
+   very dependency injection I had, earlier in the same session, removed as "unused."
+4. **A real product design (not a bug) that a test needed to work around.**
+   `CUSTOMER_REF_RATE_LIMITER` buckets by the raw `customerRef` string GLOBALLY, never scoped by
+   tenant (PROJECT.md's Stage 4 amendment B, intentional abuse-prevention: a customer could
+   otherwise reuse the same ref across many different tenant signups to amplify a flood). Since
+   every seeded order's owner is a FIXED customerRef (`ORD-1001` → `cust_1`), a 13-test admin-API
+   file that mostly reused `ORD-1001` for its non-executing scenarios also reused `cust_1` 9+
+   times, tripping the real 10-per-60s default right around the 10th/11th `/v1/chat` call -
+   surfacing as two unrelated-looking failures (`res.body.outcome` simply `undefined`, because the
+   response was a `429` the test never checked for). Fixed by overriding that one limiter to a
+   generous value in this file's own test harness, the same precedent `chat.controller.spec.ts`
+   already set for its own unit tests - not by touching the real rate-limiter design.
+5. **A test's own missing field, not a product bug.** The canary-string test's `planOutput` omitted
+   `needsPolicy`/`searchQuery` (present in every OTHER test in the file). Without a real retrieve
+   step, the cited chunk key is correctly re-checked against an EMPTY actually-retrieved set and
+   dropped - exactly the citation-forging defense PROJECT.md's retrieval contract describes - so
+   the verifier's citation rule failed, the proposal was `denied` with no Approval row at all, and
+   `approvalId` ended up `undefined`. The resulting 404 looked like a product bug from the test
+   output alone; it was the test silently proving its OWN precondition wrong. Fixed by adding the
+   missing fields and an explicit `pending_approval` assertion right after the chat call, so a
+   future regression here fails loudly at the real cause instead of several lines later as a
+   confusing 404.
+
+### Two review notes caught before they became real gaps (not CI failures - a second pair of eyes)
+
+- **`Promise.all` does not prove two requests genuinely overlapped inside the database.** The
+  original concurrent-double-approve test asserted the loser always got `409 IN_PROGRESS` - but
+  `Promise.all` only guarantees both requests are FIRED without a deliberate gap; real network and
+  driver timing could just as easily let the first request run to full completion (including
+  `markExecuted`) before the second one's own `findOneAndUpdate` ever reaches Mongo, in which case
+  the loser would correctly see `409 ALREADY_DECIDED` instead. Both outcomes are correct; the test
+  was asserting a stronger claim than the technique could actually prove. Fixed to accept either
+  code, and to assert the one invariant that's actually true under EITHER timing: the mock store's
+  own ledger shows exactly one real refund, never doubled.
+- **A whole scenario was simply missing.** Nothing exercised "the decision-time fresh-order
+  re-fetch itself fails" (a `TIMEOUT`/`CONFIG_ERROR`/etc. from the read-only tool runner, mapped to
+  `FETCH_FAILED`, never confused with the order genuinely not existing) at the integration level -
+  only the unit-level fake in `approval.service.spec.ts` covered it. Added
+  `approvals-admin-decision-order-fetch-failed.integration-spec.ts`: points `get_order`'s connector
+  at a hanging stub AFTER a healthy proposal already exists, asserts `502 ORDER_FETCH_FAILED`, the
+  row's `status`/`attemptCount` are completely untouched (never reached `beginExecution`), the mock
+  store's ledger shows zero upstream calls, and - restoring the connector - that the exact same
+  approval is still fully decidable afterward, proving "no state change" really held.
+
+**Interview Q&A**: *"You had a clean typecheck, a clean lint, and a careful read-through before any
+of this touched a real database - why run it against one at all?"* - Because every one of the five
+bugs above was invisible to that review. Two were about REAL TIMING (a lazy side-effect firing at
+exactly the wrong moment relative to a later read; a global rate limiter's bucket filling up after
+enough real HTTP round-trips) that no static analysis simulates. One was a stale fixture in a file
+nobody had reason to re-open. A fake `LlmProvider` and an in-memory repository can prove your logic
+is internally consistent; only a real database, a real HTTP server, and a real clock can prove it
+behaves correctly when time, concurrency, and a previous request's side effects are all real too -
+which is exactly why this project keeps a real-database CI job at all, rather than trusting the
+unit suite alone for anything touching persistence, timing, or concurrency.
+
 ## Milestone 4, Stage 5 follow-up I1 — a real double-refund hazard, found by someone asking exactly what the retry wrapped (2026-11-14)
 
 **What was wrong**: `chat.service.ts`'s `withOneRetry(() => this.approvalProposalPort!.createFromProposal(...))` wrapped the ENTIRE `createFromProposal` call - including the auto-execute continuation (`beginExecution` → the real privileged refund call → `markExecuted`/`markFailed`), which sits AFTER the Approval+AgentRun transaction has already committed. Neither `beginExecution` nor `executeApproval`'s own `markExecuted`/`markFailed` calls were wrapped in a try/catch - a genuine infra exception from either (a real, uncaught possibility: they're real async Mongo writes) would propagate all the way out of `createFromProposal`, get caught by the outer `withOneRetry`, and trigger a SECOND, full, from-scratch call. That second call re-runs the verifier against `input.orderSnapshot` - captured once, at the very start of the request, and never re-fetched. For a **partial** refund specifically, the stale snapshot's `remainingRefundable` never reflects money the FIRST attempt already moved, so the verifier would pass again, a second Approval could be created, and the privileged runner could be asked to issue a second real refund - the exact danger a repository README or test suite would never catch just by reading the final behavior, only by someone asking "what, precisely, does this retry cover?"
