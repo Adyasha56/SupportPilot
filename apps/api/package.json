@@ -26,7 +26,8 @@
     "generate-schema-check": "node --env-file-if-exists=.env dist-dev/dev-scripts/generate-schema-check.js",
     "agent-pipeline-smoke-test": "node --env-file-if-exists=.env dist-dev/dev-scripts/agent-pipeline-smoke-test.js",
     "latency-probe": "node --env-file-if-exists=.env dist-dev/dev-scripts/latency-probe.js",
-    "mint-customer-token": "node --env-file-if-exists=.env dist-dev/dev-scripts/mint-customer-token.js"
+    "mint-customer-token": "node --env-file-if-exists=.env dist-dev/dev-scripts/mint-customer-token.js",
+    "seed-demo-approval": "node --env-file-if-exists=.env dist-dev/dev-scripts/seed-demo-approval.js"
   },
   "dependencies": {
     "@google/genai": "2.31.0",
