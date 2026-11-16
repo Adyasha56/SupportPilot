@@ -11,6 +11,8 @@ one place that collects all of them together.
 
 Every in-memory guard in this project - the per-IP/per-key/per-tenant/per-
 customerRef rate limiters (`apps/api/src/auth/rate-limiter.ts`), the
+per-apiKeyId limiter on the admin decision route
+(`apps/api/src/approvals/approval-decision-rate-limiter.provider.ts`), the
 in-flight-run limiter and conversation lock
 (`apps/api/src/chat/in-flight-run-limiter.ts`, `conversation-lock.ts`), the
 daily generate-budget guards (`apps/api/src/agent/loop/daily-generate-
@@ -164,14 +166,40 @@ flagged as a real, surfaced product question with a concrete example
 resolved on the strength of one person's intuition about what "should"
 happen.
 
-## Admin decision retry still has no HTTP route (Stage 6 gap)
+## TTL retention vs. a long-unresolved retryable-failed Approval
 
-`approvals-auto-execute-timeout.integration-spec.ts`'s own retry step calls
-`app.get(ApprovalService).decide(...)` directly rather than through an HTTP
-request, because `POST /v1/approvals/:id/decision` does not exist yet - the
-admin API (Stage 6: the controller, the `admin` scope, the decision-flow
-error codes) is still unbuilt. The underlying `ApprovalService.decide()`
-behavior this exercises (a retryable `failed` row, re-approved with no
-re-verification, reusing the same idempotency key) is real and proven
-against a real database; only the HTTP surface for an admin to trigger it
-is missing. Resolved once Stage 6 ships.
+`Approval`'s TTL index (`APPROVAL_RETENTION_DAYS`, default 90) fires on
+`createdAt` regardless of status. A `failed` row that is `retryable: true`
+(an ambiguous upstream outcome - timeout, network error, 5xx) has no expiry
+of its own (only `pending` rows are ever written to `expired` by
+`approveFromPending`'s own expiry check) - so one left unresolved long
+enough is silently deleted by the TTL, taking its idempotency key with it.
+At that point a retry is no longer possible at all; the admin would simply
+see the row vanish from `GET /v1/approvals`, with nothing left to act on.
+`approvalExpiryDays`'s short default (7) only governs the `pending`-side
+expiry path, nowhere near the 90-day TTL window - it is specifically the
+retryable-`failed` path operators need to not leave unattended for months.
+No scheduled reconciliation sweep or alert exists for this; an admin
+noticing and retrying (safe, idempotent, via the real decision route) is
+the only recovery path today, and that path itself eventually stops being
+available once the TTL is reached. Accepted as a documented gap, not a bug
+to fix now - a real fix would need either a longer/separate retention rule
+for non-terminal rows, or active alerting, both future scope.
+
+## An unexpected infra fault during admin decision execution returns a bare 500
+
+`ApprovalService.executeApproval`'s own `markExecuted`/`markFailed` calls
+are not wrapped in a try/catch - a genuinely unexpected failure there (a
+Mongo write timeout, for example, after the real refund already succeeded
+upstream) propagates uncaught through `ApprovalsController.decide()` and
+surfaces as Nest's own default `500` body, never this project's
+`{statusCode, code, message}` contract. This is deliberate, not an
+oversight: the one real safety property - the approval is left in whatever
+state the exception found it (never falsely marked `executed`, never
+silently retried from scratch) - already holds without a catch block here,
+and a later admin retry (once the lease expires) is what actually
+reconciles it, exactly as proven by
+`approvals-markexecuted-reconciliation.integration-spec.ts`. Giving this
+one failure mode its own clean HTTP shape would be straightforward but was
+not judged worth the extra code for a path that, by construction, never
+loses money or state - only the HTTP response's own politeness.

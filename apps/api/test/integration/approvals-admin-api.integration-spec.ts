@@ -425,21 +425,30 @@ describe.skipIf(!integrationTestsEnabled())('Admin approvals API (integration, r
     expect(orderBody.alreadyRefundedTotal).toBe(5); // only the out-of-band amount - the approval's own 20 was never sent
   });
 
-  it('a deterministic concurrent double approve (ORD-1006, no sleeps): exactly one execution and one 409 IN_PROGRESS', async () => {
+  it('a concurrent double approve (ORD-1006, no sleeps): AT MOST one real refund, ever, regardless of how the race actually resolves', async () => {
     const tenant = await newTenant();
     const adminKey = (await createApiKeyFixture(uri, tenant.tenantId, 'admin')).rawKey;
     const { approvalId } = await proposeRefund(tenant, 'ORD-1006', 500, 'cust_3');
 
+    // Promise.all fires both requests without any gap, but it does NOT prove they genuinely
+    // overlapped inside the database - Node's event loop and the real network/driver timing
+    // could just as easily let the first request run to full completion (including markExecuted)
+    // before the second one's own findOneAndUpdate ever reaches Mongo. Both outcomes are
+    // CORRECT and must both be accepted: a genuine overlap loses the race on beginExecution's own
+    // atomic update and sees 409 IN_PROGRESS; a fully serialized second attempt instead finds the
+    // row already 'executed' and sees 409 ALREADY_DECIDED. What this test actually proves - the
+    // one invariant true under EITHER timing - is the mock store's own ledger: exactly one real
+    // refund landed, never two, no matter which way the race fell.
     const [first, second] = await Promise.all([decide(adminKey, approvalId, { decision: 'approve' }), decide(adminKey, approvalId, { decision: 'approve' })]);
 
     const statuses = [first.status, second.status].sort();
     expect(statuses).toEqual([200, 409]);
     const loser = first.status === 409 ? first : second;
-    expect(loser.body.code).toBe('IN_PROGRESS');
+    expect(['IN_PROGRESS', 'ALREADY_DECIDED']).toContain(loser.body.code);
 
     const orderRes = await fetch(`${mockStore.baseUrl}/orders/ORD-1006`, { headers: { Authorization: `Bearer ${MOCK_STORE_TOKEN}` } });
     const orderBody = (await orderRes.json()) as { alreadyRefundedTotal: number };
-    expect(orderBody.alreadyRefundedTotal).toBe(500); // exactly one execution, never doubled
+    expect(orderBody.alreadyRefundedTotal).toBe(500); // exactly one execution, never doubled, regardless of how the race actually resolved
   });
 
   it('approve on pending (ORD-1001): runs the verifier once against fresh order data, executes the real refund exactly once, and the admin sees executed', async () => {
