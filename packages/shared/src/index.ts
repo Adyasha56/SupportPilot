@@ -9,3 +9,4 @@ export * from './policy-document.schema';
 export * from './retrieval.schema';
 export * from './tool-schemas';
 export * from './connector-config.schema';
+export * from './conversation-messages-schemas';

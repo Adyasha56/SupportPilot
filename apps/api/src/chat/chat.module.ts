@@ -14,8 +14,11 @@ import { readOnlyToolRunnerProvider } from './read-only-tool-runner.provider';
 import { tenantRateLimiterProvider, customerRefRateLimiterProvider } from './rate-limiters.provider';
 import { conversationLockProvider } from './conversation-lock.provider';
 import { inFlightRunLimiterProvider } from './in-flight-run-limiter.provider';
+import { pollRateLimiterProvider } from './poll-rate-limiter.provider';
 import { ChatController } from './chat.controller';
 import { ChatService } from './chat.service';
+import { ConversationMessagesController } from './conversation-messages.controller';
+import { ConversationMessagesService } from './conversation-messages.service';
 
 /**
  * A plain, exported function - not an inline expression - same reasoning
@@ -54,7 +57,7 @@ export function chatDatabaseImportsFor(env: NodeJS.ProcessEnv): [typeof Database
  */
 @Module({
   imports: [LlmModule, RetrievalModule, ToolRunnerModule, ConnectorsModule, ApprovalsModule, ...chatDatabaseImportsFor(process.env)],
-  controllers: [ChatController],
+  controllers: [ChatController, ConversationMessagesController],
   providers: [
     ApiKeyGuard,
     chatApiKeyGuardSettingsProvider,
@@ -67,7 +70,9 @@ export function chatDatabaseImportsFor(env: NodeJS.ProcessEnv): [typeof Database
     customerRefRateLimiterProvider,
     conversationLockProvider,
     inFlightRunLimiterProvider,
+    pollRateLimiterProvider,
     ChatService,
+    ConversationMessagesService,
   ],
 })
 export class ChatModule {}

@@ -15,6 +15,8 @@ per-apiKeyId limiter on the admin decision route
 (`apps/api/src/approvals/approval-decision-rate-limiter.provider.ts`), the
 in-flight-run limiter and conversation lock
 (`apps/api/src/chat/in-flight-run-limiter.ts`, `conversation-lock.ts`), the
+widget polling endpoint's own per-conversation rate limiter (Milestone 5,
+`apps/api/src/chat/poll-rate-limiter.provider.ts`), the
 daily generate-budget guards (`apps/api/src/agent/loop/daily-generate-
 budget.ts`), the circuit breaker inside `GeminiLlmProvider`, and the
 ingestion per-tenant busy-lock - holds its state in a single Node process's
@@ -185,6 +187,31 @@ the only recovery path today, and that path itself eventually stops being
 available once the TTL is reached. Accepted as a documented gap, not a bug
 to fix now - a real fix would need either a longer/separate retention rule
 for non-terminal rows, or active alerting, both future scope.
+
+## The admin SPA fallback absorbs a denied/traversal static request into the ordinary shell response
+
+`express.static`'s default `fallthrough: true` (never overridden by
+`registerAdminStaticAssets`, `apps/api/src/common/admin-static.ts`) means a
+dotfile denial (`dotfiles: 'deny'`) or a `..`-style traversal attempt under
+`/admin/*` never reaches the client as its own distinct error - the
+underlying `send` stream's error event is swallowed by `serve-static`
+(confirmed directly against this project's installed `serve-static@2.2.1`/
+`send@1.2.1`: `forwardError` only becomes true once a real file was already
+found, so a 403/404 from `send` takes the `next()` branch, not `next(err)`)
+and falls through to `adminSpaFallback`, which - exactly as designed for a
+legitimate client-routed deep link - serves the SPA's own `index.html` with
+a plain `200`. The actual security property (the dotfile's or the
+traversal target's own content is never returned) still holds, verified
+empirically by `apps/api/test/static-serving.e2e-spec.ts`; what does NOT
+hold is a caller being able to distinguish "this path was denied" from "this
+is just an unmapped client route" by status code alone - both look like an
+ordinary 200 SPA-shell response. Accepted as the correct trade-off for an
+SPA fallback (disabling `fallthrough` would also break the legitimate
+deep-link case the fallback exists for), not a content-exposure risk - but
+worth knowing if a future admin-console security review goes looking for a
+403/404 here and doesn't find one. The widget's own static root
+(`widget-static.ts`) has no such fallback registered after it, so the
+identical attempts there DO surface as a plain, distinguishable 404.
 
 ## An unexpected infra fault during admin decision execution returns a bare 500
 

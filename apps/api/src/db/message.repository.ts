@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { Model, Types } from 'mongoose';
 import { MessageDocument, MessageRole } from './schemas/message.schema';
 
 export interface MessageRecord {
@@ -12,10 +12,24 @@ export interface MessageRecord {
   createdAt: Date;
 }
 
+/** Milestone 5, Stage 1a, amendment A6 - the keyset-pagination tie-breaker (message-cursor.ts's own MessageCursor, re-declared here so this file has no dependency on the chat module). */
+export interface MessagePageCursor {
+  createdAtMs: number;
+  id: string;
+}
+
 export interface MessageRepository {
   create(tenantId: string, conversationId: string, role: MessageRole, content: string): Promise<MessageRecord>;
   /** Last `limit` messages for this conversation, oldest first - the history window run-agent.ts's HistoryTurn[] is built from. */
   findRecentForConversation(tenantId: string, conversationId: string, limit: number): Promise<MessageRecord[]>;
+  /**
+   * Oldest-first page of messages strictly AFTER `after` (undefined = from
+   * the beginning), bounded by `limit` - the widget polling endpoint's own
+   * read path (apps/api/src/chat/conversation-messages.service.ts). Served
+   * entirely from the EXISTING `{tenantId:1, conversationId:1, createdAt:1}`
+   * index (message.schema.ts) - no new index.
+   */
+  findPageForConversation(tenantId: string, conversationId: string, after: MessagePageCursor | undefined, limit: number): Promise<MessageRecord[]>;
   /** Test/ops cleanup only. */
   deleteForTenant(tenantId: string): Promise<void>;
 }
@@ -54,7 +68,30 @@ export class MongooseMessageRepository implements MessageRepository {
     return docs.map((doc) => toRecord(doc as unknown as MessageDocument)).reverse();
   }
 
+  async findPageForConversation(tenantId: string, conversationId: string, after: MessagePageCursor | undefined, limit: number): Promise<MessageRecord[]> {
+    const filter: Record<string, unknown> = { tenantId, conversationId };
+
+    // A cursor whose `id` half isn't a valid ObjectId (corrupted/forged)
+    // is treated exactly like no cursor at all (message-cursor.ts's own
+    // "never throws" rule, carried through here) - never a 500.
+    const afterObjectId = after ? toObjectIdOrUndefined(after.id) : undefined;
+    if (after && afterObjectId) {
+      filter.$or = [{ createdAt: { $gt: new Date(after.createdAtMs) } }, { createdAt: new Date(after.createdAtMs), _id: { $gt: afterObjectId } }];
+    }
+
+    const docs = await this.model.find(filter).sort({ createdAt: 1, _id: 1 }).limit(limit).lean();
+    return docs.map((doc) => toRecord(doc as unknown as MessageDocument));
+  }
+
   async deleteForTenant(tenantId: string): Promise<void> {
     await this.model.deleteMany({ tenantId });
+  }
+}
+
+function toObjectIdOrUndefined(id: string): Types.ObjectId | undefined {
+  try {
+    return new Types.ObjectId(id);
+  } catch {
+    return undefined;
   }
 }

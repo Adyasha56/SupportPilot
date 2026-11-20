@@ -1,6 +1,8 @@
 import { ChatRequest } from '@supportpilot/shared';
 import { verifyCustomerToken } from '../agent/identity/customer-token';
 import { ApiKeyScope } from '../db/schemas/api-key.schema';
+import { CustomerPublicKeyRepository } from '../db/customer-public-key.repository';
+import { peekUnverifiedKid } from './unverified-kid';
 
 /**
  * Stage 4 amendment A - a customer token that is PRESENT but fails
@@ -57,4 +59,35 @@ export function resolveIdentity(
     return { kind: 'invalid_token' };
   }
   return { kind: 'identified', customerRef: verified.payload.customerRef };
+}
+
+/**
+ * Milestone 5, Stage 1a - the same synchronous-lookupPublicKey wiring
+ * chat.service.ts's own resolveIdentityAsync performs (kept there
+ * unchanged, to avoid touching tested Milestone 3/4 code for an unrelated
+ * stage), factored out here so the new widget read endpoint
+ * (conversation-messages.service.ts) can resolve identity the exact same
+ * way without a second, drifting copy of the token-verification rules
+ * themselves - only this thin async/repository-lookup glue is duplicated,
+ * never resolveIdentity's own logic.
+ */
+export async function resolveIdentityWithLookup(
+  scope: ApiKeyScope,
+  request: Pick<ChatRequest, 'customerRef' | 'customerToken'>,
+  tenantId: string,
+  customerPublicKeyRepository: CustomerPublicKeyRepository,
+  clock: () => Date,
+): Promise<IdentityResolution> {
+  let cachedKid: number | undefined;
+  let cachedPublicKeyX: string | undefined;
+
+  if (scope === 'public' && request.customerToken) {
+    cachedKid = peekUnverifiedKid(request.customerToken);
+    if (cachedKid !== undefined) {
+      cachedPublicKeyX = await customerPublicKeyRepository.findActive(tenantId, cachedKid);
+    }
+  }
+
+  const lookupPublicKey: LookupPublicKey = (_tenantId, requestedKid) => (requestedKid === cachedKid ? cachedPublicKeyX : undefined);
+  return resolveIdentity(scope, request, tenantId, lookupPublicKey, clock);
 }

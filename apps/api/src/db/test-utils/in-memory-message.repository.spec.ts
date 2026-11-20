@@ -34,6 +34,29 @@ describe('InMemoryMessageRepository', () => {
     expect(results.map((m) => m.content)).toEqual(['msg4', 'msg5']);
   });
 
+  it('findPageForConversation with no cursor returns everything, oldest first, bounded by limit', async () => {
+    const repo = new InMemoryMessageRepository();
+    const first = await repo.create('acme', 'conv_1', 'customer', 'first');
+    await repo.create('acme', 'conv_1', 'agent', 'second');
+    await repo.create('acme', 'conv_2', 'customer', 'different conversation');
+
+    const page = await repo.findPageForConversation('acme', 'conv_1', undefined, 1);
+
+    expect(page.map((m) => m.content)).toEqual(['first']);
+    expect(page[0].id).toBe(first.id);
+  });
+
+  it('findPageForConversation with a cursor returns only messages strictly after it', async () => {
+    const repo = new InMemoryMessageRepository();
+    const first = await repo.create('acme', 'conv_1', 'customer', 'first');
+    await repo.create('acme', 'conv_1', 'agent', 'second');
+    await repo.create('acme', 'conv_1', 'agent', 'third');
+
+    const page = await repo.findPageForConversation('acme', 'conv_1', { createdAtMs: first.createdAt.getTime(), id: first.id }, 10);
+
+    expect(page.map((m) => m.content)).toEqual(['second', 'third']);
+  });
+
   it('deleteForTenant only removes that tenant\'s messages', async () => {
     const repo = new InMemoryMessageRepository();
     await repo.create('acme', 'conv_1', 'customer', 'acme message');
