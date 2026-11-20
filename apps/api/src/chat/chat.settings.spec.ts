@@ -58,6 +58,10 @@ describe('loadChatSettingsFromEnv', () => {
       CHAT_RETENTION_DAYS: '14',
       CHAT_MAX_ACTIVE_CUSTOMER_KEYS_PER_TENANT: '3',
       CHAT_TENANT_DAILY_GENERATE_BUDGET: '25',
+      CHAT_POLL_PAGE_SIZE: '25',
+      CHAT_POLL_RATE_LIMIT_MAX_REQUESTS: '40',
+      CHAT_POLL_RATE_LIMIT_WINDOW_MS: '120000',
+      CHAT_POLL_RATE_LIMIT_MAX_ENTRIES: '2000',
     });
 
     expect(settings).toEqual({
@@ -86,6 +90,10 @@ describe('loadChatSettingsFromEnv', () => {
       retentionDays: 14,
       maxActiveCustomerKeysPerTenant: 3,
       tenantDailyGenerateBudget: 25,
+      pollPageSize: 25,
+      pollRateLimitMaxRequests: 40,
+      pollRateLimitWindowMs: 120000,
+      pollRateLimitMaxEntries: 2000,
     });
   });
 

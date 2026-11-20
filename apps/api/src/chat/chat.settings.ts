@@ -56,6 +56,23 @@ export const ChatSettingsSchema = z.object({
 
   /** Stage 4 item 2 - the per-tenant layer of TenantGenerateBudgetGuard; see daily-generate-budget.ts's own doc comment for why this resets on a UTC calendar day, unlike the global guard's rolling window. */
   tenantDailyGenerateBudget: z.number().int().positive(),
+
+  /**
+   * Milestone 5, Stage 1a, amendment A6 - GET /v1/chat/conversations/:id/messages.
+   * `pollPageSize` is a FIXED cap, not client-adjustable (no `limit` query
+   * param) - deliberately simple, since a poll round only ever needs to
+   * catch up on whatever arrived since the last one. `pollRateLimit*` is
+   * this endpoint's OWN bucket (conversation-messages.controller.ts),
+   * keyed by conversationId, separate from (never instead of) the shared
+   * per-IP/per-API-key guard-level limits this endpoint ALSO goes through
+   * by sharing ChatController's ApiKeyGuard instance - see
+   * poll-rate-limit-headroom.spec.ts for the documented-cadence math this
+   * default is sized against.
+   */
+  pollPageSize: z.number().int().positive(),
+  pollRateLimitMaxRequests: z.number().int().positive(),
+  pollRateLimitWindowMs: z.number().int().positive(),
+  pollRateLimitMaxEntries: z.number().int().positive(),
 });
 export type ChatSettings = z.infer<typeof ChatSettingsSchema>;
 
@@ -96,6 +113,11 @@ export function loadChatSettingsFromEnv(env: NodeJS.ProcessEnv): ChatSettings {
     maxActiveCustomerKeysPerTenant: Number(env.CHAT_MAX_ACTIVE_CUSTOMER_KEYS_PER_TENANT ?? 5),
 
     tenantDailyGenerateBudget: Number(env.CHAT_TENANT_DAILY_GENERATE_BUDGET ?? 50),
+
+    pollPageSize: Number(env.CHAT_POLL_PAGE_SIZE ?? 50),
+    pollRateLimitMaxRequests: Number(env.CHAT_POLL_RATE_LIMIT_MAX_REQUESTS ?? 100),
+    pollRateLimitWindowMs: Number(env.CHAT_POLL_RATE_LIMIT_WINDOW_MS ?? 600_000),
+    pollRateLimitMaxEntries: Number(env.CHAT_POLL_RATE_LIMIT_MAX_ENTRIES ?? 5000),
   };
 
   const result = ChatSettingsSchema.safeParse(candidate);

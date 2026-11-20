@@ -374,7 +374,31 @@ expiring is what allows this same call to take the row over.
 
 ---
 
-## 9. Cleanup
+## 9. Widget polling endpoint (Milestone 5, Stage 1a)
+
+`GET /v1/chat/conversations/:id/messages` is the widget's own read path for
+picking up new agent messages after a `pending_approval` outcome, without a
+push channel. Reuse a `conversationId` from any earlier chat request in
+this walkthrough (`$env:SP_CONVERSATION_ID` if you set one, or copy it from
+a response body):
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:3000/v1/chat/conversations/$env:SP_CONVERSATION_ID/messages" -Headers @{ Authorization = "Bearer $env:SP_PUBLIC_KEY" }
+```
+
+The response is `{ messages: [{role, content, createdAt}, ...], nextCursor }`
+- always send `nextCursor` back as the `after` query param on your next
+poll, e.g. `?after=<value>`. A second poll with no new messages echoes the
+same cursor back unchanged rather than returning `null`. An unknown or
+someone-else's conversation id gets the same generic `404` either way -
+never a hint about which. This endpoint shares `/v1/chat`'s own permissive
+CORS policy (any origin, no credentials) and its per-IP/per-API-key rate
+limits, plus its own separate per-conversation polling limiter
+(`CHAT_POLL_RATE_LIMIT_*` in `.env.example`).
+
+---
+
+## 10. Cleanup
 
 `delete-scratch-tenant` only ever deletes **policy documents and chunks** for a tenant (never the tenant itself, API keys, conversations, messages, agent runs, or customer keys - there's no single script for that today). It also takes the tenant id as a plain positional argument, not `--tenantId=`, and refuses anything that doesn't start with `rq-`, `pipe-`, or `smoke-` - which `smoke-local` satisfies:
 

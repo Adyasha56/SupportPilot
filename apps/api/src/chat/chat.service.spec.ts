@@ -158,6 +158,10 @@ function makeSettings(overrides: Partial<ChatSettings> = {}): ChatSettings {
     retentionDays: 30,
     maxActiveCustomerKeysPerTenant: 5,
     tenantDailyGenerateBudget: 50,
+    pollPageSize: 50,
+    pollRateLimitMaxRequests: 100,
+    pollRateLimitWindowMs: 600_000,
+    pollRateLimitMaxEntries: 1000,
     ...overrides,
   };
 }

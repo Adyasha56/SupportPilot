@@ -4,9 +4,29 @@ import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { loadBootstrapSettingsFromEnv } from './bootstrap-settings';
 import { ChatBodyParserErrorFilter } from './chat/chat-body-parser-error.filter';
+import { buildCorsOptionsDelegate } from './common/cors';
+import { securityHeadersMiddleware } from './common/security-headers.middleware';
+import { loadServerSettingsFromEnv } from './common/server.settings';
+import { registerAdminStaticAssets } from './common/admin-static';
+import { registerWidgetStaticAssets } from './common/widget-static';
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
+
+  const serverSettings = loadServerSettingsFromEnv(process.env);
+
+  // Milestone 5, Stage 1a, amendment A5 - registered FIRST, before every
+  // other middleware/filter/guard: Nest wires enableCors() as Express-level
+  // middleware, so a browser's OPTIONS preflight is answered here, before
+  // it could ever reach ApiKeyGuard (no API key is required to preflight).
+  app.enableCors(buildCorsOptionsDelegate({ preflightMaxAgeSeconds: serverSettings.corsPreflightMaxAgeSeconds }));
+
+  // Amendment A1/B6 - Cache-Control/X-Content-Type-Options everywhere except
+  // widget assets, CSP/Referrer-Policy on the admin HTML shell only. Must
+  // run before the static-asset registrations below so every response from
+  // them (including a cache-busting miss that falls through to the admin
+  // SPA fallback) already carries these headers.
+  app.use(securityHeadersMiddleware);
 
   // Stage 6 item 3 - a body that fails to parse at all (too large, or
   // syntactically invalid JSON) throws from Nest's global body-parser
@@ -29,6 +49,12 @@ async function bootstrap(): Promise<void> {
   // at 0 is correct there too.
   const { trustProxyHops } = loadBootstrapSettingsFromEnv(process.env);
   app.set('trust proxy', trustProxyHops);
+
+  // Amendment A1/B4/B6 - registered after the security-headers middleware
+  // above so every response from either static root already carries it;
+  // registered before listen() so they're active for the very first request.
+  registerAdminStaticAssets(app, serverSettings.adminStaticDir);
+  registerWidgetStaticAssets(app, serverSettings.widgetStaticDir, serverSettings.widgetVersion);
 
   const port = process.env.API_PORT ?? 3000;
   await app.listen(port);
