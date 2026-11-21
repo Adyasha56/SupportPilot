@@ -162,6 +162,15 @@ function makeSettings(overrides: Partial<ChatSettings> = {}): ChatSettings {
     pollRateLimitMaxRequests: 100,
     pollRateLimitWindowMs: 600_000,
     pollRateLimitMaxEntries: 1000,
+    pollTenantRateLimitMaxRequests: 1000,
+    pollTenantRateLimitWindowMs: 60_000,
+    pollTenantRateLimitMaxEntries: 1000,
+    pollGuardIpRateLimitMaxRequests: 1000,
+    pollGuardIpRateLimitWindowMs: 60_000,
+    pollGuardIpRateLimitMaxEntries: 1000,
+    pollGuardApiKeyRateLimitMaxRequests: 1000,
+    pollGuardApiKeyRateLimitWindowMs: 60_000,
+    pollGuardApiKeyRateLimitMaxEntries: 1000,
     ...overrides,
   };
 }

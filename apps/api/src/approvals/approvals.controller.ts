@@ -4,12 +4,12 @@ import {
   ApprovalListQuerySchema,
   ApprovalListResponse,
   ApprovalRecord as ApprovalRecordDTO,
+  decidedByForAdminSession,
+  decidedByForApiKey,
 } from '@supportpilot/shared';
-import { ApiKeyGuard } from '../auth/api-key.guard';
-import { CurrentApiKeyId } from '../auth/current-api-key.decorator';
-import { CurrentTenant } from '../auth/current-tenant.decorator';
-import { RequireScope } from '../auth/require-scope.decorator';
 import { RateLimiter } from '../auth/rate-limiter';
+import { AdminAuthGuard, AdminPrincipal } from '../admin-auth/admin-auth.guard';
+import { CurrentAdminPrincipal } from '../admin-auth/current-admin-principal.decorator';
 import { ChatRetryAfterFilter } from '../chat/chat-retry-after.filter';
 import { ConversationRepository, CONVERSATION_REPOSITORY } from '../db/conversation.repository';
 import { MessageRepository, MESSAGE_REPOSITORY } from '../db/message.repository';
@@ -49,9 +49,15 @@ function msToSeconds(ms: number): number {
 }
 
 /**
- * Milestone 4 Stage 6 - the admin decision surface. `@RequireScope('admin')` at the CLASS level
- * (amendment E) - a secret-scope key, already trusted on every other `/v1/*` route, gets the
- * exact same generic rejection a public key does here (ApiKeyGuard's rank-based scopeSatisfies).
+ * Milestone 4 Stage 6 - the admin decision surface. Milestone 5, Stage 1b
+ * moved this from `@UseGuards(ApiKeyGuard) @RequireScope('admin')` to
+ * `AdminAuthGuard` (item 6) - a secret-scope API key still gets the exact
+ * same generic rejection a public key does (AdminAuthGuard's own
+ * header-present-means-ONLY-the-admin-scoped-key-path rule), and a
+ * cookie-authenticated admin console session now works here too, with no
+ * separate code path - `tenantId` comes from the resolved `AdminPrincipal`
+ * (never `@CurrentTenant()`, which only ever reads what `ApiKeyGuard`
+ * itself sets - this controller no longer uses that guard at all).
  *
  * Deliberately lives INSIDE ApprovalsModule (not some other module importing ApprovalService
  * from outside) - the admin surface genuinely needs the WHOLE service (decide/getById/list),
@@ -60,8 +66,7 @@ function msToSeconds(ms: number): number {
  * is allowed to depend on the full ApprovalService.
  */
 @Controller('v1/approvals')
-@UseGuards(ApiKeyGuard)
-@RequireScope('admin')
+@UseGuards(AdminAuthGuard)
 @UseFilters(ChatRetryAfterFilter)
 export class ApprovalsController {
   private readonly logger = new Logger(ApprovalsController.name);
@@ -81,20 +86,20 @@ export class ApprovalsController {
   }
 
   @Get()
-  async list(@CurrentTenant() tenantId: string, @Query() rawQuery: unknown): Promise<ApprovalListResponse> {
+  async list(@CurrentAdminPrincipal() principal: AdminPrincipal, @Query() rawQuery: unknown): Promise<ApprovalListResponse> {
     this.assertConfigured();
     const parsed = ApprovalListQuerySchema.safeParse(rawQuery);
     if (!parsed.success) {
       throw approvalHttpError('INVALID_REQUEST', 'The query parameters are invalid.');
     }
-    const result = await this.approvalService.list(tenantId, parsed.data, this.clock());
+    const result = await this.approvalService.list(principal.tenantId, parsed.data, this.clock());
     return { approvals: result.approvals.map(toRecordDTO), ...(result.nextCursor ? { nextCursor: result.nextCursor } : {}) };
   }
 
   @Get(':id')
-  async getOne(@CurrentTenant() tenantId: string, @Param('id') id: string): Promise<ApprovalRecordDTO> {
+  async getOne(@CurrentAdminPrincipal() principal: AdminPrincipal, @Param('id') id: string): Promise<ApprovalRecordDTO> {
     this.assertConfigured();
-    const record = await this.approvalService.getById(tenantId, id, this.clock());
+    const record = await this.approvalService.getById(principal.tenantId, id, this.clock());
     if (!record) {
       // Identical 404 whether the id belongs to another tenant or doesn't exist at all - same
       // principle as PoliciesController's own remove() and the auth guard's uniform 401.
@@ -105,14 +110,17 @@ export class ApprovalsController {
 
   @Post(':id/decision')
   @HttpCode(200)
-  async decide(
-    @CurrentTenant() tenantId: string,
-    @CurrentApiKeyId() apiKeyId: string,
-    @Param('id') id: string,
-    @Body() rawBody: unknown,
-  ): Promise<ApprovalRecordDTO> {
+  async decide(@CurrentAdminPrincipal() principal: AdminPrincipal, @Param('id') id: string, @Body() rawBody: unknown): Promise<ApprovalRecordDTO> {
     this.assertConfigured();
-    const rateDecision = this.rateLimiter.tryConsume(apiKeyId);
+    const tenantId = principal.tenantId;
+    // Milestone 5, Stage 1b, item 6 - the decidedBy format: which KIND of principal decided,
+    // never a bare id alone. The rate limiter is keyed the same way - a session principal and
+    // an admin API key never share a decision-attempt budget just because both might
+    // (coincidentally) carry the same principalId value (they never do in practice, since
+    // principalId means different things per kind, but keying by the full decidedBy string
+    // keeps that true structurally, not by coincidence).
+    const decidedBy = principal.kind === 'api_key' ? decidedByForApiKey(principal.principalId) : decidedByForAdminSession(principal.principalId);
+    const rateDecision = this.rateLimiter.tryConsume(decidedBy);
     if (!rateDecision.allowed) {
       throw approvalHttpError('RATE_LIMITED', 'Too many decision attempts. Please try again shortly.', msToSeconds(rateDecision.retryAfterMs));
     }
@@ -156,7 +164,7 @@ export class ApprovalsController {
       tenantId,
       id,
       decision,
-      apiKeyId,
+      decidedBy,
       this.clock(),
       tenantSettings,
       fetchFreshOrderSnapshot,
@@ -164,7 +172,7 @@ export class ApprovalsController {
       appendCustomerMessage,
     );
 
-    this.audit(tenantId, id, apiKeyId, before.status, result);
+    this.audit(tenantId, id, decidedBy, before.status, result);
 
     if (!result.ok) {
       if (result.code === 'NOT_FOUND') {
@@ -201,15 +209,15 @@ export class ApprovalsController {
     }
   }
 
-  /** ids and codes only - never customer text, never the reasonCode's own meaning beyond its code. */
-  private audit(tenantId: string, approvalId: string, apiKeyId: string, fromStatus: string, result: DecideResult): void {
+  /** ids and codes only - never customer text, never the reasonCode's own meaning beyond its code. `decidedBy` is the formatted `key:<id>`/`admin:<id>` string (decided-by.ts), never a bare id - which kind of principal decided is itself worth auditing. */
+  private audit(tenantId: string, approvalId: string, decidedBy: string, fromStatus: string, result: DecideResult): void {
     const toStatus = result.ok ? result.status : (this.lastKnownStatusForError(result.code) ?? fromStatus);
     this.logger.log(
       JSON.stringify({
         event: 'approval_decision',
         tenantId,
         approvalId,
-        apiKeyId,
+        decidedBy,
         fromStatus,
         toStatus,
         outcomeCode: result.ok ? result.status : result.code,

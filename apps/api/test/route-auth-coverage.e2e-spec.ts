@@ -12,23 +12,43 @@ import { DiscoveryModule, DiscoveryService, MetadataScanner } from '@nestjs/core
 import { Test } from '@nestjs/testing';
 import { AppModule } from '../src/app.module';
 import { ApiKeyGuard } from '../src/auth/api-key.guard';
+import { PollApiKeyGuard } from '../src/chat/poll-api-key-guard';
+import { AdminAuthGuard } from '../src/admin-auth/admin-auth.guard';
 import { REQUIRE_SCOPE_KEY } from '../src/auth/require-scope.decorator';
+
+/** The ONE deliberate exception: the route that PRODUCES authentication can't itself require it. */
+const DELIBERATELY_UNGUARDED_PATHS = ['/health', '/v1/admin/login'];
 
 interface RouteFinding {
   controllerName: string;
   path: string;
-  hasApiKeyGuard: boolean;
+  hasRecognizedAuthGuard: boolean;
   hasScope: boolean;
 }
+
+/**
+ * Every guard class this project accepts as a real authentication guard on
+ * a route - never a bare allowlist of ONE class. `PollApiKeyGuard` is a
+ * subclass of `ApiKeyGuard` with its own independent rate-limit buckets
+ * (Part 0 item P1) but the SAME authentication logic; `AdminAuthGuard`
+ * (Milestone 5, Stage 1b) is a structurally different guard (cookie session
+ * OR admin-scoped API key) for the admin console's own routes. Nest's
+ * `@UseGuards()` metadata stores the exact class reference passed to it, so
+ * this list must name every guard class actually in use, not rely on
+ * `instanceof`/inheritance checks that would silently accept an unrelated
+ * guard that merely happens to extend one of these.
+ */
+const RECOGNIZED_AUTH_GUARDS: unknown[] = [ApiKeyGuard, PollApiKeyGuard, AdminAuthGuard];
 
 /**
  * Enumerates every real HTTP route handler across every controller Nest
  * knows about, via DiscoveryService (not by hand-maintaining a route list
  * that would silently drift out of sync with the real app). For each one,
- * checks for ApiKeyGuard and a declared @RequireScope() at EITHER the
- * method or the controller-class level (@UseGuards/@RequireScope merge
- * class and method metadata the same way Nest's own guard execution does -
- * see api-key.guard.ts's getAllAndOverride fix for the same reasoning).
+ * checks for one of RECOGNIZED_AUTH_GUARDS and a declared @RequireScope()
+ * at EITHER the method or the controller-class level (@UseGuards/
+ * @RequireScope merge class and method metadata the same way Nest's own
+ * guard execution does - see api-key.guard.ts's getAllAndOverride fix for
+ * the same reasoning).
  */
 function findRoutes(discovery: DiscoveryService, scanner: MetadataScanner): RouteFinding[] {
   const routes: RouteFinding[] = [];
@@ -55,11 +75,15 @@ function findRoutes(discovery: DiscoveryService, scanner: MetadataScanner): Rout
       const methodScope = Reflect.getMetadata(REQUIRE_SCOPE_KEY, handler) as unknown;
 
       const fullPath = `/${controllerPath}/${routePath}`.replace(/\/+/g, '/').replace(/\/$/, '') || '/';
+      const allGuards = [...classGuards, ...methodGuards];
       routes.push({
         controllerName: controllerCtor.name,
         path: fullPath,
-        hasApiKeyGuard: [...classGuards, ...methodGuards].includes(ApiKeyGuard),
-        hasScope: classScope !== undefined || methodScope !== undefined,
+        hasRecognizedAuthGuard: RECOGNIZED_AUTH_GUARDS.some((guard) => allGuards.includes(guard)),
+        // AdminAuthGuard has no @RequireScope concept of its own - a binary "admin-scoped key or
+        // cookie session, or nothing" - so a route it guards needs no SEPARATE scope declaration;
+        // every other recognized guard still does.
+        hasScope: classScope !== undefined || methodScope !== undefined || allGuards.includes(AdminAuthGuard),
       });
     }
   }
@@ -93,7 +117,7 @@ describe('Route auth coverage', () => {
     app = undefined;
   });
 
-  it('every route except /health has ApiKeyGuard and a declared scope', async () => {
+  it('every route except the deliberate exceptions has a recognized auth guard and a declared scope', async () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule, DiscoveryModule] }).compile();
     app = moduleRef.createNestApplication();
     await app.init();
@@ -105,8 +129,38 @@ describe('Route auth coverage', () => {
     // broken discovery call (e.g. returning []) can't make this pass vacuously.
     expect(routes.length).toBeGreaterThan(0);
 
-    const offenders = routes.filter((r) => r.path !== '/health' && (!r.hasApiKeyGuard || !r.hasScope));
+    const offenders = routes.filter((r) => !DELIBERATELY_UNGUARDED_PATHS.includes(r.path) && (!r.hasRecognizedAuthGuard || !r.hasScope));
     expect(offenders).toEqual([]);
+  });
+
+  it('Stage 1b item 6 - /v1/admin/login is the ONE deliberate exception; every OTHER /v1/admin/* route IS guarded', async () => {
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule, DiscoveryModule] }).compile();
+    app = moduleRef.createNestApplication();
+    await app.init();
+
+    const discovery = moduleRef.get(DiscoveryService);
+    const routes = findRoutes(discovery, new MetadataScanner());
+
+    const loginRoute = routes.find((r) => r.path === '/v1/admin/login');
+    expect(loginRoute).toBeDefined();
+    expect(loginRoute!.hasRecognizedAuthGuard).toBe(false);
+
+    const otherAdminRoutes = routes.filter((r) => r.path.startsWith('/v1/admin/') && r.path !== '/v1/admin/login');
+    expect(otherAdminRoutes.length).toBeGreaterThan(0);
+    expect(otherAdminRoutes.every((r) => r.hasRecognizedAuthGuard && r.hasScope)).toBe(true);
+  });
+
+  it('Stage 1b item 6 - /v1/approvals* now uses AdminAuthGuard, not the old ApiKeyGuard/RequireScope(admin) pair', async () => {
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule, DiscoveryModule] }).compile();
+    app = moduleRef.createNestApplication();
+    await app.init();
+
+    const discovery = moduleRef.get(DiscoveryService);
+    const routes = findRoutes(discovery, new MetadataScanner());
+
+    const approvalRoutes = routes.filter((r) => r.path.startsWith('/v1/approvals'));
+    expect(approvalRoutes.length).toBeGreaterThan(0);
+    expect(approvalRoutes.every((r) => r.hasRecognizedAuthGuard && r.hasScope)).toBe(true);
   });
 
   it('proves the check actually works: flags a deliberately misconfigured controller missing the guard', async () => {
@@ -119,7 +173,7 @@ describe('Route auth coverage', () => {
     }
 
     const routes = await buildRouteFindings([], [LeakyController]);
-    const offenders = routes.filter((r) => r.path !== '/health' && (!r.hasApiKeyGuard || !r.hasScope));
+    const offenders = routes.filter((r) => r.path !== '/health' && (!r.hasRecognizedAuthGuard || !r.hasScope));
 
     expect(offenders.length).toBeGreaterThan(0);
     expect(offenders[0].controllerName).toBe('LeakyController');
@@ -136,10 +190,26 @@ describe('Route auth coverage', () => {
     }
 
     const routes = await buildRouteFindings([], [GuardedNoScopeController]);
-    const offenders = routes.filter((r) => r.path !== '/health' && (!r.hasApiKeyGuard || !r.hasScope));
+    const offenders = routes.filter((r) => r.path !== '/health' && (!r.hasRecognizedAuthGuard || !r.hasScope));
 
     expect(offenders.length).toBeGreaterThan(0);
-    expect(offenders[0].hasApiKeyGuard).toBe(true);
+    expect(offenders[0].hasRecognizedAuthGuard).toBe(true);
     expect(offenders[0].hasScope).toBe(false);
+  });
+
+  it('Part 0 item P1 - a route guarded by PollApiKeyGuard ALONE (never the bare ApiKeyGuard) is still recognized, not flagged', async () => {
+    @Controller('poll-guarded')
+    @UseGuards(PollApiKeyGuard)
+    class PollGuardedController {
+      @Get()
+      ok(): string {
+        return 'guarded by the poll-dedicated subclass, with a scope declared';
+      }
+    }
+    const routes = await buildRouteFindings([], [PollGuardedController]);
+    const offenders = routes.filter((r) => r.path !== '/health' && !r.hasRecognizedAuthGuard);
+
+    expect(offenders).toEqual([]);
+    expect(routes[0].hasRecognizedAuthGuard).toBe(true);
   });
 });

@@ -21,7 +21,6 @@ requests).
 
 - `MONGODB_URI` - your own Atlas cluster (or Atlas Local), never the shared test database.
 - `GEMINI_API_KEY` - a real AI Studio key, **or leave the placeholder in** to deliberately test the degraded path (section 7 below).
-- `ADMIN_SESSION_SECRET`
 - `CONNECTOR_CONFIG_DIR`
 - `CONNECTOR_HOST_ALLOWLIST`
 - `ALLOW_PRIVATE_NETWORKS`
@@ -67,7 +66,6 @@ $env:CONNECTOR_CONFIG_DIR = (Resolve-Path .manual-connectors).Path
 $env:CONNECTOR_SECRET_ACME_MOCK_STORE_TOKEN = 'local-manual-test-token'
 $env:MONGODB_URI = 'mongodb+srv://<your-own-cluster>/supportpilot'
 $env:GEMINI_API_KEY = 'your-real-key-or-leave-this-exact-placeholder-for-section-7'
-$env:ADMIN_SESSION_SECRET = 'local-manual-test-only'
 pnpm --filter @supportpilot/api run dev
 ```
 
@@ -398,7 +396,110 @@ limits, plus its own separate per-conversation polling limiter
 
 ---
 
-## 10. Cleanup
+## 10. Admin console authentication (Milestone 5, Stage 1b)
+
+This walkthrough has used an `--scope=admin` API key for section 8's
+approvals the whole time - that keeps working unchanged. This section
+walks through the OTHER way in: a real password login, which mints a
+cookie session.
+
+### 10a. Create the admin credential
+
+`set-admin-credential` is the ONLY way to create or change one - there is
+no HTTP endpoint for it, and the password is never accepted on the command
+line.
+
+```powershell
+$env:ADMIN_CREDENTIAL_PASSWORD = "a-real-password-at-least-12-chars"
+pnpm --filter @supportpilot/api run set-admin-credential -- --tenantId=smoke-local --email=owner@smoke-local.example
+Remove-Item Env:\ADMIN_CREDENTIAL_PASSWORD
+```
+
+Omit `ADMIN_CREDENTIAL_PASSWORD` entirely to get an interactive, hidden
+(no-echo) prompt instead - useful when you don't want the password sitting
+in your shell's environment at all, even briefly.
+
+### 10b. Why you need the dev cookie mode for this walkthrough
+
+The production session cookie is `__Host-sp_session` - `Secure`,
+`SameSite=Strict`. **A browser (and PowerShell's own cookie jar) will
+never store a `Secure` cookie over plain `http://localhost`** - there is
+no way around this, it's the point of the attribute. For this local,
+plain-HTTP walkthrough, set BOTH of the following before starting the API
+(both are required - either alone does nothing):
+
+```powershell
+$env:ADMIN_DEV_COOKIE_ENABLED = "true"
+$env:NODE_ENV = "development"
+```
+
+This issues a differently-named, non-Secure cookie (`sp_session_dev`)
+instead - **never set `ADMIN_DEV_COOKIE_ENABLED` in any real deployment.**
+
+### 10c. Log in with a cookie jar
+
+```powershell
+$session = $null
+$loginBody = @{ email = "owner@smoke-local.example"; password = "a-real-password-at-least-12-chars" } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://localhost:3000/v1/admin/login" -Method Post -ContentType "application/json" -Body $loginBody -SessionVariable session
+```
+
+`-SessionVariable session` captures the `Set-Cookie` response into a
+reusable `WebRequestSession` object - pass `-WebSession $session` on every
+later call to keep sending it, exactly like a browser's own cookie jar.
+
+### 10d. Bootstrap the SPA session (get the CSRF token)
+
+```powershell
+$bootstrap = Invoke-RestMethod -Uri "http://localhost:3000/v1/admin/session" -WebSession $session
+$bootstrap
+```
+
+Returns `{tenantId, csrfToken, absoluteExpiresAt, idleExpiresAt}`. Save the
+CSRF token for the next step:
+
+```powershell
+$csrf = $bootstrap.csrfToken
+```
+
+### 10e. Use the cookie session on a real admin route
+
+Every state-changing request needs the CSRF header; a plain `GET` does not:
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:3000/v1/approvals" -WebSession $session
+Invoke-RestMethod -Uri "http://localhost:3000/v1/approvals/$env:SP_APPROVAL_ID/decision" -WebSession $session -Method Post -Headers @{ "x-csrf-token" = $csrf } -ContentType "application/json" -Body (@{ decision = "approve" } | ConvertTo-Json)
+```
+
+Omit the `x-csrf-token` header on that `POST` to see the generic `401` the
+CSRF check produces - and note it's the exact same guard, so the request
+also needs a browser-plausible `Origin`/no `Sec-Fetch-Site: cross-site` -
+PowerShell's `Invoke-RestMethod` sends neither by default, which is fine
+for this manual walkthrough since `ADMIN_ALLOWED_ORIGINS` is left unset
+(no `Origin` header present at all is never itself a rejection - see
+`origin-guard.ts`).
+
+### 10f. Log out
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:3000/v1/admin/logout" -WebSession $session -Method Post -Headers @{ "x-csrf-token" = $csrf }
+```
+
+### 10g. Lockout and recovery
+
+Send the wrong password a few times in a row (past `ADMIN_LOCKOUT_FREE_ATTEMPTS`,
+default 3) and you'll start seeing the backoff grow - every failure gets
+the IDENTICAL generic `401 INVALID_CREDENTIALS`, whether the email doesn't
+exist, the password is wrong, or the account is currently locked; there is
+no way to tell which from the response. **The admin API key you've been
+using since section 8 is completely unaffected** - lockout only ever
+applies to the password-login path, never to `AdminAuthGuard`'s header
+path, which is precisely why it's the documented recovery route when an
+admin is locked out of password login (`docs/known-limitations.md`).
+
+---
+
+## 11. Cleanup
 
 `delete-scratch-tenant` only ever deletes **policy documents and chunks** for a tenant (never the tenant itself, API keys, conversations, messages, agent runs, or customer keys - there's no single script for that today). It also takes the tenant id as a plain positional argument, not `--tenantId=`, and refuses anything that doesn't start with `rq-`, `pipe-`, or `smoke-` - which `smoke-local` satisfies:
 

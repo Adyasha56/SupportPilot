@@ -19,6 +19,10 @@ import { MongooseAgentRunRepository, AGENT_RUN_REPOSITORY } from './agent-run.re
 import { MongooseCustomerPublicKeyRepository, CUSTOMER_PUBLIC_KEY_REPOSITORY } from './customer-public-key.repository';
 import { ApprovalSchema } from '../approvals/schemas/approval.schema';
 import { MongooseApprovalRepository, APPROVAL_REPOSITORY } from '../approvals/approval.repository';
+import { AdminCredentialSchema } from './schemas/admin-credential.schema';
+import { AdminSessionSchema } from './schemas/admin-session.schema';
+import { MongooseAdminCredentialRepository, ADMIN_CREDENTIAL_REPOSITORY } from './admin-credential.repository';
+import { MongooseAdminSessionRepository, ADMIN_SESSION_REPOSITORY } from './admin-session.repository';
 
 const repositoryProviders: Provider[] = [
   { provide: TENANT_REPOSITORY, useClass: MongooseTenantRepository },
@@ -31,6 +35,8 @@ const repositoryProviders: Provider[] = [
   { provide: AGENT_RUN_REPOSITORY, useClass: MongooseAgentRunRepository },
   { provide: CUSTOMER_PUBLIC_KEY_REPOSITORY, useClass: MongooseCustomerPublicKeyRepository },
   { provide: APPROVAL_REPOSITORY, useClass: MongooseApprovalRepository },
+  { provide: ADMIN_CREDENTIAL_REPOSITORY, useClass: MongooseAdminCredentialRepository },
+  { provide: ADMIN_SESSION_REPOSITORY, useClass: MongooseAdminSessionRepository },
 ];
 
 /**
@@ -69,6 +75,8 @@ const repositoryProviders: Provider[] = [
       { name: 'AgentRun', schema: AgentRunSchema },
       { name: 'CustomerPublicKey', schema: CustomerPublicKeySchema },
       { name: 'Approval', schema: ApprovalSchema },
+      { name: 'AdminCredential', schema: AdminCredentialSchema },
+      { name: 'AdminSession', schema: AdminSessionSchema },
     ]),
   ],
   providers: repositoryProviders,
@@ -84,6 +92,8 @@ const repositoryProviders: Provider[] = [
     AGENT_RUN_REPOSITORY,
     CUSTOMER_PUBLIC_KEY_REPOSITORY,
     APPROVAL_REPOSITORY,
+    ADMIN_CREDENTIAL_REPOSITORY,
+    ADMIN_SESSION_REPOSITORY,
   ],
 })
 export class DatabaseModule {}

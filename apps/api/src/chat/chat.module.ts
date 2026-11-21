@@ -14,7 +14,9 @@ import { readOnlyToolRunnerProvider } from './read-only-tool-runner.provider';
 import { tenantRateLimiterProvider, customerRefRateLimiterProvider } from './rate-limiters.provider';
 import { conversationLockProvider } from './conversation-lock.provider';
 import { inFlightRunLimiterProvider } from './in-flight-run-limiter.provider';
-import { pollRateLimiterProvider } from './poll-rate-limiter.provider';
+import { pollRateLimiterProvider, pollTenantRateLimiterProvider } from './poll-rate-limiter.provider';
+import { PollApiKeyGuard } from './poll-api-key-guard';
+import { pollApiKeyGuardSettingsProvider } from './poll-api-key-guard-settings.provider';
 import { ChatController } from './chat.controller';
 import { ChatService } from './chat.service';
 import { ConversationMessagesController } from './conversation-messages.controller';
@@ -61,6 +63,8 @@ export function chatDatabaseImportsFor(env: NodeJS.ProcessEnv): [typeof Database
   providers: [
     ApiKeyGuard,
     chatApiKeyGuardSettingsProvider,
+    PollApiKeyGuard,
+    pollApiKeyGuardSettingsProvider,
     chatSettingsProvider,
     runAgentSettingsProvider,
     dailyGenerateBudgetProvider,
@@ -71,6 +75,7 @@ export function chatDatabaseImportsFor(env: NodeJS.ProcessEnv): [typeof Database
     conversationLockProvider,
     inFlightRunLimiterProvider,
     pollRateLimiterProvider,
+    pollTenantRateLimiterProvider,
     ChatService,
     ConversationMessagesService,
   ],

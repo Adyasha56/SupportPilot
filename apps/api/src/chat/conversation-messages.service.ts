@@ -1,6 +1,6 @@
 import { Inject, Injectable, Optional } from '@nestjs/common';
 import { ConversationMessagesQuerySchema, ConversationMessagesResponse, GENERIC_ID_PATTERN } from '@supportpilot/shared';
-import { ConversationRepository, CONVERSATION_REPOSITORY } from '../db/conversation.repository';
+import { ConversationRecord, ConversationRepository, CONVERSATION_REPOSITORY } from '../db/conversation.repository';
 import { MessageRecord, MessageRepository, MESSAGE_REPOSITORY } from '../db/message.repository';
 import { CustomerPublicKeyRepository, CUSTOMER_PUBLIC_KEY_REPOSITORY } from '../db/customer-public-key.repository';
 import { ApiKeyScope } from '../db/schemas/api-key.schema';
@@ -9,12 +9,13 @@ import { resolveIdentityWithLookup } from './identity-resolution';
 import { decodeMessageCursor, encodeMessageCursor } from './message-cursor';
 import { CHAT_SETTINGS } from './chat-settings.provider';
 import { ChatSettings } from './chat.settings';
-import { POLL_RATE_LIMITER } from './poll-rate-limiter.provider';
+import { POLL_RATE_LIMITER, POLL_TENANT_RATE_LIMITER } from './poll-rate-limiter.provider';
 
 export type ConversationMessagesErrorCode = 'NOT_CONFIGURED' | 'INVALID_REQUEST' | 'INVALID_CUSTOMER_TOKEN' | 'RATE_LIMITED' | 'NOT_FOUND';
 
 export type ConversationMessagesResult =
-  | { kind: 'success'; body: ConversationMessagesResponse }
+  | { kind: 'success'; body: ConversationMessagesResponse; etag: string }
+  | { kind: 'not_modified'; etag: string }
   | { kind: 'error'; code: ConversationMessagesErrorCode; message: string; retryAfterSeconds?: number };
 
 export interface ConversationMessagesInput {
@@ -24,11 +25,25 @@ export interface ConversationMessagesInput {
   conversationId: string;
   /** Unvalidated - ConversationMessagesQuerySchema.safeParse happens inside getMessages(), first thing after the id shape check. */
   rawQuery: unknown;
+  /** The request's own `If-None-Match` header, verbatim - see computeEtag's own doc comment for the conditional-response design (Part 0, item P1). */
+  ifNoneMatch?: string;
 }
 
 const GENERIC_NOT_FOUND_MESSAGE = 'Conversation not found.';
 const GENERIC_INVALID_REQUEST_MESSAGE = 'The request is invalid.';
 const GENERIC_INVALID_TOKEN_MESSAGE = 'The customer token is invalid, expired, or could not be verified.';
+
+/**
+ * A WEAK ETag (RFC 9110 - the response isn't byte-identical across calls
+ * with the same value, only equivalent-enough: same count of messages)
+ * derived from the Conversation's own `messageCount`, which already
+ * increments on every new customer/agent message (chat.service.ts's
+ * `incrementMessageCount`). Computed from a value we ALREADY had to read
+ * for the ownership check two lines above its call site - no extra read.
+ */
+function computeEtag(conversation: ConversationRecord): string {
+  return `W/"${conversation.messageCount}"`;
+}
 
 /**
  * Milestone 5, Stage 1a, amendment A6 - GET /v1/chat/conversations/:id/messages.
@@ -48,14 +63,25 @@ const GENERIC_INVALID_TOKEN_MESSAGE = 'The customer token is invalid, expired, o
  *      chat.service.ts enforces; a public-scope caller's own
  *      `customerRef` query param is never consulted (resolveIdentity
  *      itself enforces this).
- *   5. the poll-specific rate limiter (POLL_RATE_LIMITER), keyed by
- *      `${tenantId}:${conversationId}` - checked BEFORE the conversation
- *      read below, so a flood against one (real or guessed) conversation
- *      id is rejected as cheaply as possible.
+ *   5. the poll-TENANT rate limiter (POLL_TENANT_RATE_LIMITER, Part 0 item
+ *      P1) - many visitors of the same tenant's widget, summed - then the
+ *      poll-CONVERSATION rate limiter (POLL_RATE_LIMITER), keyed by
+ *      `${tenantId}:${conversationId}` - one visitor's own stream. Both
+ *      checked BEFORE the conversation read below, so a flood (real
+ *      visitors or a guessed id) is rejected as cheaply as possible. (The
+ *      per-IP/per-API-key guard-level buckets ran even earlier, in
+ *      PollApiKeyGuard, before this service is ever called at all.)
  *   6. conversation lookup, tenant-scoped, with the SAME null-safe
  *      ownership match chat.service.ts's resolveConversation uses -
  *      a mismatch and a nonexistent id are the IDENTICAL 404.
- *   7. the message page itself, oldest-first, bounded by
+ *   7. the ETag conditional check (Part 0 item P1 - "a conditional response
+ *      so an unchanged poll is cheap"): computed from the conversation we
+ *      JUST read for step 6, at no extra cost. A matching `If-None-Match`
+ *      short-circuits here - `kind: 'not_modified'`, the message-page query
+ *      below never runs at all, which is the actual cost this is meant to
+ *      avoid (a ranged index scan, however cheap, beats doing it on every
+ *      single poll when nothing changed).
+ *   8. the message page itself, oldest-first, bounded by
  *      ChatSettings.pollPageSize, served off the existing
  *      {tenantId,conversationId,createdAt} index.
  */
@@ -69,6 +95,7 @@ export class ConversationMessagesService {
     @Optional() @Inject(CUSTOMER_PUBLIC_KEY_REPOSITORY) private readonly customerPublicKeyRepository: CustomerPublicKeyRepository | undefined,
     @Inject(CHAT_SETTINGS) private readonly settings: ChatSettings,
     @Inject(POLL_RATE_LIMITER) private readonly pollRateLimiter: RateLimiter,
+    @Inject(POLL_TENANT_RATE_LIMITER) private readonly pollTenantRateLimiter: RateLimiter,
     @Optional() clock?: () => Date,
   ) {
     this.clock = clock ?? (() => new Date());
@@ -95,6 +122,10 @@ export class ConversationMessagesService {
     }
     const verifiedCustomerRef = identity.kind === 'identified' ? identity.customerRef : undefined;
 
+    const tenantDecision = this.pollTenantRateLimiter.tryConsume(input.tenantId);
+    if (!tenantDecision.allowed) {
+      return this.error('RATE_LIMITED', 'Too many polling requests for this tenant.', Math.ceil(tenantDecision.retryAfterMs / 1000));
+    }
     const pollDecision = this.pollRateLimiter.tryConsume(`${input.tenantId}:${input.conversationId}`);
     if (!pollDecision.allowed) {
       return this.error('RATE_LIMITED', 'Too many requests for this conversation.', Math.ceil(pollDecision.retryAfterMs / 1000));
@@ -105,11 +136,17 @@ export class ConversationMessagesService {
       return this.error('NOT_FOUND', GENERIC_NOT_FOUND_MESSAGE);
     }
 
+    const etag = computeEtag(conversation);
+    if (input.ifNoneMatch !== undefined && input.ifNoneMatch === etag) {
+      return { kind: 'not_modified', etag };
+    }
+
     const after = decodeMessageCursor(query.after);
     const page = await this.messageRepository.findPageForConversation(input.tenantId, input.conversationId, after, this.settings.pollPageSize);
 
     return {
       kind: 'success',
+      etag,
       body: {
         messages: page.map((m) => ({ role: m.role, content: m.content, createdAt: m.createdAt.toISOString() })),
         nextCursor: this.computeNextCursor(page, query.after),

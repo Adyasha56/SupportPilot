@@ -61,18 +61,41 @@ export const ChatSettingsSchema = z.object({
    * Milestone 5, Stage 1a, amendment A6 - GET /v1/chat/conversations/:id/messages.
    * `pollPageSize` is a FIXED cap, not client-adjustable (no `limit` query
    * param) - deliberately simple, since a poll round only ever needs to
-   * catch up on whatever arrived since the last one. `pollRateLimit*` is
-   * this endpoint's OWN bucket (conversation-messages.controller.ts),
-   * keyed by conversationId, separate from (never instead of) the shared
-   * per-IP/per-API-key guard-level limits this endpoint ALSO goes through
-   * by sharing ChatController's ApiKeyGuard instance - see
-   * poll-rate-limit-headroom.spec.ts for the documented-cadence math this
-   * default is sized against.
+   * catch up on whatever arrived since the last one.
+   *
+   * FOUR independent buckets guard this route, narrowest to broadest, and
+   * (Part 0, item P1 - a real bug the Stage 1a audit found) NONE of them
+   * are shared with chat-SENDING traffic any more:
+   *   - `pollRateLimit*` - per CONVERSATION (conversation-messages.service.ts),
+   *     sized for one visitor's own worst-case polling stream.
+   *   - `pollTenantRateLimit*` - per TENANT (new) - many visitors of the
+   *     same tenant's widget, summed.
+   *   - `pollGuardIpRateLimit*` / `pollGuardApiKeyRateLimit*` - the
+   *     poll-dedicated `ApiKeyGuard` instance's own per-IP/per-key buckets
+   *     (poll-api-key-guard.ts) - a SEPARATE instance from ChatController's,
+   *     so a flood of polling traffic can never 429 an actual chat send
+   *     (or vice versa) by exhausting a budget the two routes used to share.
+   * All four are sized against `ASSUMED_CONCURRENT_VISITORS` (20,
+   * poll-rate-limit-headroom.ts) and the documented polling cadence - see
+   * poll-rate-limit-headroom.spec.ts for the worst-case math each default
+   * is checked against.
    */
   pollPageSize: z.number().int().positive(),
   pollRateLimitMaxRequests: z.number().int().positive(),
   pollRateLimitWindowMs: z.number().int().positive(),
   pollRateLimitMaxEntries: z.number().int().positive(),
+
+  pollTenantRateLimitMaxRequests: z.number().int().positive(),
+  pollTenantRateLimitWindowMs: z.number().int().positive(),
+  pollTenantRateLimitMaxEntries: z.number().int().positive(),
+
+  pollGuardIpRateLimitMaxRequests: z.number().int().positive(),
+  pollGuardIpRateLimitWindowMs: z.number().int().positive(),
+  pollGuardIpRateLimitMaxEntries: z.number().int().positive(),
+
+  pollGuardApiKeyRateLimitMaxRequests: z.number().int().positive(),
+  pollGuardApiKeyRateLimitWindowMs: z.number().int().positive(),
+  pollGuardApiKeyRateLimitMaxEntries: z.number().int().positive(),
 });
 export type ChatSettings = z.infer<typeof ChatSettingsSchema>;
 
@@ -118,6 +141,21 @@ export function loadChatSettingsFromEnv(env: NodeJS.ProcessEnv): ChatSettings {
     pollRateLimitMaxRequests: Number(env.CHAT_POLL_RATE_LIMIT_MAX_REQUESTS ?? 100),
     pollRateLimitWindowMs: Number(env.CHAT_POLL_RATE_LIMIT_WINDOW_MS ?? 600_000),
     pollRateLimitMaxEntries: Number(env.CHAT_POLL_RATE_LIMIT_MAX_ENTRIES ?? 5000),
+
+    // Sized for ASSUMED_CONCURRENT_VISITORS=20 against the documented cadence's worst-case 60s
+    // window per visitor (8, poll-rate-limit-headroom.ts) -> 160 worst case for 20 visitors;
+    // 200 leaves ~25% margin. See poll-rate-limit-headroom.spec.ts for the exact proof.
+    pollTenantRateLimitMaxRequests: Number(env.CHAT_POLL_TENANT_RATE_LIMIT_MAX_REQUESTS ?? 200),
+    pollTenantRateLimitWindowMs: Number(env.CHAT_POLL_TENANT_RATE_LIMIT_WINDOW_MS ?? 60_000),
+    pollTenantRateLimitMaxEntries: Number(env.CHAT_POLL_TENANT_RATE_LIMIT_MAX_ENTRIES ?? 500),
+
+    pollGuardIpRateLimitMaxRequests: Number(env.CHAT_POLL_GUARD_IP_RATE_LIMIT_MAX_REQUESTS ?? 200),
+    pollGuardIpRateLimitWindowMs: Number(env.CHAT_POLL_GUARD_IP_RATE_LIMIT_WINDOW_MS ?? 60_000),
+    pollGuardIpRateLimitMaxEntries: Number(env.CHAT_POLL_GUARD_IP_RATE_LIMIT_MAX_ENTRIES ?? 5000),
+
+    pollGuardApiKeyRateLimitMaxRequests: Number(env.CHAT_POLL_GUARD_API_KEY_RATE_LIMIT_MAX_REQUESTS ?? 200),
+    pollGuardApiKeyRateLimitWindowMs: Number(env.CHAT_POLL_GUARD_API_KEY_RATE_LIMIT_WINDOW_MS ?? 60_000),
+    pollGuardApiKeyRateLimitMaxEntries: Number(env.CHAT_POLL_GUARD_API_KEY_RATE_LIMIT_MAX_ENTRIES ?? 2000),
   };
 
   const result = ChatSettingsSchema.safeParse(candidate);

@@ -182,6 +182,14 @@ export const ApprovalRecordSchema = z.object({
   failureClass: RefundExecutionFailureClassSchema.optional(),
   /** F4 - whether the refund might actually have been applied upstream, independent of whether WE can retry it. */
   upstreamMaybeReceived: z.boolean().optional(),
+  /**
+   * Milestone 5, Stage 1b - `key:<apiKeyId>` / `admin:<credentialId>` /
+   * `'system:auto_execute'` for every new write; a bare id with no prefix
+   * is a pre-Stage-1b (legacy) value. Deliberately left as a plain
+   * `z.string()` here, never tightened to only the three new forms, so a
+   * legacy document keeps validating - use `parseDecidedBy`/
+   * `describeDecidedBy` (decided-by.ts) to interpret either shape.
+   */
   decidedBy: z.string().optional(),
   decidedAt: z.string().optional(),
   expiresAt: z.string(),

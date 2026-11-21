@@ -40,6 +40,15 @@ function makeSettings(overrides: Partial<ChatSettings> = {}): ChatSettings {
     pollRateLimitMaxRequests: 100,
     pollRateLimitWindowMs: 600_000,
     pollRateLimitMaxEntries: 1000,
+    pollTenantRateLimitMaxRequests: 1000,
+    pollTenantRateLimitWindowMs: 60_000,
+    pollTenantRateLimitMaxEntries: 1000,
+    pollGuardIpRateLimitMaxRequests: 1000,
+    pollGuardIpRateLimitWindowMs: 60_000,
+    pollGuardIpRateLimitMaxEntries: 1000,
+    pollGuardApiKeyRateLimitMaxRequests: 1000,
+    pollGuardApiKeyRateLimitWindowMs: 60_000,
+    pollGuardApiKeyRateLimitMaxEntries: 1000,
     ...overrides,
   };
 }
@@ -50,6 +59,7 @@ function makeService(opts: {
   customerPublicKeyRepository?: InMemoryCustomerPublicKeyRepository;
   settings?: Partial<ChatSettings>;
   pollRateLimiter?: RateLimiter;
+  pollTenantRateLimiter?: RateLimiter;
 } = {}): {
   service: ConversationMessagesService;
   conversationRepository: InMemoryConversationRepository;
@@ -61,8 +71,16 @@ function makeService(opts: {
   const customerPublicKeyRepository = opts.customerPublicKeyRepository ?? new InMemoryCustomerPublicKeyRepository();
   const settings = makeSettings(opts.settings);
   const pollRateLimiter = opts.pollRateLimiter ?? new RateLimiter({ maxRequests: 1000, windowMs: 60_000, maxEntries: 1000 }, () => new Date());
+  const pollTenantRateLimiter = opts.pollTenantRateLimiter ?? new RateLimiter({ maxRequests: 1000, windowMs: 60_000, maxEntries: 1000 }, () => new Date());
 
-  const service = new ConversationMessagesService(conversationRepository, messageRepository, customerPublicKeyRepository, settings, pollRateLimiter);
+  const service = new ConversationMessagesService(
+    conversationRepository,
+    messageRepository,
+    customerPublicKeyRepository,
+    settings,
+    pollRateLimiter,
+    pollTenantRateLimiter,
+  );
   return { service, conversationRepository, messageRepository, customerPublicKeyRepository };
 }
 
@@ -76,7 +94,8 @@ describe('ConversationMessagesService', () => {
   it('returns NOT_CONFIGURED when a required repository is missing (no database)', async () => {
     const settings = makeSettings();
     const pollRateLimiter = new RateLimiter({ maxRequests: 100, windowMs: 60_000, maxEntries: 100 }, () => new Date());
-    const service = new ConversationMessagesService(undefined, undefined, undefined, settings, pollRateLimiter);
+    const pollTenantRateLimiter = new RateLimiter({ maxRequests: 100, windowMs: 60_000, maxEntries: 100 }, () => new Date());
+    const service = new ConversationMessagesService(undefined, undefined, undefined, settings, pollRateLimiter, pollTenantRateLimiter);
 
     const result = await service.getMessages({ tenantId: 'acme', matchedScope: 'public', conversationId: 'conv_1', rawQuery: {} });
 
@@ -314,5 +333,127 @@ describe('ConversationMessagesService', () => {
     const limited = await service.getMessages({ tenantId: 'acme', matchedScope: 'public', conversationId: conversation.id, rawQuery: {} });
     expect(limited).toMatchObject({ kind: 'error', code: 'RATE_LIMITED' });
     expect((limited as { retryAfterSeconds?: number }).retryAfterSeconds).toBeGreaterThan(0);
+  });
+
+  it('Part 0 item P1: the NEW per-tenant poll limiter rejects once ITS bucket is exhausted, independent of the per-conversation one', async () => {
+    const pollTenantRateLimiter = new RateLimiter({ maxRequests: 1, windowMs: 60_000, maxEntries: 100 }, () => new Date());
+    const { service, conversationRepository } = makeService({ pollTenantRateLimiter });
+    const conversation = await conversationRepository.create('acme', null);
+
+    const ok = await service.getMessages({ tenantId: 'acme', matchedScope: 'public', conversationId: conversation.id, rawQuery: {} });
+    expect(ok.kind).toBe('success');
+
+    const limited = await service.getMessages({ tenantId: 'acme', matchedScope: 'public', conversationId: conversation.id, rawQuery: {} });
+    expect(limited).toMatchObject({ kind: 'error', code: 'RATE_LIMITED', message: 'Too many polling requests for this tenant.' });
+  });
+
+  it(
+    'Part 0 item P1 - the two-limiter INTERACTION under several simulated visitors: the per-tenant bucket catches ' +
+      'aggregate load across many conversations that each individual per-conversation bucket, alone, would never see',
+    async () => {
+      // Five independent "visitors" = five different conversations under the SAME tenant. Each
+      // visitor's own per-conversation bucket is generous (20) - no single visitor is anywhere
+      // near its own limit. The TENANT bucket (8) is what actually catches the combined load,
+      // proving the two limiters interact correctly rather than one silently making the other
+      // irrelevant.
+      const pollRateLimiter = new RateLimiter({ maxRequests: 20, windowMs: 60_000, maxEntries: 100 }, () => new Date());
+      const pollTenantRateLimiter = new RateLimiter({ maxRequests: 8, windowMs: 60_000, maxEntries: 100 }, () => new Date());
+      const { service, conversationRepository } = makeService({ pollRateLimiter, pollTenantRateLimiter });
+
+      const visitorCount = 5;
+      const conversations = await Promise.all(
+        Array.from({ length: visitorCount }, () => conversationRepository.create('acme', null)),
+      );
+
+      const outcomes: string[] = [];
+      // Round-robin: visitor 0 polls, then visitor 1, ... then back to 0 - exactly what several
+      // independent polling loops interleaved on one event loop would produce. 2 rounds = 10
+      // total requests across 5 visitors (2 each) - well under any ONE visitor's own 20-request
+      // bucket, but over the shared tenant bucket of 8.
+      for (let round = 0; round < 2; round++) {
+        for (const conversation of conversations) {
+          const result = await service.getMessages({ tenantId: 'acme', matchedScope: 'public', conversationId: conversation.id, rawQuery: {} });
+          outcomes.push(result.kind === 'error' ? result.code : result.kind);
+        }
+      }
+
+      const successCount = outcomes.filter((o) => o === 'success').length;
+      const rateLimitedCount = outcomes.filter((o) => o === 'RATE_LIMITED').length;
+      expect(successCount).toBe(8); // exactly the tenant bucket's own cap - never more.
+      expect(rateLimitedCount).toBe(10 - 8);
+      // And no individual visitor's own per-conversation bucket (cap 20) was ever the cause -
+      // confirm by checking the SAME scenario with the tenant limiter effectively unbounded.
+      const { service: unboundedTenantService } = makeService({
+        pollRateLimiter: new RateLimiter({ maxRequests: 20, windowMs: 60_000, maxEntries: 100 }, () => new Date()),
+        pollTenantRateLimiter: new RateLimiter({ maxRequests: 1000, windowMs: 60_000, maxEntries: 100 }, () => new Date()),
+        conversationRepository,
+      });
+      const unboundedOutcomes: string[] = [];
+      for (let round = 0; round < 2; round++) {
+        for (const conversation of conversations) {
+          const result = await unboundedTenantService.getMessages({ tenantId: 'acme', matchedScope: 'public', conversationId: conversation.id, rawQuery: {} });
+          unboundedOutcomes.push(result.kind === 'error' ? result.code : result.kind);
+        }
+      }
+      expect(unboundedOutcomes.every((o) => o === 'success')).toBe(true);
+    },
+  );
+
+  it('an unchanged conversation returns kind: not_modified when If-None-Match matches the current ETag, and never queries for messages', async () => {
+    const conversationRepository = new InMemoryConversationRepository();
+    const realMessageRepository = new InMemoryMessageRepository();
+    let findPageCalls = 0;
+    const spyingMessageRepository: InMemoryMessageRepository = Object.create(realMessageRepository, {
+      findPageForConversation: {
+        value: (...args: Parameters<InMemoryMessageRepository['findPageForConversation']>) => {
+          findPageCalls++;
+          return realMessageRepository.findPageForConversation(...args);
+        },
+      },
+    });
+    const { service } = makeService({ conversationRepository, messageRepository: spyingMessageRepository });
+    const conversation = await conversationRepository.create('acme', null);
+    await realMessageRepository.create('acme', conversation.id, 'customer', 'hello');
+
+    const first = await service.getMessages({ tenantId: 'acme', matchedScope: 'public', conversationId: conversation.id, rawQuery: {} });
+    expect(first.kind).toBe('success');
+    if (first.kind !== 'success') return;
+    expect(findPageCalls).toBe(1);
+
+    const second = await service.getMessages({
+      tenantId: 'acme',
+      matchedScope: 'public',
+      conversationId: conversation.id,
+      rawQuery: {},
+      ifNoneMatch: first.etag,
+    });
+    expect(second).toEqual({ kind: 'not_modified', etag: first.etag });
+    expect(findPageCalls).toBe(1); // still 1 - the second call never reached the message query at all.
+  });
+
+  it('the ETag changes once a new message is added, so a stale If-None-Match no longer short-circuits', async () => {
+    const { service, conversationRepository, messageRepository } = makeService();
+    const conversation = await conversationRepository.create('acme', null);
+    await messageRepository.create('acme', conversation.id, 'customer', 'hello');
+
+    const first = await service.getMessages({ tenantId: 'acme', matchedScope: 'public', conversationId: conversation.id, rawQuery: {} });
+    expect(first.kind).toBe('success');
+    if (first.kind !== 'success') return;
+
+    await conversationRepository.incrementMessageCount('acme', conversation.id, 2);
+    await messageRepository.create('acme', conversation.id, 'agent', 'reply');
+
+    const second = await service.getMessages({
+      tenantId: 'acme',
+      matchedScope: 'public',
+      conversationId: conversation.id,
+      rawQuery: {},
+      ifNoneMatch: first.etag,
+    });
+    expect(second.kind).toBe('success');
+    if (second.kind === 'success') {
+      expect(second.etag).not.toBe(first.etag);
+      expect(second.body.messages.map((m) => m.content)).toEqual(['hello', 'reply']);
+    }
   });
 });
