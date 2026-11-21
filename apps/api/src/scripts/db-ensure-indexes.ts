@@ -54,6 +54,8 @@ import { AgentRunSchema } from '../db/schemas/agent-run.schema';
 import { CustomerPublicKeySchema } from '../db/schemas/customer-public-key.schema';
 import { APPROVAL_ACTIVE_ORDER_UNIQUE_INDEX_NAME, APPROVAL_RUN_UNIQUE_INDEX_NAME, ApprovalSchema } from '../approvals/schemas/approval.schema';
 import { AGENT_RUN_RUN_UNIQUE_INDEX_NAME } from '../db/schemas/agent-run.schema';
+import { AdminCredentialSchema } from '../db/schemas/admin-credential.schema';
+import { AdminSessionSchema } from '../db/schemas/admin-session.schema';
 
 export const COLLECTION_NAME = 'policyChunks';
 export const POLL_INTERVAL_MS = 10_000;
@@ -823,6 +825,8 @@ export function buildIndexPlans(
   const agentRunModel = mongoose.model('AgentRun', AgentRunSchema);
   const customerPublicKeyModel = mongoose.model('CustomerPublicKey', CustomerPublicKeySchema);
   const approvalModel = mongoose.model('Approval', ApprovalSchema);
+  const adminCredentialModel = mongoose.model('AdminCredential', AdminCredentialSchema);
+  const adminSessionModel = mongoose.model('AdminSession', AdminSessionSchema);
 
   const vectorSearchDeps: EnsureIndexDeps = {
     listCollectionNames: async () => {
@@ -885,6 +889,22 @@ export function buildIndexPlans(
       // assuming away.
       APPROVAL_RUN_UNIQUE_INDEX_NAME,
     ),
+    // Milestone 5, Stage 1b, item 8 - no TTL at all (a credential never auto-expires, only an
+    // explicit set-admin-credential.ts run ever replaces one). The email uniqueness is a plain
+    // schema-declared index (admin-credential.schema.ts), picked up automatically below like any
+    // other regular index - no special-case handling needed.
+    makeCollectionDeps('AdminCredential', adminCredentialModel, 'adminCredentials', expireAfterSeconds),
+    // The tokenHash uniqueness AND the absoluteExpiresAt TTL are BOTH plain schema-declared
+    // indexes (admin-session.schema.ts) - deliberately NOT wired through this script's own
+    // ttlField/expireAfterSeconds mechanism below (no `ttlField` argument passed here). That
+    // out-of-band mechanism exists specifically so a TUNABLE retention-days setting can change an
+    // existing TTL index's expiry via collMod without a disruptive drop+recreate - absoluteExpiresAt's
+    // TTL is a FIXED expireAfterSeconds:0 (delete once the already-stored absolute timestamp
+    // passes, never a relative "N days after createdAt" window) that will never need that kind of
+    // change, so a plain schema-declared index is simpler and carries none of the two-system
+    // conflict this script's own module doc comment describes - diffSchemaIndexes() alone manages
+    // it, exactly like {tenantId,principalId} and every other ordinary index here.
+    makeCollectionDeps('AdminSession', adminSessionModel, 'adminSessions', expireAfterSeconds),
   ];
 
   return { collectionPlans, vectorSearchDeps };

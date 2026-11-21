@@ -10,3 +10,5 @@ export * from './retrieval.schema';
 export * from './tool-schemas';
 export * from './connector-config.schema';
 export * from './conversation-messages-schemas';
+export * from './admin-auth-schemas';
+export * from './decided-by';

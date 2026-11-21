@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConnectorsModule } from '../connectors/connectors.module';
 import { ToolRunnerModule } from '../agent/tool-runner/tool-runner.module';
 import { DatabaseModule } from '../db/database.module';
+import { AdminAuthModule } from '../admin-auth/admin-auth.module';
 import { APPROVAL_PROPOSAL_PORT } from './approval-proposal.port';
 import { approvalDecisionRateLimiterProvider } from './approval-decision-rate-limiter.provider';
 import { approvalsReadOnlyToolRunnerProvider } from './approvals-read-only-tool-runner.provider';
@@ -54,7 +55,7 @@ export function approvalsDatabaseImportsFor(env: NodeJS.ProcessEnv): [typeof Dat
  * provider.
  */
 @Module({
-  imports: [ToolRunnerModule, ConnectorsModule, ...approvalsDatabaseImportsFor(process.env)],
+  imports: [ToolRunnerModule, ConnectorsModule, AdminAuthModule, ...approvalsDatabaseImportsFor(process.env)],
   controllers: [ApprovalsController],
   providers: [
     ApprovalService,

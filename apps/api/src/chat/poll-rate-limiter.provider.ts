@@ -22,3 +22,24 @@ export const pollRateLimiterProvider: Provider = {
       () => new Date(),
     ),
 };
+
+/**
+ * Part 0, item P1 - keyed by tenantId alone: many visitors of the SAME
+ * tenant's widget, summed, on top of (never instead of) the per-conversation
+ * bucket above. Sized for ASSUMED_CONCURRENT_VISITORS (poll-rate-limit-headroom.ts).
+ */
+export const POLL_TENANT_RATE_LIMITER = Symbol('POLL_TENANT_RATE_LIMITER');
+
+export const pollTenantRateLimiterProvider: Provider = {
+  provide: POLL_TENANT_RATE_LIMITER,
+  inject: [CHAT_SETTINGS],
+  useFactory: (settings: ChatSettings) =>
+    new RateLimiter(
+      {
+        maxRequests: settings.pollTenantRateLimitMaxRequests,
+        windowMs: settings.pollTenantRateLimitWindowMs,
+        maxEntries: settings.pollTenantRateLimitMaxEntries,
+      },
+      () => new Date(),
+    ),
+};

@@ -25,6 +25,9 @@ import { AgentRunSchema } from '../../src/db/schemas/agent-run.schema';
 import { CustomerPublicKeySchema } from '../../src/db/schemas/customer-public-key.schema';
 import { ApprovalSchema } from '../../src/approvals/schemas/approval.schema';
 import { DEMO_TENANT_SETTINGS } from '../../src/db/tenant.repository';
+import { AdminCredentialSchema } from '../../src/db/schemas/admin-credential.schema';
+import { AdminSessionSchema } from '../../src/db/schemas/admin-session.schema';
+import { hashPassword } from '../../src/admin-auth/password-hash';
 
 export interface TenantFixture {
   tenantId: string;
@@ -145,6 +148,8 @@ export async function cleanupTenant(uri: string, tenantId: string): Promise<void
   const AgentRunModel = mongoose.model('AgentRun', AgentRunSchema);
   const CustomerPublicKeyModel = mongoose.model('CustomerPublicKey', CustomerPublicKeySchema);
   const ApprovalModel = mongoose.model('Approval', ApprovalSchema);
+  const AdminCredentialModel = mongoose.model('AdminCredential', AdminCredentialSchema);
+  const AdminSessionModel = mongoose.model('AdminSession', AdminSessionSchema);
 
   await Promise.all([
     TenantModel.deleteOne({ _id: tenantId }),
@@ -157,7 +162,24 @@ export async function cleanupTenant(uri: string, tenantId: string): Promise<void
     CustomerPublicKeyModel.deleteMany({ tenantId }),
     // Milestone 4 - Approval rows a test created directly against the real database.
     ApprovalModel.deleteMany({ tenantId }),
+    // Milestone 5, Stage 1b - AdminCredential's own _id IS the tenantId.
+    AdminCredentialModel.deleteOne({ _id: tenantId }),
+    AdminSessionModel.deleteMany({ tenantId }),
   ]);
+}
+
+/**
+ * Milestone 5, Stage 1b - the test-only equivalent of
+ * `pnpm run set-admin-credential`, direct model creation (never going
+ * through `MongooseAdminCredentialRepository`), same convention every other
+ * fixture helper in this file already follows. Returns the plaintext
+ * password so the test can actually log in with it.
+ */
+export async function createAdminCredentialFixture(uri: string, tenantId: string, email: string, password: string): Promise<{ email: string; password: string }> {
+  await ensureConnected(uri);
+  const AdminCredentialModel = mongoose.model('AdminCredential', AdminCredentialSchema);
+  await AdminCredentialModel.create({ _id: tenantId, email, passwordHash: await hashPassword(password), failedAttempts: 0, lockedUntil: null });
+  return { email, password };
 }
 
 export async function disconnectFixtureConnection(): Promise<void> {

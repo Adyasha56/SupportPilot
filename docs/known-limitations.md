@@ -32,6 +32,66 @@ deployment"). Fixing it for real would mean moving every one of these to a
 shared store (Redis, or MongoDB itself) - a real piece of future work, not
 a small patch.
 
+## The per-API-key chat limit is a TENANT-WIDE throttle, not a per-visitor one
+
+`ChatSettings.rateLimitApiKeyMaxRequests` (default 60/min, enforced by
+`ApiKeyGuard`'s per-key `RateLimiter`) is keyed by the `ApiKey` document's
+own id - and a tenant's public widget key is exactly ONE document, shared
+by every visitor of that tenant's widget. This was the direct cause of a
+real bug found and fixed in Part 0 of the Milestone 5, Stage 1a follow-up
+(see the next section): before the fix, the widget's polling endpoint ALSO
+spent this same shared budget, so a handful of concurrent visitors polling
+at a few requests/minute each could sum past 60/min and get everyone -
+every visitor's chat send included - a `429`, even though no single visitor
+was individually anywhere near a reasonable rate. The polling-vs-chat
+sharing is now fixed (next section) - but the underlying design point
+remains, and is worth stating plainly: **this limit was never really
+"per API key" in the sense its name suggests - it's per TENANT**, since
+one tenant's widget traffic is, in practice, one shared key's traffic.
+A tenant with many simultaneous customers sending chat messages (not just
+polling) can still collectively hit this one shared bucket today.
+
+**Proposed fix, not yet built**: make this limit a genuine per-tenant
+*setting* (`Tenant.settings`, alongside `refundCap`/`approvalThreshold`),
+sized by each tenant's own expected traffic, rather than one fixed global
+default (`CHAT_RATE_LIMIT_API_KEY_MAX_REQUESTS`) applied identically
+regardless of a tenant's actual visitor volume. This would also let a
+tenant genuinely expecting high concurrent chat volume raise their own
+limit without changing the default for every other tenant.
+
+## Part 0 (Milestone 5 Stage 1a follow-up), item P1 - the polling endpoint used to share chat's own guard-level buckets
+
+Confirmed directly from the code: `ConversationMessagesController`
+originally carried `@UseGuards(ApiKeyGuard)` - the SAME `ApiKeyGuard`
+provider `ChatController` uses, both registered once in `ChatModule`'s
+`providers` array. NestJS providers are singletons by default, so sharing
+the provider meant sharing the exact same `RateLimiter` instances: the
+widget's polling traffic was silently spending the identical per-IP
+(20/min) and per-API-key (60/min, see the section above) budget as
+chat-SENDING traffic. Five concurrent visitors polling at the original 3s/
+10s cadence (13 requests/60s each) summed to 65/minute on the ONE shared
+per-key bucket - over the 60/min default, 429-ing every visitor's chat AND
+polling requests, not just the "excess" ones; visitors sharing a NAT'd IP
+hit the per-IP bucket the identical way.
+
+**Fixed**: `ConversationMessagesController` now carries its own
+`PollApiKeyGuard` (`apps/api/src/chat/poll-api-key-guard.ts`) - the same
+authentication logic (inherited from `ApiKeyGuard`, not copied), but with
+its own, entirely independent per-IP/per-key `RateLimiter` instances
+(`CHAT_POLL_GUARD_IP_RATE_LIMIT_*`/`CHAT_POLL_GUARD_API_KEY_RATE_LIMIT_*`).
+A new per-TENANT poll bucket (`CHAT_POLL_TENANT_RATE_LIMIT_*`) was also
+added, on top of the pre-existing per-conversation one, since many
+visitors of one tenant's widget can still sum past a per-conversation
+bucket's own, narrower limit. Every one of these four buckets is sized
+against `ASSUMED_CONCURRENT_VISITORS` (20, a stated assumption -
+`apps/api/src/chat/poll-rate-limit-headroom.ts`), not a single visitor -
+see `poll-rate-limit-headroom.spec.ts` for the worst-case math each
+default is checked against. The documented polling cadence was also
+revised (cheaper: 5s start, back off to 15s after 30s) and the endpoint now
+supports a conditional `ETag`/`If-None-Match` response, so an unchanged
+poll skips the message-page query entirely - both reduce real load
+further, on top of the bucket fix itself.
+
 ## Config read at import time in several modules
 
 `app.module.ts`, `auth.module.ts`, `chat.module.ts`, `ingestion.module.ts`,
@@ -212,6 +272,34 @@ worth knowing if a future admin-console security review goes looking for a
 403/404 here and doesn't find one. The widget's own static root
 (`widget-static.ts`) has no such fallback registered after it, so the
 identical attempts there DO surface as a plain, distinguishable 404.
+
+## Admin console: one credential per tenant, no self-service password reset
+
+Milestone 5, Stage 1b deliberately ships the single-admin-per-tenant model
+PROJECT.md section 6 already decided (no roles, no multi-admin, no SSO -
+explicit non-goals). Two concrete consequences worth stating plainly:
+
+- **No password reset flow of any kind** (no "forgot password" email, no
+  reset link - there's no email-sending capability in this project at all).
+  The only way to change a tenant's admin password is `pnpm run
+  set-admin-credential`, run by whoever has direct database access - the
+  same person/role who already runs `create-api-key`/`set-tenant-settings`
+  today. This is the explicit, accepted recovery path, not a gap to fix
+  later at this project's scale.
+- **A locked-out admin's recovery path is the tenant's own `admin`-scoped
+  API key** (`create-api-key.ts --scope=admin`), which authenticates via
+  `AdminAuthGuard`'s header path and is never subject to the password
+  lockout at all (lockout only ever applies to the password-login path) -
+  see `docs/manual-testing.md`'s own lockout-and-recovery walkthrough.
+
+Unlike every in-memory guard this project already documents above
+("Single-instance assumptions"), `AdminSession` rows live in MongoDB, not
+process memory - a session genuinely survives a restart/redeploy and is
+correctly shared across instances if this were ever horizontally scaled
+(PROJECT.md's own non-goal, but worth noting the session store itself
+isn't what would need fixing first). The per-IP login limiter and the
+scrypt `HashConcurrencyLimiter`, however, ARE single-instance in-memory
+state, for the same accepted reason every other limiter in this project is.
 
 ## An unexpected infra fault during admin decision execution returns a bare 500
 

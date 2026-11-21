@@ -504,6 +504,8 @@ describe('buildIndexPlans', () => {
       'AgentRun',
       'CustomerPublicKey',
       'Approval',
+      'AdminCredential',
+      'AdminSession',
     ]);
 
     const policyChunkPlan = collectionPlans.find((plan) => plan.label === 'PolicyChunk')!;

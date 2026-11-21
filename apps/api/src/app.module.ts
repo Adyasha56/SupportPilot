@@ -9,6 +9,7 @@ import { LlmModule } from './llm/llm.module';
 import { IngestionModule } from './ingestion/ingestion.module';
 import { RetrievalModule } from './retrieval/retrieval.module';
 import { ChatModule } from './chat/chat.module';
+import { AdminAuthModule } from './admin-auth/admin-auth.module';
 
 /**
  * DatabaseModule itself is only imported when MONGODB_URI is actually set -
@@ -30,6 +31,7 @@ const databaseImports = process.env.MONGODB_URI ? [DatabaseModule] : [];
     IngestionModule,
     RetrievalModule,
     ChatModule,
+    AdminAuthModule,
     ...databaseImports,
   ],
   controllers: [HealthController],

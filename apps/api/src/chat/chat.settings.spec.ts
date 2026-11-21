@@ -62,6 +62,15 @@ describe('loadChatSettingsFromEnv', () => {
       CHAT_POLL_RATE_LIMIT_MAX_REQUESTS: '40',
       CHAT_POLL_RATE_LIMIT_WINDOW_MS: '120000',
       CHAT_POLL_RATE_LIMIT_MAX_ENTRIES: '2000',
+      CHAT_POLL_TENANT_RATE_LIMIT_MAX_REQUESTS: '150',
+      CHAT_POLL_TENANT_RATE_LIMIT_WINDOW_MS: '45000',
+      CHAT_POLL_TENANT_RATE_LIMIT_MAX_ENTRIES: '400',
+      CHAT_POLL_GUARD_IP_RATE_LIMIT_MAX_REQUESTS: '150',
+      CHAT_POLL_GUARD_IP_RATE_LIMIT_WINDOW_MS: '45000',
+      CHAT_POLL_GUARD_IP_RATE_LIMIT_MAX_ENTRIES: '4000',
+      CHAT_POLL_GUARD_API_KEY_RATE_LIMIT_MAX_REQUESTS: '150',
+      CHAT_POLL_GUARD_API_KEY_RATE_LIMIT_WINDOW_MS: '45000',
+      CHAT_POLL_GUARD_API_KEY_RATE_LIMIT_MAX_ENTRIES: '1500',
     });
 
     expect(settings).toEqual({
@@ -94,6 +103,15 @@ describe('loadChatSettingsFromEnv', () => {
       pollRateLimitMaxRequests: 40,
       pollRateLimitWindowMs: 120000,
       pollRateLimitMaxEntries: 2000,
+      pollTenantRateLimitMaxRequests: 150,
+      pollTenantRateLimitWindowMs: 45000,
+      pollTenantRateLimitMaxEntries: 400,
+      pollGuardIpRateLimitMaxRequests: 150,
+      pollGuardIpRateLimitWindowMs: 45000,
+      pollGuardIpRateLimitMaxEntries: 4000,
+      pollGuardApiKeyRateLimitMaxRequests: 150,
+      pollGuardApiKeyRateLimitWindowMs: 45000,
+      pollGuardApiKeyRateLimitMaxEntries: 1500,
     });
   });
 
