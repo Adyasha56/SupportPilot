@@ -42,13 +42,32 @@ afterAll(async () => {
 
 describe.skipIf(!integrationTestsEnabled())('Admin console authentication (integration, real database)', () => {
   let app: INestApplication;
+  let priorDevCookieEnv: string | undefined;
 
   beforeAll(async () => {
+    // This suite talks to the app over plain HTTP (supertest's in-process server, never real
+    // TLS) - the PRODUCTION session cookie is `Secure`, which `superagent`'s own cookie jar
+    // (what `request.agent()` uses below) correctly refuses to resend over a non-HTTPS
+    // connection, exactly like a real browser would. Without this, the login itself succeeds
+    // but the cookie never survives to the next request - AdminAuthGuard then (correctly) sees
+    // no cookie at all. Same reason docs/manual-testing.md's own section 10b tells a human to
+    // set this for http://localhost; this is that same requirement, for this test's transport.
+    // Read by admin-auth.settings.ts at module-compile time, so it MUST be set before compile().
+    priorDevCookieEnv = process.env.ADMIN_DEV_COOKIE_ENABLED;
+    process.env.ADMIN_DEV_COOKIE_ENABLED = 'true';
+
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = moduleRef.createNestApplication();
     await app.init();
   }, 60_000);
-  afterAll(() => app.close());
+  afterAll(async () => {
+    await app.close();
+    if (priorDevCookieEnv === undefined) {
+      delete process.env.ADMIN_DEV_COOKIE_ENABLED;
+    } else {
+      process.env.ADMIN_DEV_COOKIE_ENABLED = priorDevCookieEnv;
+    }
+  });
 
   it('a full login -> cookie-authenticated approvals list -> logout round trip, with CSRF on the state change', async () => {
     const tenant = await newTenant();
