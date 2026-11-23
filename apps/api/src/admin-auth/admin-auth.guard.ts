@@ -126,10 +126,35 @@ export class AdminAuthGuard implements CanActivate {
       context.getClass(),
     ]) ?? DEFAULT_MINIMUM_SCOPE;
 
+    // TEMPORARY DIAGNOSTIC (remove once the connectors-admin 401 is root-caused) -
+    // console.error so it surfaces regardless of Logger configuration.
+    console.error(
+      'DEBUG_ADMIN_AUTH_GUARD',
+      JSON.stringify({
+        url: request.url,
+        method: request.method,
+        hasAuthHeader: Boolean(request.headers.authorization),
+        requiredScope,
+        hasApiKeyRepository: Boolean(this.apiKeyRepository),
+        hasSessionRepository: Boolean(this.sessionRepository),
+        className: context.getClass()?.name,
+        handlerName: context.getHandler()?.name,
+      }),
+    );
+
     const authorizationHeader = request.headers.authorization;
-    const principal = authorizationHeader
-      ? await this.authenticateApiKey(authorizationHeader, requiredScope)
-      : await this.authenticateSession(request);
+    let principal: AdminPrincipal;
+    try {
+      principal = authorizationHeader
+        ? await this.authenticateApiKey(authorizationHeader, requiredScope)
+        : await this.authenticateSession(request);
+    } catch (err) {
+      console.error(
+        'DEBUG_ADMIN_AUTH_GUARD_FAIL',
+        JSON.stringify({ url: request.url, errType: err instanceof Error ? err.constructor.name : typeof err, errMessage: err instanceof Error ? err.message : String(err) }),
+      );
+      throw err;
+    }
 
     this.checkPrincipalRateLimit(principal, context);
 
@@ -158,6 +183,17 @@ export class AdminAuthGuard implements CanActivate {
     const rawKey = authorizationHeader.slice('Bearer '.length);
     const candidateHash = hashApiKey(rawKey);
     const record = await this.apiKeyRepository!.findByHash(candidateHash);
+    console.error(
+      'DEBUG_ADMIN_AUTH_GUARD_KEY_LOOKUP',
+      JSON.stringify({
+        found: Boolean(record),
+        scopes: record?.scopes,
+        revokedAt: record?.revokedAt,
+        requiredScope,
+        verifies: record ? verifyApiKeyHash(candidateHash, record.hash) : undefined,
+        scopeSatisfiesResult: record ? scopeSatisfies(record.scopes, requiredScope) : undefined,
+      }),
+    );
     if (!record || !verifyApiKeyHash(candidateHash, record.hash) || record.revokedAt || !scopeSatisfies(record.scopes, requiredScope)) {
       this.fail();
     }
@@ -171,12 +207,17 @@ export class AdminAuthGuard implements CanActivate {
     }
     const cookies = parseCookieHeader(request.headers.cookie);
     const rawToken = readSessionCookieValue(cookies);
+    console.error(
+      'DEBUG_ADMIN_AUTH_GUARD_SESSION_COOKIE',
+      JSON.stringify({ rawCookieHeader: request.headers.cookie, parsedCookieNames: Object.keys(cookies), hasRawToken: Boolean(rawToken) }),
+    );
     if (!rawToken) {
       this.fail();
     }
 
     const tokenHash = hashSessionToken(rawToken!);
     const session = await this.sessionRepository!.findByTokenHash(tokenHash);
+    console.error('DEBUG_ADMIN_AUTH_GUARD_SESSION_LOOKUP', JSON.stringify({ found: Boolean(session) }));
     if (!session || !tokensMatch(tokenHash, session.tokenHash)) {
       this.fail();
     }
