@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
+  ChunkLookupKey,
+  ChunkLookupResult,
   NewPolicyChunk,
   PolicyChunkRepository,
   VectorSearchParams,
@@ -88,6 +90,13 @@ export class InMemoryPolicyChunkRepository implements PolicyChunkRepository {
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
+  }
+
+  async findManyByDocumentIdAndPosition(tenantId: string, keys: ChunkLookupKey[]): Promise<ChunkLookupResult[]> {
+    const wanted = new Set(keys.map((key) => `${key.documentId}:${key.position}`));
+    return this.chunks
+      .filter((chunk) => chunk.tenantId === tenantId && wanted.has(`${chunk.documentId}:${chunk.position}`))
+      .map((chunk) => ({ documentId: chunk.documentId, position: chunk.position, headingPath: chunk.headingPath, title: chunk.title }));
   }
 
   private removeWhere(predicate: (chunk: StoredChunk) => boolean): void {

@@ -14,6 +14,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import mongoose from 'mongoose';
+import { generateConversationId } from '../../src/db/conversation-id';
 import { generateRawApiKey, getKeyPrefix, hashApiKey } from '../../src/auth/api-key.service';
 import { ApiKeySchema, ApiKeyScope } from '../../src/db/schemas/api-key.schema';
 import { TenantSchema } from '../../src/db/schemas/tenant.schema';
@@ -180,6 +181,45 @@ export async function createAdminCredentialFixture(uri: string, tenantId: string
   const AdminCredentialModel = mongoose.model('AdminCredential', AdminCredentialSchema);
   await AdminCredentialModel.create({ _id: tenantId, email, passwordHash: await hashPassword(password), failedAttempts: 0, lockedUntil: null });
   return { email, password };
+}
+
+/**
+ * Stage 1c, item 2/6 - a Conversation with one Message pair and one
+ * AgentRun, seeded directly via Mongoose (never through chat.service.ts -
+ * running the real agent loop is far more than this fixture needs). Used
+ * by the conversations-admin integration tests to exercise
+ * GET /v1/conversations/:id against a real, non-trivial document.
+ */
+export async function createConversationWithRunFixture(
+  uri: string,
+  tenantId: string,
+  customerRef: string | null = null,
+): Promise<{ conversationId: string; runId: string }> {
+  await ensureConnected(uri);
+  const ConversationModel = mongoose.model('Conversation', ConversationSchema);
+  const MessageModel = mongoose.model('Message', MessageSchema);
+  const AgentRunModel = mongoose.model('AgentRun', AgentRunSchema);
+
+  const conversationId = generateConversationId();
+  await ConversationModel.create({ _id: conversationId, tenantId, customerRef, status: 'open', messageCount: 2 });
+  await MessageModel.create({ tenantId, conversationId, role: 'customer', content: 'where is my order' });
+  await MessageModel.create({ tenantId, conversationId, role: 'agent', content: 'let me check that for you' });
+
+  const runId = `r_${randomUUID().replace(/-/g, '')}`;
+  await AgentRunModel.create({
+    tenantId,
+    runId,
+    conversationId,
+    outcome: 'reply',
+    stepCount: 2,
+    llmCallCount: 2,
+    tokensIn: 50,
+    tokensOut: 80,
+    latencyMs: 500,
+    steps: [{ type: 'plan', durationMs: 10, outcomeCode: 'OK' }, { type: 'compose', durationMs: 20, outcomeCode: 'OK' }],
+  });
+
+  return { conversationId, runId };
 }
 
 export async function disconnectFixtureConnection(): Promise<void> {

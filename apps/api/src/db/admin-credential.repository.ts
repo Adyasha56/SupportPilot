@@ -29,6 +29,8 @@ export interface AdminCredentialRepository {
   incrementFailedAttempts(tenantId: string, lockedUntil: Date | null): Promise<AdminCredentialRecord | null>;
   /** On a successful login - failedAttempts back to 0, lockedUntil cleared. */
   resetFailedAttempts(tenantId: string): Promise<void>;
+  /** Part 0, item Q1 - rehash-on-successful-login. A NARROW, single-field update - deliberately never touches failedAttempts/lockedUntil/email, unlike `upsert` (which is an administrative reset, not a transparent background rehash). */
+  updatePasswordHash(tenantId: string, passwordHash: string): Promise<void>;
   /** Test/ops cleanup only. */
   deleteForTenant(tenantId: string): Promise<void>;
 }
@@ -86,6 +88,10 @@ export class MongooseAdminCredentialRepository implements AdminCredentialReposit
 
   async resetFailedAttempts(tenantId: string): Promise<void> {
     await this.model.updateOne({ _id: tenantId }, { $set: { failedAttempts: 0, lockedUntil: null } });
+  }
+
+  async updatePasswordHash(tenantId: string, passwordHash: string): Promise<void> {
+    await this.model.updateOne({ _id: tenantId }, { $set: { passwordHash } });
   }
 
   async deleteForTenant(tenantId: string): Promise<void> {

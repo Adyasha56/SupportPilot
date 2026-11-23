@@ -160,6 +160,31 @@ export interface PolicyChunkRepository {
    * output as already safe to serve.
    */
   vectorSearch(params: VectorSearchParams): Promise<VectorSearchResultItem[]>;
+  /**
+   * Stage 1c, item 2 - the admin conversation-detail view's citation
+   * resolution: given the `{documentId, position}` pairs parsed out of a
+   * historical AgentStep's `citedChunkKeys` (chunk-key.ts's own
+   * `parseChunkKey`), returns whichever of them still exist, with their
+   * CURRENT `headingPath`/`title` - best-effort, never throws for a
+   * document deleted since the run happened (that pair is simply absent
+   * from the result). Deliberately NOT filtered by `active` - an admin
+   * reviewing a past run's reasoning should still see which section a
+   * chunk came from even if that chunk has since been deactivated (not yet
+   * physically deleted); only a truly deleted chunk fails to resolve.
+   */
+  findManyByDocumentIdAndPosition(tenantId: string, keys: ChunkLookupKey[]): Promise<ChunkLookupResult[]>;
+}
+
+export interface ChunkLookupKey {
+  documentId: string;
+  position: number;
+}
+
+export interface ChunkLookupResult {
+  documentId: string;
+  position: number;
+  headingPath: string;
+  title: string;
 }
 
 export const POLICY_CHUNK_REPOSITORY = Symbol('POLICY_CHUNK_REPOSITORY');
@@ -200,5 +225,30 @@ export class MongoosePolicyChunkRepository implements PolicyChunkRepository {
 
   async vectorSearch(params: VectorSearchParams): Promise<VectorSearchResultItem[]> {
     return this.model.aggregate<VectorSearchResultItem>(buildVectorSearchPipeline(params));
+  }
+
+  async findManyByDocumentIdAndPosition(tenantId: string, keys: ChunkLookupKey[]): Promise<ChunkLookupResult[]> {
+    if (keys.length === 0) {
+      return [];
+    }
+    const documentObjectIds = new Map<string, Types.ObjectId>();
+    for (const key of keys) {
+      if (!documentObjectIds.has(key.documentId) && Types.ObjectId.isValid(key.documentId)) {
+        documentObjectIds.set(key.documentId, new Types.ObjectId(key.documentId));
+      }
+    }
+    if (documentObjectIds.size === 0) {
+      return [];
+    }
+
+    const docs = await this.model
+      .find({ tenantId, documentId: { $in: [...documentObjectIds.values()] } })
+      .select({ documentId: 1, position: 1, headingPath: 1, title: 1 })
+      .lean();
+
+    const wanted = new Set(keys.map((key) => `${key.documentId}:${key.position}`));
+    return docs
+      .map((doc) => ({ documentId: doc.documentId.toString(), position: doc.position, headingPath: doc.headingPath, title: doc.title }))
+      .filter((doc) => wanted.has(`${doc.documentId}:${doc.position}`));
   }
 }

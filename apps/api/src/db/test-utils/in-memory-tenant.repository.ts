@@ -1,4 +1,5 @@
 import { Tenant, TenantNotFoundError, TenantRepository, TenantSettingsPatch } from '../tenant.repository';
+import { validateEffectiveTenantSettings } from '../tenant-settings-validation';
 
 /** Mirrors updateSettings' own "only keys actually present are changed" rule - an explicit `undefined` in patch must never overwrite an existing stored value. */
 function removeUndefined(patch: TenantSettingsPatch): Partial<TenantSettingsPatch> {
@@ -28,12 +29,14 @@ export class InMemoryTenantRepository implements TenantRepository {
     return tenant;
   }
 
+  /** Mirrors MongooseTenantRepository.updateSettings' own "validate the EFFECTIVE merged settings" rule (tenant-settings-validation.ts) - not just this call's own patch in isolation. */
   async updateSettings(tenantId: string, patch: TenantSettingsPatch): Promise<Tenant> {
     const existing = this.tenants.get(tenantId);
     if (!existing) {
       throw new TenantNotFoundError(tenantId);
     }
     const updated: Tenant = { ...existing, ...removeUndefined(patch) };
+    validateEffectiveTenantSettings(updated);
     this.tenants.set(tenantId, updated);
     return updated;
   }

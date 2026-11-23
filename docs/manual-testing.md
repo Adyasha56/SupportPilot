@@ -497,6 +497,92 @@ applies to the password-login path, never to `AdminAuthGuard`'s header
 path, which is precisely why it's the documented recovery route when an
 admin is locked out of password login (`docs/known-limitations.md`).
 
+### 10h. Conversations (Stage 1c, item 2) - list and detail, via the session
+
+Reuses `$session` from 10c - a plain `GET`, no CSRF header needed:
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:3000/v1/conversations?limit=10" -WebSession $session
+```
+
+Returns `{conversations: [...], nextCursor?}`. Pass the next page's cursor
+back as `&cursor=<value>` (URL-encode it - `[uri]::EscapeDataString($cursor)`)
+to page forward; filter with `&status=open`, `&createdAfter=...`,
+`&createdBefore=...` (full ISO-8601 timestamps). Open one conversation's
+full detail - messages, every `AgentRun` (steps, outcome, citations by
+heading, token usage, `degraded`, `refundDisposition`, a `proposedAction`
+summary if one exists), and `customerRef` in full:
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:3000/v1/conversations/$env:SP_CONVERSATION_ID" -WebSession $session
+```
+
+An id belonging to another tenant or one that doesn't exist at all gets
+the identical `404` either way.
+
+### 10i. Tenant settings (Stage 1c, item 3) - read, and the step-up on write
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:3000/v1/tenant/settings" -WebSession $session
+```
+
+A non-restricted field (anything except `refundCap`/`autoExecuteRefunds`)
+changes with no password at all, same as an admin API key:
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:3000/v1/tenant/settings" -WebSession $session -Method Put -Headers @{ "x-csrf-token" = $csrf } -ContentType "application/json" -Body (@{ approvalThreshold = 300 } | ConvertTo-Json)
+```
+
+**Raising `refundCap` or enabling `autoExecuteRefunds` needs the real
+password in the body too** - omit it and you get `400 STEP_UP_REQUIRED`;
+get it wrong and you get `401 INVALID_PASSWORD` (counted toward the SAME
+lockout 10g describes - don't guess this one either). An admin **API
+key** gets `403 KEY_PRINCIPAL_CANNOT_CHANGE_FIELD` for either of these two
+fields, unconditionally - only a session can ever change them, by design:
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:3000/v1/tenant/settings" -WebSession $session -Method Put -Headers @{ "x-csrf-token" = $csrf } -ContentType "application/json" -Body (@{ refundCap = 3000; password = "a-real-password-at-least-12-chars" } | ConvertTo-Json)
+```
+
+Enabling `autoExecuteRefunds` additionally needs `confirmAutoExecute: true`
+and an already-set (or same-call) `dailyRefundCountLimit` - two more
+independent reasons someone would have to deliberately override before an
+unattended refund can ever fire:
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:3000/v1/tenant/settings" -WebSession $session -Method Put -Headers @{ "x-csrf-token" = $csrf } -ContentType "application/json" -Body (@{ autoExecuteRefunds = $true; confirmAutoExecute = $true; dailyRefundCountLimit = 3; password = "a-real-password-at-least-12-chars" } | ConvertTo-Json)
+```
+
+### 10j. Connectors (Stage 1c, item 4) - read-only, via the session or an admin key
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:3000/v1/connectors" -WebSession $session
+```
+
+Returns `{connectors: [{tool, description}, ...]}` only - never `secretRef`,
+the `request` block, `inputSchema`, `responseMap`, `riskLevel`, or
+`idPattern`, even though the real connector config files you set up in
+section 2 have all of those. There is no write path here at all (editing
+configs and testing a tool call from the console are deferred - see
+`docs/known-limitations.md`).
+
+### 10k. Policies now work via the session too (Stage 1c, item 1)
+
+Section 3c's upload used a `--scope=secret` API key - that still works
+unchanged. A cookie session ALSO works now (`PoliciesController` moved
+from `ApiKeyGuard` to `AdminAuthGuard`, minimum scope `secret`), with the
+CSRF token in a header exactly like every other state-changing session
+request - the multipart body doesn't change that:
+
+```powershell
+curl.exe -X POST "http://localhost:3000/v1/policies" -H "x-csrf-token: $csrf" -b "sp_session_dev=$($session.Cookies.GetCookies('http://localhost:3000') | Where-Object { $_.Name -eq 'sp_session_dev' } | Select-Object -ExpandProperty Value)" -F "title=Session Upload" -F "file=@sample-policy.md;type=text/markdown"
+```
+
+(`curl.exe`'s `-b` needs the raw cookie value pulled out of `$session`'s
+own jar by hand, the same reason section 3c already uses `curl.exe`
+rather than `Invoke-RestMethod` for the one multipart step - `-WebSession`
+only works with PowerShell's own cmdlets.)
+
 ---
 
 ## 11. Cleanup

@@ -25,6 +25,13 @@ export class InMemoryMessageRepository implements MessageRepository {
     return matching.slice(startIndex, startIndex + limit);
   }
 
+  /** Mirrors MongooseMessageRepository's own "most recent `limit`, oldest-first" behavior. */
+  async findAllForConversation(tenantId: string, conversationId: string, limit: number): Promise<MessageRecord[]> {
+    return this.messages
+      .filter((m) => m.tenantId === tenantId && m.conversationId === conversationId)
+      .slice(-limit);
+  }
+
   async deleteForTenant(tenantId: string): Promise<void> {
     for (let i = this.messages.length - 1; i >= 0; i--) {
       if (this.messages[i].tenantId === tenantId) {

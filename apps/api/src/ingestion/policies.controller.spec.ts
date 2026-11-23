@@ -3,10 +3,16 @@ import { INestApplication, Logger } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
-import { ApiKeyGuard } from '../auth/api-key.guard';
+import { AdminAuthGuard } from '../admin-auth/admin-auth.guard';
+import { AdminAuthSettings } from '../admin-auth/admin-auth.settings';
+import { ADMIN_AUTH_SETTINGS } from '../admin-auth/admin-auth-settings.provider';
+import { PRODUCTION_SESSION_COOKIE_NAME } from '../admin-auth/cookie-utils';
+import { hashSessionToken, mintCsrfToken, mintSessionToken } from '../admin-auth/session-token';
 import { generateRawApiKey, getKeyPrefix, hashApiKey } from '../auth/api-key.service';
 import { API_KEY_REPOSITORY } from '../db/api-key.repository';
+import { ADMIN_SESSION_REPOSITORY } from '../db/admin-session.repository';
 import { InMemoryApiKeyRepository } from '../db/test-utils/in-memory-api-key.repository';
+import { InMemoryAdminSessionRepository } from '../db/test-utils/in-memory-admin-session.repository';
 import { InMemoryPolicyChunkRepository } from '../db/test-utils/in-memory-policy-chunk.repository';
 import { InMemoryPolicyDocumentRepository } from '../db/test-utils/in-memory-policy-document.repository';
 import { POLICY_CHUNK_REPOSITORY } from '../db/policy-chunk.repository';
@@ -22,6 +28,30 @@ import { MulterExceptionFilter } from './multer-exception.filter';
 import { PoliciesController } from './policies.controller';
 import { PolicyIngestionService } from './policy-ingestion.service';
 import { TenantIngestionLock } from './tenant-ingestion-lock';
+
+const ALLOWED_ORIGIN = 'https://admin.supportpilot.example';
+
+function adminAuthSettings(overrides: Partial<AdminAuthSettings> = {}): AdminAuthSettings {
+  return {
+    hashMaxConcurrency: 6,
+    hashMaxQueueLength: 20,
+    sessionAbsoluteLifetimeMs: 8 * 60 * 60 * 1000,
+    sessionIdleTimeoutMs: 30 * 60 * 1000,
+    sessionLastSeenWriteIntervalMs: 60_000,
+    lockoutFreeAttempts: 3,
+    lockoutBaseMs: 1_000,
+    lockoutCapMs: 15 * 60 * 1000,
+    loginIpRateLimitMaxRequests: 1000,
+    loginIpRateLimitWindowMs: 60_000,
+    loginIpRateLimitMaxEntries: 1000,
+    devCookieEnabled: false,
+    allowedOrigins: [ALLOWED_ORIGIN],
+    principalRateLimitMaxRequests: 1000,
+    principalRateLimitWindowMs: 60_000,
+    principalRateLimitMaxEntries: 1000,
+    ...overrides,
+  };
+}
 
 function ingestionSettings(overrides: Partial<IngestionSettings> = {}): IngestionSettings {
   return {
@@ -68,20 +98,24 @@ async function buildApp(overrides: {
   ingestionSettings?: Partial<IngestionSettings>;
   llmSettings?: Partial<LlmSettings>;
   llmProvider?: { embed: (texts: string[], taskType: string) => Promise<unknown> };
+  adminAuthSettings?: Partial<AdminAuthSettings>;
 } = {}) {
   const apiKeyRepository = new InMemoryApiKeyRepository();
+  const sessionRepository = new InMemoryAdminSessionRepository();
   const documentRepository = new InMemoryPolicyDocumentRepository();
   const chunkRepository = new InMemoryPolicyChunkRepository();
 
   const moduleRef = await Test.createTestingModule({
     controllers: [PoliciesController],
     providers: [
-      ApiKeyGuard,
+      AdminAuthGuard,
       Reflector,
       PolicyIngestionService,
       TenantIngestionLock,
       MulterExceptionFilter,
       { provide: API_KEY_REPOSITORY, useValue: apiKeyRepository },
+      { provide: ADMIN_SESSION_REPOSITORY, useValue: sessionRepository },
+      { provide: ADMIN_AUTH_SETTINGS, useValue: adminAuthSettings(overrides.adminAuthSettings) },
       { provide: POLICY_DOCUMENT_REPOSITORY, useValue: documentRepository },
       { provide: POLICY_CHUNK_REPOSITORY, useValue: chunkRepository },
       { provide: TRANSACTION_RUNNER, useValue: { withTransaction: async (fn: (s: undefined) => Promise<unknown>) => fn(undefined) } },
@@ -94,14 +128,29 @@ async function buildApp(overrides: {
   const app = moduleRef.createNestApplication();
   await app.init();
 
-  async function createKey(tenantId: string, scope: 'public' | 'secret' = 'secret') {
+  async function createKey(tenantId: string, scope: 'public' | 'secret' | 'admin' = 'secret') {
     const rawKey = generateRawApiKey();
     const hash = hashApiKey(rawKey);
     const id = await apiKeyRepository.create(tenantId, hash, getKeyPrefix(rawKey), [scope]);
     return { rawKey, id };
   }
 
-  return { app, apiKeyRepository, documentRepository, chunkRepository, createKey };
+  async function createSession(tenantId: string) {
+    const rawSessionToken = mintSessionToken();
+    const csrfToken = mintCsrfToken();
+    await sessionRepository.create({
+      tenantId,
+      principalId: tenantId,
+      tokenHash: hashSessionToken(rawSessionToken),
+      csrfToken,
+      lastSeenAt: new Date(),
+      absoluteExpiresAt: new Date(Date.now() + 100_000),
+      idleTimeoutMs: 100_000,
+    });
+    return { cookie: `${PRODUCTION_SESSION_COOKIE_NAME}=${rawSessionToken}`, csrfToken };
+  }
+
+  return { app, apiKeyRepository, sessionRepository, documentRepository, chunkRepository, createKey, createSession };
 }
 
 describe('PoliciesController', () => {
@@ -414,12 +463,14 @@ describe('PoliciesController', () => {
       const moduleRef = await Test.createTestingModule({
         controllers: [PoliciesController],
         providers: [
-          ApiKeyGuard,
+          AdminAuthGuard,
           Reflector,
           PolicyIngestionService,
           TenantIngestionLock,
           MulterExceptionFilter,
           { provide: API_KEY_REPOSITORY, useValue: new InMemoryApiKeyRepository() },
+          { provide: ADMIN_SESSION_REPOSITORY, useValue: new InMemoryAdminSessionRepository() },
+          { provide: ADMIN_AUTH_SETTINGS, useValue: adminAuthSettings() },
           { provide: LLM_PROVIDER, useValue: new FakeLlmProvider() },
           { provide: LLM_SETTINGS, useValue: llmSettings() },
           { provide: INGESTION_SETTINGS, useValue: ingestionSettings() },
@@ -507,6 +558,109 @@ describe('PoliciesController', () => {
 
       expect(second.status).toBe(404);
       expect(second.body).toEqual(neverExisted.body);
+    });
+  });
+
+  describe('Stage 1c, item 1 - moved from ApiKeyGuard to AdminAuthGuard (minimum scope: secret)', () => {
+    it('an ADMIN-scoped API key works too - admin satisfies the secret minimum', async () => {
+      const built = await buildApp();
+      app = built.app;
+      const { rawKey } = await built.createKey('acme', 'admin');
+
+      const res = await request(app.getHttpServer())
+        .post('/v1/policies')
+        .set('Authorization', `Bearer ${rawKey}`)
+        .attach('file', Buffer.from(SAMPLE_MARKDOWN), 'policy.md');
+      expect(res.status).toBe(201);
+    });
+
+    it('a cookie-authenticated admin session can list and upload with no API key at all', async () => {
+      const built = await buildApp();
+      app = built.app;
+      const { cookie, csrfToken } = await built.createSession('acme');
+
+      const upload = await request(app.getHttpServer())
+        .post('/v1/policies')
+        .set('Cookie', cookie)
+        .set('x-csrf-token', csrfToken)
+        .set('Origin', ALLOWED_ORIGIN)
+        .attach('file', Buffer.from(SAMPLE_MARKDOWN), 'policy.md');
+      expect(upload.status).toBe(201);
+
+      const list = await request(app.getHttpServer()).get('/v1/policies').set('Cookie', cookie);
+      expect(list.status).toBe(200);
+      expect(list.body).toHaveLength(1);
+    });
+
+    it('a session upload WITHOUT the CSRF header is rejected, even though the body is multipart (the token travels in a header, never the body)', async () => {
+      const built = await buildApp();
+      app = built.app;
+      const { cookie } = await built.createSession('acme');
+
+      const res = await request(app.getHttpServer())
+        .post('/v1/policies')
+        .set('Cookie', cookie)
+        .set('Origin', ALLOWED_ORIGIN)
+        .attach('file', Buffer.from(SAMPLE_MARKDOWN), 'policy.md');
+      expect(res.status).toBe(401);
+    });
+
+    it('a session delete WITHOUT the CSRF header is rejected', async () => {
+      const built = await buildApp();
+      app = built.app;
+      const { rawKey } = await built.createKey('acme');
+      const created = await request(app.getHttpServer())
+        .post('/v1/policies')
+        .set('Authorization', `Bearer ${rawKey}`)
+        .attach('file', Buffer.from(SAMPLE_MARKDOWN), 'policy.md');
+
+      const { cookie } = await built.createSession('acme');
+      const res = await request(app.getHttpServer()).delete(`/v1/policies/${created.body.id}`).set('Cookie', cookie).set('Origin', ALLOWED_ORIGIN);
+      expect(res.status).toBe(401);
+
+      // Never actually deleted.
+      expect(await built.documentRepository.findById('acme', created.body.id)).not.toBeNull();
+    });
+
+    it('a session delete WITH the right CSRF header succeeds', async () => {
+      const built = await buildApp();
+      app = built.app;
+      const { rawKey } = await built.createKey('acme');
+      const created = await request(app.getHttpServer())
+        .post('/v1/policies')
+        .set('Authorization', `Bearer ${rawKey}`)
+        .attach('file', Buffer.from(SAMPLE_MARKDOWN), 'policy.md');
+
+      const { cookie, csrfToken } = await built.createSession('acme');
+      const res = await request(app.getHttpServer())
+        .delete(`/v1/policies/${created.body.id}`)
+        .set('Cookie', cookie)
+        .set('x-csrf-token', csrfToken)
+        .set('Origin', ALLOWED_ORIGIN);
+      expect(res.status).toBe(204);
+    });
+
+    it("a session for tenant widgetco can never see or delete acme's documents - tenant isolation holds for the session path too", async () => {
+      const built = await buildApp();
+      app = built.app;
+      const { rawKey } = await built.createKey('acme');
+      const created = await request(app.getHttpServer())
+        .post('/v1/policies')
+        .set('Authorization', `Bearer ${rawKey}`)
+        .attach('file', Buffer.from(SAMPLE_MARKDOWN), 'policy.md');
+
+      const { cookie, csrfToken } = await built.createSession('widgetco');
+
+      const list = await request(app.getHttpServer()).get('/v1/policies').set('Cookie', cookie);
+      expect(list.body).toEqual([]);
+
+      const del = await request(app.getHttpServer())
+        .delete(`/v1/policies/${created.body.id}`)
+        .set('Cookie', cookie)
+        .set('x-csrf-token', csrfToken)
+        .set('Origin', ALLOWED_ORIGIN);
+      expect(del.status).toBe(404);
+      expect(await built.documentRepository.findById('acme', created.body.id)).not.toBeNull();
     });
   });
 });

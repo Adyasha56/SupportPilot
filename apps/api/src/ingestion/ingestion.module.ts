@@ -1,5 +1,5 @@
 import { Module } from '@nestjs/common';
-import { AuthModule } from '../auth/auth.module';
+import { AdminAuthModule } from '../admin-auth/admin-auth.module';
 import { DatabaseModule } from '../db/database.module';
 import { LlmModule } from '../llm/llm.module';
 import { ingestionSettingsProvider } from './ingestion-settings.provider';
@@ -13,7 +13,9 @@ import { TenantIngestionLock } from './tenant-ingestion-lock';
  * Always imported into AppModule, REGARDLESS of whether MONGODB_URI is set
  * - unlike DatabaseModule itself, which crashes immediately with no URI.
  * DatabaseModule is only imported here when a URI is present (same
- * self-sufficient pattern as AuthModule - see auth.module.ts). Nest module
+ * self-sufficient pattern as AdminAuthModule - see admin-auth.module.ts;
+ * imported here since Stage 1c item 1, when PoliciesController moved from
+ * `ApiKeyGuard` to `AdminAuthGuard`). Nest module
  * providers are NOT visible across sibling imports just because they share
  * a parent: IngestionModule must import DatabaseModule itself to see its
  * exported repository tokens, even though AppModule also imports both.
@@ -38,7 +40,7 @@ export function ingestionDatabaseImportsFor(env: NodeJS.ProcessEnv): [typeof Dat
 }
 
 @Module({
-  imports: [AuthModule, LlmModule, ...ingestionDatabaseImportsFor(process.env)],
+  imports: [AdminAuthModule, LlmModule, ...ingestionDatabaseImportsFor(process.env)],
   controllers: [PoliciesController],
   providers: [
     ingestionSettingsProvider,

@@ -54,6 +54,13 @@ export class InMemoryAdminCredentialRepository implements AdminCredentialReposit
     }
   }
 
+  async updatePasswordHash(tenantId: string, passwordHash: string): Promise<void> {
+    const record = this.byTenantId.get(tenantId);
+    if (record) {
+      record.passwordHash = passwordHash;
+    }
+  }
+
   async deleteForTenant(tenantId: string): Promise<void> {
     this.byTenantId.delete(tenantId);
   }

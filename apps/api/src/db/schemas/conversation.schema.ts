@@ -39,3 +39,13 @@ export const ConversationSchema = new Schema<ConversationDocument>(
 // performance. This index is for Milestone 5's admin console conversation
 // list, scoped per tenant/customer.
 ConversationSchema.index({ tenantId: 1, customerRef: 1 });
+
+// Stage 1c, item 2 - serves ConversationRepository.list()'s own
+// `{tenantId, createdAt: -1, _id: -1}` sort/cursor predicate (the admin
+// console's conversation list). An optional `status` filter is applied
+// on top of this index's scan rather than earning its own compound index -
+// this project's scale (a free-tier M0 cluster, a portfolio demo's worth
+// of conversations) doesn't justify a second index just for that one
+// optional filter, same "keep it simple at this scale" call the rest of
+// this project's indexing already makes.
+ConversationSchema.index({ tenantId: 1, createdAt: -1 });

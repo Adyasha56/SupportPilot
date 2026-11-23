@@ -4,6 +4,7 @@ import { AdminSessionRepository, ADMIN_SESSION_REPOSITORY } from '../db/admin-se
 import { RateLimiter } from '../auth/rate-limiter';
 import { computeLockedUntil } from './lockout';
 import { HashConcurrencyLimiter, verifyDummyHash, verifyPasswordHash } from './password-hash';
+import { rehashOnLoginIfWeak } from './rehash-on-login';
 import { hashSessionToken, mintCsrfToken, mintSessionToken } from './session-token';
 import { AdminAuthSettings } from './admin-auth.settings';
 import { ADMIN_AUTH_SETTINGS } from './admin-auth-settings.provider';
@@ -98,6 +99,9 @@ export class AdminLoginService {
     // session cookie the request ALREADY presented, if any, before minting the new one - a
     // pre-set cookie value can never silently "become" authenticated by surviving a login.
     await this.credentialRepository.resetFailedAttempts(credential.tenantId);
+    // Part 0, item Q1 - transparently upgrade a weak stored hash now that the real password is
+    // in hand. Never affects this login's own outcome either way.
+    await rehashOnLoginIfWeak(this.credentialRepository, this.hashLimiter, credential.tenantId, input.password, credential.passwordHash);
     if (input.presentedRawSessionToken) {
       const priorSession = await this.sessionRepository.findByTokenHash(hashSessionToken(input.presentedRawSessionToken));
       if (priorSession) {
