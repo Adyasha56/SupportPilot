@@ -57,6 +57,29 @@ describe('InMemoryMessageRepository', () => {
     expect(page.map((m) => m.content)).toEqual(['second', 'third']);
   });
 
+  describe('Stage 1c, item 2 - findAllForConversation (the admin conversation-detail transcript)', () => {
+    it('returns every message, oldest first, scoped by tenant and conversation', async () => {
+      const repo = new InMemoryMessageRepository();
+      await repo.create('acme', 'conv_1', 'customer', 'first');
+      await repo.create('acme', 'conv_1', 'agent', 'second');
+      await repo.create('acme', 'conv_2', 'customer', 'different conversation');
+      await repo.create('widgetco', 'conv_1', 'customer', 'different tenant, same conversation id');
+
+      const results = await repo.findAllForConversation('acme', 'conv_1', 100);
+      expect(results.map((m) => m.content)).toEqual(['first', 'second']);
+    });
+
+    it('bounded by limit, keeps the MOST RECENT messages (never the oldest) when a conversation exceeds it', async () => {
+      const repo = new InMemoryMessageRepository();
+      for (let i = 1; i <= 5; i++) {
+        await repo.create('acme', 'conv_1', 'customer', `msg${i}`);
+      }
+
+      const results = await repo.findAllForConversation('acme', 'conv_1', 2);
+      expect(results.map((m) => m.content)).toEqual(['msg4', 'msg5']);
+    });
+  });
+
   it('deleteForTenant only removes that tenant\'s messages', async () => {
     const repo = new InMemoryMessageRepository();
     await repo.create('acme', 'conv_1', 'customer', 'acme message');

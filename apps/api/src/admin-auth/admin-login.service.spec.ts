@@ -3,7 +3,7 @@ import { InMemoryAdminCredentialRepository } from '../db/test-utils/in-memory-ad
 import { InMemoryAdminSessionRepository } from '../db/test-utils/in-memory-admin-session.repository';
 import { RateLimiter } from '../auth/rate-limiter';
 import { AdminLoginService } from './admin-login.service';
-import { HashConcurrencyLimiter, hashPassword } from './password-hash';
+import { HashConcurrencyLimiter, hashPassword, parseHash } from './password-hash';
 import { AdminAuthSettings } from './admin-auth.settings';
 import * as passwordHashModule from './password-hash';
 import { hashSessionToken } from './session-token';
@@ -23,6 +23,9 @@ function makeSettings(overrides: Partial<AdminAuthSettings> = {}): AdminAuthSett
     loginIpRateLimitMaxEntries: 1000,
     devCookieEnabled: false,
     allowedOrigins: [],
+    principalRateLimitMaxRequests: 1000,
+    principalRateLimitWindowMs: 60_000,
+    principalRateLimitMaxEntries: 1000,
     ...overrides,
   };
 }
@@ -54,6 +57,29 @@ describe('AdminLoginService (items 2/3)', () => {
     const sessions = await sessionRepository.findByTokenHash(hashSessionToken(result.rawSessionToken));
     expect(sessions).not.toBeNull();
     expect(sessions!.tenantId).toBe('acme');
+  });
+
+  it('Part 0, item Q1 - a successful login against a WEAK stored hash transparently rehashes it to the current parameters', async () => {
+    const credentialRepository = new InMemoryAdminCredentialRepository();
+    const sessionRepository = new InMemoryAdminSessionRepository();
+    const settings = makeSettings();
+    const ipRateLimiter = new RateLimiter({ maxRequests: 1000, windowMs: 60_000, maxEntries: 1000 }, () => new Date());
+    const hashLimiter = new HashConcurrencyLimiter(4, 20);
+    const service = new AdminLoginService(credentialRepository, sessionRepository, settings, ipRateLimiter, hashLimiter);
+
+    const weakHash = await hashPassword('correct-password-123', { n: 16_384, r: 8, p: 1, keylen: 32 });
+    await credentialRepository.upsert('acme', 'admin@acme.example', weakHash);
+
+    const result = await service.login({ email: 'admin@acme.example', password: 'correct-password-123', clientIp: '1.2.3.4' });
+    expect(result.kind).toBe('success');
+
+    const after = await credentialRepository.findByTenantId('acme');
+    expect(after!.passwordHash).not.toBe(weakHash);
+    expect(parseHash(after!.passwordHash).p).toBe(5);
+    // The upgraded hash still verifies with the same real password - rehashing never changes
+    // what password actually unlocks the account.
+    const secondLogin = await service.login({ email: 'admin@acme.example', password: 'correct-password-123', clientIp: '1.2.3.4' });
+    expect(secondLogin.kind).toBe('success');
   });
 
   it('an unknown email is invalid_credentials, verified against the DUMMY hash (spy proof), never the real path', async () => {

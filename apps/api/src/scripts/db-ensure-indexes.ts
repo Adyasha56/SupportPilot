@@ -367,10 +367,22 @@ function indexNameFromKeys(keys: Record<string, number>): string {
     .join('_');
 }
 
+/**
+ * Part 0, item Q4 - a TO-CREATE index (e.g. AdminSession's own
+ * `absoluteExpiresAt` TTL index, schema-defined with a fixed literal
+ * `expireAfterSeconds: 0`, never routed through the dedicated
+ * ttlField/collMod mechanism above since it isn't derived from
+ * CHAT_RETENTION_DAYS) must be labeled with the SAME unique/TTL/partial
+ * flags `describeExistingIndex` already shows for an index that already
+ * exists - an operator reading the script's "about to create" log line
+ * should see a TTL index coming, not just a bare field name, exactly as
+ * they would if that same index already existed.
+ */
 function describeIndexToCreate([keys, options]: RegularIndexSpec): string {
   const name = typeof options.name === 'string' ? options.name : indexNameFromKeys(keys);
   const flags = [
     options.unique ? 'unique' : undefined,
+    typeof options.expireAfterSeconds === 'number' ? `TTL ${options.expireAfterSeconds}s` : undefined,
     options.partialFilterExpression ? `partial: ${JSON.stringify(options.partialFilterExpression)}` : undefined,
   ].filter((flag): flag is string => flag !== undefined);
   return flags.length > 0 ? `${name} (${flags.join(', ')})` : name;

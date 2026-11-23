@@ -30,6 +30,21 @@ export interface MessageRepository {
    * index (message.schema.ts) - no new index.
    */
   findPageForConversation(tenantId: string, conversationId: string, after: MessagePageCursor | undefined, limit: number): Promise<MessageRecord[]>;
+  /**
+   * Stage 1c, item 2 - the admin console's conversation-detail view (never
+   * the agent's own history window, which stays exactly
+   * `findRecentForConversation` as documented in known-limitations.md's
+   * "TTL deletes old messages even inside a still-active conversation"
+   * entry). Returns up to `limit` messages, OLDEST first - for a
+   * conversation longer than `limit`, the MOST RECENT `limit` messages are
+   * kept (same "newest N, then reverse for display order" approach
+   * `findRecentForConversation` already uses) so the admin always sees the
+   * conversation's current state, never an arbitrarily truncated tail of
+   * ancient history. This is not itself paginated - a full Milestone-6-
+   * style paginated transcript view is future work if a conversation ever
+   * genuinely needs one.
+   */
+  findAllForConversation(tenantId: string, conversationId: string, limit: number): Promise<MessageRecord[]>;
   /** Test/ops cleanup only. */
   deleteForTenant(tenantId: string): Promise<void>;
 }
@@ -81,6 +96,15 @@ export class MongooseMessageRepository implements MessageRepository {
 
     const docs = await this.model.find(filter).sort({ createdAt: 1, _id: 1 }).limit(limit).lean();
     return docs.map((doc) => toRecord(doc as unknown as MessageDocument));
+  }
+
+  async findAllForConversation(tenantId: string, conversationId: string, limit: number): Promise<MessageRecord[]> {
+    const docs = await this.model
+      .find({ tenantId, conversationId })
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit)
+      .lean();
+    return docs.map((doc) => toRecord(doc as unknown as MessageDocument)).reverse();
   }
 
   async deleteForTenant(tenantId: string): Promise<void> {

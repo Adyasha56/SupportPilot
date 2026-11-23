@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { AdminCredentialRepository, ADMIN_CREDENTIAL_REPOSITORY } from '../db/admin-credential.repository';
 import { computeLockedUntil } from './lockout';
 import { HashConcurrencyLimiter, verifyDummyHash, verifyPasswordHash } from './password-hash';
+import { rehashOnLoginIfWeak } from './rehash-on-login';
 import { AdminAuthSettings } from './admin-auth.settings';
 import { ADMIN_AUTH_SETTINGS } from './admin-auth-settings.provider';
 import { ADMIN_HASH_CONCURRENCY_LIMITER } from './hash-concurrency-limiter.provider';
@@ -85,6 +86,7 @@ export class VerifyPasswordService {
     }
 
     await this.credentialRepository.resetFailedAttempts(credential.tenantId);
+    await rehashOnLoginIfWeak(this.credentialRepository, this.hashLimiter, credential.tenantId, password, credential.passwordHash);
     this.audit(principal.tenantId, 'OK');
     return { kind: 'ok' };
   }

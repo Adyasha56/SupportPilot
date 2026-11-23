@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
@@ -9,11 +10,23 @@ import { securityHeadersMiddleware } from './common/security-headers.middleware'
 import { loadServerSettingsFromEnv } from './common/server.settings';
 import { registerAdminStaticAssets } from './common/admin-static';
 import { registerWidgetStaticAssets } from './common/widget-static';
+import { loadAdminAuthSettingsFromEnv } from './admin-auth/admin-auth.settings';
+import { warnIfAdminOriginsMisconfigured } from './admin-auth/admin-origins-boot-check';
+
+const bootLogger = new Logger('Bootstrap');
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
 
   const serverSettings = loadServerSettingsFromEnv(process.env);
+
+  // Part 0, item Q3 - ADMIN_ALLOWED_ORIGINS empty is a deliberate
+  // fail-closed default (admin-auth.settings.ts), but silent. Warn once at
+  // boot, in production only, with a count and a boolean - never an origin
+  // string. loadAdminAuthSettingsFromEnv is pure env parsing (no database),
+  // so this is safe to call here even before AppModule's own providers for
+  // the same settings are resolved.
+  warnIfAdminOriginsMisconfigured(loadAdminAuthSettingsFromEnv(process.env).allowedOrigins, process.env.NODE_ENV, (message) => bootLogger.warn(message));
 
   // Milestone 5, Stage 1a, amendment A5 - registered FIRST, before every
   // other middleware/filter/guard: Nest wires enableCors() as Express-level

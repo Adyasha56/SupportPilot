@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IngestionModule, ingestionDatabaseImportsFor } from './ingestion.module';
 import { DatabaseModule } from '../db/database.module';
-import { AuthModule } from '../auth/auth.module';
+import { AdminAuthModule } from '../admin-auth/admin-auth.module';
 import { LlmModule } from '../llm/llm.module';
 
 /**
@@ -57,15 +57,15 @@ describe('ingestionDatabaseImportsFor (pure function - no import, no module rese
 });
 
 describe('IngestionModule (real, statically-imported class - no dynamic import, no module reset)', () => {
-  it('always imports AuthModule and LlmModule, regardless of MONGODB_URI', () => {
+  it('always imports AdminAuthModule and LlmModule, regardless of MONGODB_URI', () => {
     const imports = Reflect.getMetadata('imports', IngestionModule) as unknown[];
-    expect(imports).toContain(AuthModule);
+    expect(imports).toContain(AdminAuthModule);
     expect(imports).toContain(LlmModule);
   });
 
   it("the real decorator's imports match exactly what ingestionDatabaseImportsFor(process.env) computes for the ambient env this module was actually loaded under", () => {
     const imports = Reflect.getMetadata('imports', IngestionModule) as unknown[];
-    expect(imports).toEqual([AuthModule, LlmModule, ...ingestionDatabaseImportsFor(process.env)]);
+    expect(imports).toEqual([AdminAuthModule, LlmModule, ...ingestionDatabaseImportsFor(process.env)]);
   });
 });
 

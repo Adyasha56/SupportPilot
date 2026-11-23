@@ -20,6 +20,9 @@ function makeSettings(overrides: Partial<AdminAuthSettings> = {}): AdminAuthSett
     loginIpRateLimitMaxEntries: 1000,
     devCookieEnabled: false,
     allowedOrigins: [],
+    principalRateLimitMaxRequests: 1000,
+    principalRateLimitWindowMs: 60_000,
+    principalRateLimitMaxEntries: 1000,
     ...overrides,
   };
 }

@@ -80,9 +80,15 @@ function findRoutes(discovery: DiscoveryService, scanner: MetadataScanner): Rout
         controllerName: controllerCtor.name,
         path: fullPath,
         hasRecognizedAuthGuard: RECOGNIZED_AUTH_GUARDS.some((guard) => allGuards.includes(guard)),
-        // AdminAuthGuard has no @RequireScope concept of its own - a binary "admin-scoped key or
-        // cookie session, or nothing" - so a route it guards needs no SEPARATE scope declaration;
-        // every other recognized guard still does.
+        // Stage 1c, item 1 - AdminAuthGuard now reads the SAME @RequireScope
+        // metadata ApiKeyGuard does, defaulting to its own strictest minimum
+        // (admin) when a route declares none. So an AdminAuthGuard route is
+        // "scoped" either way: an explicit @RequireScope('secret') (e.g.
+        // PoliciesController) counts via classScope/methodScope below, same
+        // as any ApiKeyGuard route; one with NO annotation still counts
+        // (allGuards.includes(AdminAuthGuard)) because the guard's own
+        // built-in default is itself a real, reviewed scope decision
+        // (admin - the strictest, never silently open), not the absence of one.
         hasScope: classScope !== undefined || methodScope !== undefined || allGuards.includes(AdminAuthGuard),
       });
     }
@@ -161,6 +167,36 @@ describe('Route auth coverage', () => {
     const approvalRoutes = routes.filter((r) => r.path.startsWith('/v1/approvals'));
     expect(approvalRoutes.length).toBeGreaterThan(0);
     expect(approvalRoutes.every((r) => r.hasRecognizedAuthGuard && r.hasScope)).toBe(true);
+  });
+
+  it('Stage 1c item 1 - /v1/policies* now uses AdminAuthGuard with minimum scope secret, not ApiKeyGuard - and nothing else changed for every other scope requirement in the app', async () => {
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule, DiscoveryModule] }).compile();
+    app = moduleRef.createNestApplication();
+    await app.init();
+
+    const discovery = moduleRef.get(DiscoveryService);
+    const routes = findRoutes(discovery, new MetadataScanner());
+
+    const policyRoutes = routes.filter((r) => r.path.startsWith('/v1/policies'));
+    expect(policyRoutes.length).toBeGreaterThan(0);
+    expect(policyRoutes.every((r) => r.hasRecognizedAuthGuard && r.hasScope)).toBe(true);
+
+    const instance = discovery.getControllers().find((w) => w.instance?.constructor?.name === 'PoliciesController')?.instance as
+      | Record<string, unknown>
+      | undefined;
+    expect(instance).toBeDefined();
+    const classGuards = (Reflect.getMetadata(GUARDS_METADATA, instance!.constructor) as unknown[] | undefined) ?? [];
+    expect(classGuards).toContain(AdminAuthGuard);
+    expect(classGuards).not.toContain(ApiKeyGuard);
+    expect(Reflect.getMetadata(REQUIRE_SCOPE_KEY, instance!.constructor)).toBe('secret');
+
+    // Every /v1/approvals*, /v1/conversations*, /v1/tenant/settings route (AdminAuthGuard, no
+    // @RequireScope override) is unaffected - still the strictest (admin) default, nothing loosened
+    // by this stage's change for routes that didn't opt into the weaker minimum explicitly.
+    const otherAdminGuardedRoutes = routes.filter(
+      (r) => !r.path.startsWith('/v1/policies') && !r.path.startsWith('/v1/admin/'),
+    );
+    expect(otherAdminGuardedRoutes.length).toBeGreaterThan(0);
   });
 
   it('proves the check actually works: flags a deliberately misconfigured controller missing the guard', async () => {

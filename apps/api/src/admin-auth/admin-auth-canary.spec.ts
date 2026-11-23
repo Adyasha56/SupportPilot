@@ -24,6 +24,9 @@ function makeSettings(): AdminAuthSettings {
     loginIpRateLimitMaxEntries: 1000,
     devCookieEnabled: false,
     allowedOrigins: [],
+    principalRateLimitMaxRequests: 1000,
+    principalRateLimitWindowMs: 60_000,
+    principalRateLimitMaxEntries: 1000,
   };
 }
 

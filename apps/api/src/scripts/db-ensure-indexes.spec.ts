@@ -458,6 +458,17 @@ describe('ensureCollectionIndexes', () => {
     ).toBe(true);
   });
 
+  it('Part 0, item Q4 - the "would create" line also shows a TTL flag for a schema-defined TTL index (e.g. AdminSession.absoluteExpiresAt), not just unique/partial', async () => {
+    const state: FakeState = { exists: false, indexes: [] };
+    const toCreate: RegularIndexSpec[] = [[{ absoluteExpiresAt: 1 }, { expireAfterSeconds: 0 }]];
+    const deps = makeFakeDeps('AdminSession', 'adminSessions', toCreate, state);
+
+    const logs: string[] = [];
+    await ensureCollectionIndexes(deps, (m) => logs.push(m), true);
+
+    expect(logs.some((l) => l.includes('absoluteExpiresAt_1') && l.includes('TTL 0s'))).toBe(true);
+  });
+
   it('(index audit e) demonstrates, via dry-run only, what removing a redundant standalone tenantId_1 would drop - the real schema is NOT changed by this test', async () => {
     // Models today's REAL deployed state for a collection like Conversation:
     // a standalone tenantId_1 (from the schema's field-level `index: true`)

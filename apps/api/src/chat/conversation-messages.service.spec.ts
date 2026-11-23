@@ -456,4 +456,65 @@ describe('ConversationMessagesService', () => {
       expect(second.body.messages.map((m) => m.content)).toEqual(['hello', 'reply']);
     }
   });
+
+  it('Part 0, item Q2 - two DIFFERENT conversations with the identical messageCount get DIFFERENT ETags (the id is bound into it)', async () => {
+    const { service, conversationRepository, messageRepository } = makeService();
+    const conversationA = await conversationRepository.create('acme', null);
+    const conversationB = await conversationRepository.create('acme', null);
+    await messageRepository.create('acme', conversationA.id, 'customer', 'hello from A');
+    await messageRepository.create('acme', conversationB.id, 'customer', 'hello from B');
+
+    const resultA = await service.getMessages({ tenantId: 'acme', matchedScope: 'public', conversationId: conversationA.id, rawQuery: {} });
+    const resultB = await service.getMessages({ tenantId: 'acme', matchedScope: 'public', conversationId: conversationB.id, rawQuery: {} });
+    expect(resultA.kind).toBe('success');
+    expect(resultB.kind).toBe('success');
+    if (resultA.kind !== 'success' || resultB.kind !== 'success') return;
+
+    // Both conversations have messageCount 0 (neither ever called incrementMessageCount) - if
+    // the ETag were derived from messageCount ALONE, these would collide.
+    expect(resultA.etag).not.toBe(resultB.etag);
+
+    // And reusing conversation A's own ETag as If-None-Match against conversation B must NEVER
+    // short-circuit to not_modified - they are different resources, even at equal messageCount.
+    const crossConversationAttempt = await service.getMessages({
+      tenantId: 'acme',
+      matchedScope: 'public',
+      conversationId: conversationB.id,
+      rawQuery: {},
+      ifNoneMatch: resultA.etag,
+    });
+    expect(crossConversationAttempt.kind).toBe('success');
+  });
+
+  it("Part 0, item Q2 - tenant/ownership checks run BEFORE any 304 decision: a mismatched or nonexistent id is ALWAYS the 404, " +
+    'never a 304, however the If-None-Match header is forged', async () => {
+    const { service, conversationRepository } = makeService();
+    const ownedConversation = await conversationRepository.create('acme', 'cust_owner');
+    // The attacker cannot know a real ETag for a conversation they don't own, but the whole
+    // point of this guarantee is that it must not matter even if they somehow guessed or forged
+    // one that happens to look plausible - ownership is checked first, unconditionally.
+    const forgedGuesses = [`W/"${ownedConversation.id}-0"`, '"anything"', 'W/"0"', ownedConversation.id];
+
+    for (const guess of forgedGuesses) {
+      // Case 1: right tenant, no/anonymous identity, but the conversation belongs to cust_owner.
+      const mismatchResult = await service.getMessages({
+        tenantId: 'acme',
+        matchedScope: 'public',
+        conversationId: ownedConversation.id,
+        rawQuery: {},
+        ifNoneMatch: guess,
+      });
+      expect(mismatchResult).toMatchObject({ kind: 'error', code: 'NOT_FOUND' });
+
+      // Case 2: a conversation id that was never created at all.
+      const nonexistentResult = await service.getMessages({
+        tenantId: 'acme',
+        matchedScope: 'public',
+        conversationId: 'doesNotExistAtAll98765',
+        rawQuery: {},
+        ifNoneMatch: guess,
+      });
+      expect(nonexistentResult).toMatchObject({ kind: 'error', code: 'NOT_FOUND' });
+    }
+  });
 });

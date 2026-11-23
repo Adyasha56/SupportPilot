@@ -103,4 +103,37 @@ describe('InMemoryPolicyChunkRepository', () => {
     expect(results[0].title).toBe('near');
     expect(results[1].title).toBe('far');
   });
+
+  describe('Stage 1c, item 2 - findManyByDocumentIdAndPosition (citation resolution for the admin conversation-detail view)', () => {
+    it('resolves a matching (documentId, position) pair to its current headingPath/title', async () => {
+      const repo = new InMemoryPolicyChunkRepository();
+      await repo.insertMany([chunk({ documentId: 'doc-1', position: 2, headingPath: 'Refund Policy > Late Delivery', title: 'Refund Policy' })]);
+
+      const results = await repo.findManyByDocumentIdAndPosition('acme', [{ documentId: 'doc-1', position: 2 }]);
+      expect(results).toEqual([{ documentId: 'doc-1', position: 2, headingPath: 'Refund Policy > Late Delivery', title: 'Refund Policy' }]);
+    });
+
+    it('a key for a chunk that no longer exists (deleted document) is simply absent, never an error', async () => {
+      const repo = new InMemoryPolicyChunkRepository();
+      const results = await repo.findManyByDocumentIdAndPosition('acme', [{ documentId: 'does-not-exist', position: 0 }]);
+      expect(results).toEqual([]);
+    });
+
+    it('still resolves a DEACTIVATED (but not yet deleted) chunk - a historical citation should still show its heading', async () => {
+      const repo = new InMemoryPolicyChunkRepository();
+      await repo.insertMany([chunk({ documentId: 'doc-1', position: 0 })]);
+      await repo.deactivateForDocument('acme', 'doc-1');
+
+      const results = await repo.findManyByDocumentIdAndPosition('acme', [{ documentId: 'doc-1', position: 0 }]);
+      expect(results).toHaveLength(1);
+    });
+
+    it("never returns another tenant's chunk, even with the same documentId/position", async () => {
+      const repo = new InMemoryPolicyChunkRepository();
+      await repo.insertMany([chunk({ tenantId: 'widgetco', documentId: 'doc-1', position: 0 })]);
+
+      const results = await repo.findManyByDocumentIdAndPosition('acme', [{ documentId: 'doc-1', position: 0 }]);
+      expect(results).toEqual([]);
+    });
+  });
 });

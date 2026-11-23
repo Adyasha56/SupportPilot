@@ -5,6 +5,7 @@ import { LLM_SETTINGS } from '../llm/llm-settings.provider';
 import { LlmProvider } from '../llm/llm-provider.interface';
 import { LlmSettings } from '../llm/llm.settings';
 import { POLICY_CHUNK_REPOSITORY, PolicyChunkRepository, VectorSearchResultItem } from '../db/policy-chunk.repository';
+import { buildChunkKey } from './chunk-key';
 import { RETRIEVAL_SETTINGS } from './retrieval-settings.provider';
 import { RetrievalSettings } from './retrieval.settings';
 
@@ -136,7 +137,7 @@ export class PolicyRetrievalService {
     // candidates to choose from even when some of the over-fetched batch
     // had to be dropped.
     const results: RetrievalResult[] = current.slice(0, topK).map((r) => ({
-      chunkKey: `${r.documentId}-${r.position}`,
+      chunkKey: buildChunkKey(r.documentId, r.position),
       documentId: r.documentId,
       documentTitle: r.title,
       headingPath: r.headingPath,

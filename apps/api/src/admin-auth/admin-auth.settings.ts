@@ -40,6 +40,13 @@ export const AdminAuthSettingsSchema = z.object({
   // can never pass, so cookie-authenticated non-GET requests are refused
   // until this is actually configured - fails closed, never open.
   allowedOrigins: z.array(z.string()),
+
+  // Stage 1c, item 5 - a per-PRINCIPAL rate limit (AdminAuthGuard), checked
+  // on every admin route after authentication succeeds. Separate from, and
+  // in addition to, the narrower approval-decision limiter.
+  principalRateLimitMaxRequests: z.number().int().positive(),
+  principalRateLimitWindowMs: z.number().int().positive(),
+  principalRateLimitMaxEntries: z.number().int().positive(),
 });
 export type AdminAuthSettings = z.infer<typeof AdminAuthSettingsSchema>;
 
@@ -52,7 +59,9 @@ function parseOrigins(raw: string | undefined): string[] {
 
 export function loadAdminAuthSettingsFromEnv(env: NodeJS.ProcessEnv): AdminAuthSettings {
   const candidate = {
-    hashMaxConcurrency: Number(env.ADMIN_HASH_MAX_CONCURRENCY ?? 4),
+    // Part 0, item Q1 - 6, not the original 4: see password-hash.ts's own doc comment for the
+    // stated 96 MiB budget (16 MiB/verification x 6) this is sized against.
+    hashMaxConcurrency: Number(env.ADMIN_HASH_MAX_CONCURRENCY ?? 6),
     hashMaxQueueLength: Number(env.ADMIN_HASH_MAX_QUEUE_LENGTH ?? 20),
 
     sessionAbsoluteLifetimeMs: Number(env.ADMIN_SESSION_ABSOLUTE_LIFETIME_MS ?? 8 * 60 * 60 * 1000),
@@ -70,6 +79,15 @@ export function loadAdminAuthSettingsFromEnv(env: NodeJS.ProcessEnv): AdminAuthS
     devCookieEnabled: env.ADMIN_DEV_COOKIE_ENABLED === 'true',
 
     allowedOrigins: parseOrigins(env.ADMIN_ALLOWED_ORIGINS),
+
+    // Stage 1c, item 5 - generous enough for a real admin console's own
+    // polling/navigation (conversations list, settings reads, etc.), tight
+    // enough to still be a real ceiling against a misbehaving script or a
+    // compromised credential - same order of magnitude as ApiKeyGuard's
+    // own per-key default (120/min).
+    principalRateLimitMaxRequests: Number(env.ADMIN_PRINCIPAL_RATE_LIMIT_MAX_REQUESTS ?? 120),
+    principalRateLimitWindowMs: Number(env.ADMIN_PRINCIPAL_RATE_LIMIT_WINDOW_MS ?? 60_000),
+    principalRateLimitMaxEntries: Number(env.ADMIN_PRINCIPAL_RATE_LIMIT_MAX_ENTRIES ?? 5000),
   };
 
   const result = AdminAuthSettingsSchema.safeParse(candidate);

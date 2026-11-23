@@ -36,13 +36,22 @@ const GENERIC_INVALID_TOKEN_MESSAGE = 'The customer token is invalid, expired, o
 /**
  * A WEAK ETag (RFC 9110 - the response isn't byte-identical across calls
  * with the same value, only equivalent-enough: same count of messages)
- * derived from the Conversation's own `messageCount`, which already
- * increments on every new customer/agent message (chat.service.ts's
- * `incrementMessageCount`). Computed from a value we ALREADY had to read
- * for the ownership check two lines above its call site - no extra read.
+ * derived from BOTH the conversation id AND its `messageCount` (Part 0,
+ * item Q2) - messageCount alone is not resource-specific: two DIFFERENT
+ * conversations can easily share the same message count (e.g. two brand
+ * new ones), and an ETag that doesn't bind the resource it describes
+ * could make a stale/reused `If-None-Match` from one conversation wrongly
+ * read as "unchanged" against a different one. Binding the id makes that
+ * structurally impossible, independent of (and in addition to) the
+ * ownership check already gating whether this function is ever reached
+ * for a given id at all (see getMessages's own doc comment on ordering).
+ * `messageCount` already increments on every new customer/agent message
+ * (chat.service.ts's `incrementMessageCount`); both fields were ALREADY
+ * read for the ownership check just above this function's call site - no
+ * extra read.
  */
 function computeEtag(conversation: ConversationRecord): string {
-  return `W/"${conversation.messageCount}"`;
+  return `W/"${conversation.id}-${conversation.messageCount}"`;
 }
 
 /**
@@ -80,7 +89,12 @@ function computeEtag(conversation: ConversationRecord): string {
  *      short-circuits here - `kind: 'not_modified'`, the message-page query
  *      below never runs at all, which is the actual cost this is meant to
  *      avoid (a ranged index scan, however cheap, beats doing it on every
- *      single poll when nothing changed).
+ *      single poll when nothing changed). Part 0, item Q2 - this step is
+ *      STRUCTURALLY unreachable for a mismatched/nonexistent id, since
+ *      step 6 already returned 404 before this line is ever reached - a
+ *      304-vs-404 response can never be used to probe whether a
+ *      conversation exists or belongs to the caller, however the
+ *      `If-None-Match` header is forged.
  *   8. the message page itself, oldest-first, bounded by
  *      ChatSettings.pollPageSize, served off the existing
  *      {tenantId,conversationId,createdAt} index.

@@ -16,8 +16,10 @@ per-apiKeyId limiter on the admin decision route
 in-flight-run limiter and conversation lock
 (`apps/api/src/chat/in-flight-run-limiter.ts`, `conversation-lock.ts`), the
 widget polling endpoint's own per-conversation rate limiter (Milestone 5,
-`apps/api/src/chat/poll-rate-limiter.provider.ts`), the
-daily generate-budget guards (`apps/api/src/agent/loop/daily-generate-
+`apps/api/src/chat/poll-rate-limiter.provider.ts`), the per-ADMIN-PRINCIPAL
+rate limiter inside `AdminAuthGuard` itself (Stage 1c item 5 - applies to
+every approvals/conversations/settings/connectors/policies admin request),
+the daily generate-budget guards (`apps/api/src/agent/loop/daily-generate-
 budget.ts`), the circuit breaker inside `GeminiLlmProvider`, and the
 ingestion per-tenant busy-lock - holds its state in a single Node process's
 memory. Running more than one instance of the API (a second container, a
@@ -132,7 +134,13 @@ the image, or a mounted directory - see the demo profile's own
 admin-console action. Accepted for now because Milestone 1 explicitly
 scoped connector configs as "data, not code" at the FILE level only -
 moving them into the database (and building the admin console's connector
-editor on top) is explicitly Milestone 5 work, not done yet.
+editor on top) is explicitly Milestone 5 work, not done yet. Stage 1c item 4
+added the READ-only half of the admin surface this gap always expected to
+eventually need (`GET /v1/connectors`, tool name and description only,
+`ConnectorsAdminController`) - this does not change anything above: still
+no write path, still files on disk, still a deploy to add a tenant's
+connectors. A tenant with no fixtures directory of its own gets an empty
+list, never an error.
 
 ## The Origin check is advisory, not a security boundary
 
@@ -273,6 +281,27 @@ worth knowing if a future admin-console security review goes looking for a
 (`widget-static.ts`) has no such fallback registered after it, so the
 identical attempts there DO surface as a plain, distinguishable 404.
 
+## A real parameter mistake, found and fixed: scrypt was NOT at an OWASP-listed configuration
+
+Milestone 5, Part 0, item Q1 caught a genuine bug in Stage 1b's original
+`password-hash.ts`: it used N=2^14, r=8, **p=1** and documented this as
+"OWASP's current minimum." Checked directly against the LIVE OWASP
+Password Storage Cheat Sheet (2026-11-21), that claim was wrong - the real
+table is N=2^17/r=8/p=1 (listed first), down to N=2^13/r=8/p=10, and N=2^14
+is paired with **p=5**, never p=1. p=1 at N=2^14 is not one of the five
+rows at all; a direct benchmark on this project's own machine measured it
+at ~32ms versus ~145-307ms for every real OWASP row - roughly 5x less
+total work than even the smallest-memory sanctioned configuration. Fixed
+to the real OWASP row (N=2^14, r=8, p=5, ~154ms measured, 16 MiB/
+verification) with `maxmem` now set explicitly rather than left at
+node:crypto's own 32 MiB default, and a rehash-on-successful-login path so
+any credential already written under the original, weaker parameters is
+transparently upgraded the next time its owner logs in or re-enters their
+password for a step-up, with no forced password reset. Recorded here
+specifically so this specific class of mistake (citing a security
+standard from memory instead of checking it) is visible and not repeated
+silently elsewhere in this project.
+
 ## Admin console: one credential per tenant, no self-service password reset
 
 Milestone 5, Stage 1b deliberately ships the single-admin-per-tenant model
@@ -318,3 +347,89 @@ reconciles it, exactly as proven by
 one failure mode its own clean HTTP shape would be straightforward but was
 not judged worth the extra code for a path that, by construction, never
 loses money or state - only the HTTP response's own politeness.
+
+## Production deployment checklist
+
+A short checklist for anyone actually setting `NODE_ENV=production` for this
+API (Render free web service, Docker Compose outside the `demo` profile,
+or any other host) - not a substitute for reading `.env.example` in full,
+just the items that fail silently or fail closed in a way worth calling out
+up front.
+
+- **`ADMIN_ALLOWED_ORIGINS` must be set.** Left empty, the admin-auth
+  Origin check (`admin-auth.settings.ts`) fails closed by design - every
+  cookie-session-authenticated non-GET admin request (login excluded) is
+  refused with a generic error, not a security hole, but a confusing one to
+  debug after the fact. Part 0, item Q3: the API now logs ONE boot-time
+  warning when `NODE_ENV=production` and this is empty - a count
+  (`allowedOriginsCount: 0`) and a boolean (`nodeEnvIsProduction: true`)
+  only, never an origin string, since the log itself must not become a
+  place secrets or internal hostnames leak. See
+  `apps/api/src/admin-auth/admin-origins-boot-check.ts` and its own spec.
+  Watch for `admin_allowed_origins_empty_in_production` in the boot log.
+- **`TRUST_PROXY_HOPS`** should match the real number of reverse-proxy hops
+  in front of the API (1 on Render's free web service, 0 behind no proxy at
+  all) - `main.ts`'s own comment explains why 0 is the only safe default
+  without knowing the topology, and why getting this wrong silently breaks
+  every per-IP limiter (it would key on the proxy's own IP instead of the
+  real client's).
+- **`ADMIN_DEV_COOKIE_ENABLED` must be unset (or `false`).** The non-Secure
+  dev cookie path requires it set to the literal string `true` AND
+  `NODE_ENV!=='production'` - both, never either alone - so leaving it set
+  in a production environment variable is harmless by construction, but
+  don't rely on that; unset it anyway.
+- **`CONNECTOR_CONFIG_DIR`/private-network SSRF exceptions** are the `demo`
+  Compose profile's job, never production's - see "Docker demo and the
+  SSRF guard" in `PROJECT.md` section 3. A production container always has
+  `allowPrivateNetworks: false` and `requireHttps: true`, unconditionally.
+- **Free tiers**: re-verify Gemini/Atlas M0/Render's current limits before
+  relying on them (RULES.md §7) - they change without notice.
+
+## A real bug, found by real CI: a guard's own `@Optional()` dependencies don't resolve unless its DATABASE provider module is ALSO directly imported by the consuming module
+
+Stage 1c item 4's `GET /v1/connectors` kept failing a real `test:integration` run
+with a false `401` for a genuine admin API key AND a genuine cookie session, while
+the identical `@UseGuards(AdminAuthGuard)` pattern worked on every other admin
+route in the same run. The first fix attempt (moving the controller out of
+`ConnectorsModule` into its own root-level `ConnectorsAdminModule`, matching
+`ConversationsAdminModule`/`TenantSettingsAdminModule`'s shape) did NOT fix it -
+proof the real cause was never "transitively imported vs. imported at the root," a
+plausible-sounding theory that turned out to be wrong. Temporary diagnostic logging
+added directly to `AdminAuthGuard` (logging whether its own `apiKeyRepository`/
+`sessionRepository` were defined, per request) found the actual cause in one CI run:
+the guard instance protecting `ConnectorsAdminController` had **both** repositories
+`undefined`, while the same guard protecting every other admin controller had both
+defined.
+
+**Root cause**: `AdminAuthGuard`, referenced via `@UseGuards(AdminAuthGuard)`, is
+resolved by NestJS through the CONSUMING controller's own module injector context -
+it is not simply "the one global singleton" reused identically everywhere it's
+exported from. `AdminAuthModule` exports the guard CLASS itself, but its
+`API_KEY_REPOSITORY`/`ADMIN_SESSION_REPOSITORY` constructor parameters (both
+`@Optional()`, provided by `DatabaseModule`, which `AdminAuthModule` imports but
+does not itself re-export) only resolve correctly when `DatabaseModule` is ALSO
+directly visible to the SAME module that declares the guarded controller - being
+reachable one level further away, only through `AdminAuthModule`, is not enough.
+Every other module successfully using `AdminAuthGuard`
+(`IngestionModule`/`ApprovalsModule`/`ConversationsAdminModule`/
+`TenantSettingsAdminModule`) happens to ALSO import `DatabaseModule` directly
+itself, for its own unrelated repository needs - `ConnectorsAdminModule` was the
+only one that didn't, since `ConnectorsAdminController` itself has no database
+dependency of its own.
+
+**Fixed** by having `ConnectorsAdminModule` import `DatabaseModule` too (the same
+conditional `env.MONGODB_URI ? [DatabaseModule] : []` pattern every other module
+already uses), even though nothing in that module reads from it directly - purely
+so `AdminAuthGuard`'s own optional dependencies resolve when NestJS constructs the
+guard in that module's context. The root-level-module restructuring from the first
+fix attempt was kept (it's still the right shape, just wasn't the actual fix).
+
+**Why this matters beyond the one bug**: any FUTURE admin-only module whose own
+controller needs no database access of its own (unlike this one, every other admin
+module so far happened to need one) must still import `DatabaseModule` conditionally
+purely to make `AdminAuthGuard`'s own dependencies resolve - an easy thing to miss,
+since the controller's own code gives no hint it's needed. This is also a concrete,
+measured instance of RULES.md §6's whole point: integration tests against a real
+database catch classes of bugs no amount of unit testing or static review can - two
+plausible-sounding theories (and one real fix attempt built on the first one) were
+both wrong until a real CI run with real diagnostic output showed the actual cause.

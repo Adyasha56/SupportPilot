@@ -17,8 +17,8 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { PolicyDocumentSummary } from '@supportpilot/shared';
-import { ApiKeyGuard } from '../auth/api-key.guard';
-import { CurrentTenant } from '../auth/current-tenant.decorator';
+import { AdminAuthGuard, AdminPrincipal } from '../admin-auth/admin-auth.guard';
+import { CurrentAdminPrincipal } from '../admin-auth/current-admin-principal.decorator';
 import { RequireScope } from '../auth/require-scope.decorator';
 import { POLICY_CHUNK_REPOSITORY, PolicyChunkRepository } from '../db/policy-chunk.repository';
 import { POLICY_DOCUMENT_REPOSITORY, PolicyDocumentRecord, PolicyDocumentRepository } from '../db/policy-document.repository';
@@ -80,8 +80,24 @@ function toSummary(doc: PolicyDocumentRecord): PolicyDocumentSummary {
   };
 }
 
+/**
+ * Stage 1c, item 1 - moved from `@UseGuards(ApiKeyGuard) @RequireScope
+ * ('secret')` to `AdminAuthGuard` with the SAME minimum scope: a
+ * secret-or-higher API key still works exactly as before (nothing changes
+ * for an existing secret-key caller - route-auth-coverage.e2e-spec.ts's own
+ * "nothing changes" case), and a cookie-authenticated admin console
+ * session now works here too, with no separate code path. `tenantId` comes
+ * from the resolved `AdminPrincipal` (`@CurrentAdminPrincipal()`), never
+ * `@CurrentTenant()` - same reasoning as ApprovalsController's own doc
+ * comment, this controller no longer uses `ApiKeyGuard` at all. CSRF (on
+ * POST/DELETE, for a session principal only) and the Origin/Sec-Fetch-Site
+ * check come for free from `AdminAuthGuard` itself - the CSRF token travels
+ * in the `x-csrf-token` HEADER, so it applies to the multipart upload
+ * exactly the same way it applies to a plain JSON body; no special-casing
+ * needed for `multipart/form-data`.
+ */
 @Controller('v1/policies')
-@UseGuards(ApiKeyGuard)
+@UseGuards(AdminAuthGuard)
 @RequireScope('secret')
 @UseFilters(MulterExceptionFilter)
 export class PoliciesController {
@@ -98,10 +114,11 @@ export class PoliciesController {
   @HttpCode(201)
   @UseInterceptors(FileInterceptor('file', { storage: inMemoryStorageEngine, limits: MULTER_LIMITS }))
   async upload(
-    @CurrentTenant() tenantId: string,
+    @CurrentAdminPrincipal() principal: AdminPrincipal,
     @UploadedFile() file: MemoryUploadedFile | undefined,
     @Body('title') rawTitle: string | undefined,
   ): Promise<PolicyDocumentSummary> {
+    const tenantId = principal.tenantId;
     const startedAt = Date.now();
 
     if (!file) {
@@ -151,17 +168,18 @@ export class PoliciesController {
   }
 
   @Get()
-  async list(@CurrentTenant() tenantId: string): Promise<PolicyDocumentSummary[]> {
+  async list(@CurrentAdminPrincipal() principal: AdminPrincipal): Promise<PolicyDocumentSummary[]> {
     if (!this.documentRepository) {
       throw policyHttpError('NOT_CONFIGURED', 'The database is not configured.');
     }
-    const docs = await this.documentRepository.findAllForTenant(tenantId);
+    const docs = await this.documentRepository.findAllForTenant(principal.tenantId);
     return docs.map(toSummary);
   }
 
   @Delete(':id')
   @HttpCode(204)
-  async remove(@CurrentTenant() tenantId: string, @Param('id') id: string): Promise<void> {
+  async remove(@CurrentAdminPrincipal() principal: AdminPrincipal, @Param('id') id: string): Promise<void> {
+    const tenantId = principal.tenantId;
     if (!this.documentRepository || !this.chunkRepository) {
       throw policyHttpError('NOT_CONFIGURED', 'The database is not configured.');
     }
