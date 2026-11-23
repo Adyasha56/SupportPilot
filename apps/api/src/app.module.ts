@@ -12,6 +12,7 @@ import { ChatModule } from './chat/chat.module';
 import { AdminAuthModule } from './admin-auth/admin-auth.module';
 import { ConversationsAdminModule } from './conversations-admin/conversations-admin.module';
 import { TenantSettingsAdminModule } from './tenant-settings/tenant-settings-admin.module';
+import { ConnectorsAdminModule } from './connectors/connectors-admin.module';
 
 /**
  * DatabaseModule itself is only imported when MONGODB_URI is actually set -
@@ -36,6 +37,7 @@ const databaseImports = process.env.MONGODB_URI ? [DatabaseModule] : [];
     AdminAuthModule,
     ConversationsAdminModule,
     TenantSettingsAdminModule,
+    ConnectorsAdminModule,
     ...databaseImports,
   ],
   controllers: [HealthController],

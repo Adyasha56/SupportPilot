@@ -384,3 +384,42 @@ up front.
   `allowPrivateNetworks: false` and `requireHttps: true`, unconditionally.
 - **Free tiers**: re-verify Gemini/Atlas M0/Render's current limits before
   relying on them (RULES.md §7) - they change without notice.
+
+## A real bug, found by real CI: AdminAuthGuard silently failed on a route registered through a transitively-imported module
+
+Stage 1c item 4's first version of `GET /v1/connectors` put `ConnectorsAdminController`
+and an `AdminAuthModule` import directly onto the PRE-EXISTING `ConnectorsModule` -
+the module `ToolRunnerModule`/`ChatModule`/`ApprovalsModule` already import for the
+agent loop's own tool-execution needs, never listed directly in `AppModule`'s own
+`imports`, only reached transitively. Unit-level controller tests (a hand-built
+`Test.createTestingModule` with fakes provided directly, never touching the real
+module graph) passed cleanly, and so did every other check available without a real
+database. A real CI run against Atlas Local (2026-11-23,
+`pnpm --filter @supportpilot/api run test:integration`) caught what nothing else
+could: through the REAL `AppModule`, a genuine admin-scoped API key AND a genuine
+cookie session both got a false `401` on `GET /v1/connectors`, while the identical
+`@UseGuards(AdminAuthGuard)` pattern worked correctly on every other admin route in
+the same run (approvals, conversations, settings, policies) - including within the
+very same test file, since the only other request `connectors-admin.integration-spec.ts`
+makes is an EXPECTED `401` for a secret-scoped key, which can't distinguish "scope
+correctly rejected" from "the guard's dependencies never resolved at all."
+
+**Fixed** by moving the admin controller out of `ConnectorsModule` entirely, into its
+own `ConnectorsAdminModule` (`apps/api/src/connectors/connectors-admin.module.ts`),
+registered directly in `AppModule`'s own top-level `imports` - the exact same shape
+`ConversationsAdminModule`/`TenantSettingsAdminModule` already use, both proven to
+work in this same CI run. `ConnectorsModule` itself reverted to exactly its
+pre-Stage-1c-item-4 shape (no controller, no `AdminAuthModule` import) and is now
+imported by `ConnectorsAdminModule` only for its already-exported
+`CONNECTOR_CONFIG_REPOSITORY` token.
+
+**Why this matters beyond the one bug**: it's a concrete argument for the pattern
+this project already leans on elsewhere (a small, dedicated admin module per
+surface, imported directly at the root) rather than attaching an admin-facing
+controller to whatever existing module happens to own the underlying repository -
+even when the attached module's OWN `imports` array looks correct on paper, a
+module reached only transitively, through multiple parents, is a less-proven shape
+for a guard's own cross-module DI than one imported directly where the app is
+actually composed. This is also a concrete, measured instance of RULES.md §6's
+whole point: integration tests against a real database catch classes of bugs no
+amount of unit testing or static review can.

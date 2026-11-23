@@ -1,20 +1,23 @@
 import { Module } from '@nestjs/common';
-import { AdminAuthModule } from '../admin-auth/admin-auth.module';
 import { connectorConfigRepositoryProvider, connectorConfigSettingsProvider } from './connector-config-repository.provider';
-import { ConnectorsAdminController } from './connectors-admin.controller';
 
 /**
- * Stage 1c, item 4 - `AdminAuthModule` is imported here (not by a new
- * sibling module) specifically so the read-only `GET /v1/connectors`
- * route lives right next to the repository it reads, the same reasoning
- * ApprovalsController/ApprovalsModule already follow. This module is
- * already imported transitively into AppModule's graph (via ChatModule,
- * ApprovalsModule), so `ConnectorsAdminController` is active with no
- * further AppModule change needed.
+ * Deliberately NO admin controller and NO `AdminAuthModule` import here -
+ * this module is reached only TRANSITIVELY (via ToolRunnerModule,
+ * ChatModule, ApprovalsModule), never listed directly in AppModule's own
+ * `imports`. A real CI run against Atlas Local (2026-11-23) proved that
+ * bolting `ConnectorsAdminController`/`AdminAuthModule` onto THIS module
+ * does not reliably wire `AdminAuthGuard`'s database-backed dependencies
+ * in the full app graph - a real admin API key and a real session both
+ * got a false 401 on `GET /v1/connectors`, even though the identical
+ * `@UseGuards(AdminAuthGuard)` pattern works correctly on every OTHER
+ * admin route. The admin-facing controller now lives in its own
+ * `ConnectorsAdminModule` (connectors-admin.module.ts), imported directly
+ * at the AppModule root - the exact same shape as `ConversationsAdminModule`/
+ * `TenantSettingsAdminModule`, which are proven to work. See
+ * docs/known-limitations.md for the fuller account.
  */
 @Module({
-  imports: [AdminAuthModule],
-  controllers: [ConnectorsAdminController],
   providers: [connectorConfigSettingsProvider, connectorConfigRepositoryProvider],
   exports: [connectorConfigRepositoryProvider, connectorConfigSettingsProvider],
 })
